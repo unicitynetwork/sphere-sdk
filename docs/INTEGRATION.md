@@ -691,8 +691,11 @@ npm test -- --coverage
 | `l1/address` | 18 | HD key derivation |
 | `l1/addressToScriptHash` | 7 | Electrum scripthash |
 | `l1/tx` | 23 | SegWit transactions, UTXO selection |
+| `l1/crypto` | 22 | Wallet encryption, WIF conversion |
 | `serialization/txf` | 44 | TXF token format |
-| **Total** | **261** | All passing |
+| `serialization/wallet-text` | 32 | Text wallet backup format |
+| `modules/TokenSplitCalculator` | 23 | Token split optimization |
+| **Total** | **338** | All passing |
 
 ### Writing Tests
 
@@ -704,12 +707,19 @@ tests/
 │   ├── core/
 │   │   ├── crypto.test.ts
 │   │   ├── bech32.test.ts
-│   │   └── ...
+│   │   ├── currency.test.ts
+│   │   ├── encryption.test.ts
+│   │   └── utils.test.ts
 │   ├── l1/
 │   │   ├── address.test.ts
-│   │   └── ...
+│   │   ├── addressToScriptHash.test.ts
+│   │   ├── crypto.test.ts
+│   │   └── tx.test.ts
+│   ├── modules/
+│   │   └── TokenSplitCalculator.test.ts
 │   └── serialization/
-│       └── txf-serializer.test.ts
+│       ├── txf-serializer.test.ts
+│       └── wallet-text.test.ts
 └── fixtures/
     └── test-vectors.ts
 ```

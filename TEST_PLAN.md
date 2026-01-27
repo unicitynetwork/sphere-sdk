@@ -16,8 +16,11 @@ Comprehensive test plan covering all SDK modules. Tests use **Vitest** with mock
 | `l1/address` | 18 | ✅ Done |
 | `l1/addressToScriptHash` | 7 | ✅ Done |
 | `l1/tx` | 23 | ✅ Done |
+| `l1/crypto` | 22 | ✅ Done |
 | `serialization/txf-serializer` | 44 | ✅ Done |
-| **Total** | **261** | **✅ Passing** |
+| `serialization/wallet-text` | 32 | ✅ Done |
+| `modules/TokenSplitCalculator` | 23 | ✅ Done |
+| **Total** | **338** | **✅ Passing** |
 
 ### Not Yet Covered (Requires Mocking)
 
