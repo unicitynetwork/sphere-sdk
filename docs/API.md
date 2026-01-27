@@ -196,8 +196,8 @@ interface PaymentRequestResult {
 // Example
 const result = await sphere.payments.sendPaymentRequest('@bob', {
   amount: '1000000',
-  coinId: 'ALPHA',
-  message: 'Lottery ticket #42',
+  coinId: 'UCT',
+  message: 'Payment for order #1234',
 });
 ```
 
@@ -314,8 +314,8 @@ Wait for a response to a payment request with optional timeout (default: 60000ms
 // Send request and wait for response
 const result = await sphere.payments.sendPaymentRequest('@bob', {
   amount: '1000000',
-  coinId: 'ALPHA',
-  message: 'Lottery ticket',
+  coinId: 'UCT',
+  message: 'Coffee purchase',
 });
 
 if (result.success) {

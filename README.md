@@ -55,7 +55,7 @@ console.log('L3 Balance:', balance);
 const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',
-  coinId: 'ALPHA',
+  coinId: 'UCT',
 });
 
 // Derive additional addresses
@@ -90,6 +90,66 @@ const providers = createBrowserProviders({
 });
 ```
 
+## Multi-Address Support
+
+The SDK supports HD (Hierarchical Deterministic) wallets with multiple addresses:
+
+```typescript
+// Get current address index
+const currentIndex = sphere.getCurrentAddressIndex(); // 0
+
+// Switch to a different address
+await sphere.switchToAddress(1);
+console.log(sphere.identity?.address); // alpha1... (address at index 1)
+
+// Register nametag for this address (independent per address)
+await sphere.registerNametag('bob');
+
+// Switch back to first address
+await sphere.switchToAddress(0);
+
+// Get nametag for specific address
+const bobNametag = sphere.getNametagForAddress(1); // 'bob'
+
+// Get all address nametags
+const allNametags = sphere.getAllAddressNametags();
+// Map { 0 => 'alice', 1 => 'bob' }
+
+// Derive address without switching (for display/receiving)
+const addr2 = sphere.deriveAddress(2);
+console.log(addr2.address, addr2.publicKey);
+```
+
+### Identity Properties
+
+```typescript
+interface Identity {
+  publicKey: string;           // secp256k1 public key (hex)
+  address: string;             // L1 address (alpha1...)
+  predicateAddress?: string;   // L3 address (DIRECT://...)
+  ipnsName?: string;           // IPNS name for token sync
+  nametag?: string;            // Registered nametag (@username)
+}
+
+// Access identity
+console.log(sphere.identity?.address);          // alpha1qw3e...
+console.log(sphere.identity?.predicateAddress); // DIRECT://0000be36...
+console.log(sphere.identity?.nametag);          // alice
+```
+
+### Address Change Event
+
+```typescript
+// Listen for address switches
+sphere.on('identity:changed', (event) => {
+  console.log('Switched to address index:', event.data.addressIndex);
+  console.log('L1 address:', event.data.address);
+  console.log('L3 address:', event.data.predicateAddress);
+  console.log('Public key:', event.data.publicKey);
+  console.log('Nametag:', event.data.nametag);
+});
+```
+
 ## Payment Requests
 
 Request payments from others with response tracking:
@@ -98,8 +158,8 @@ Request payments from others with response tracking:
 // Send payment request
 const result = await sphere.payments.sendPaymentRequest('@bob', {
   amount: '1000000',
-  coinId: 'ALPHA',
-  message: 'Lottery ticket #42',
+  coinId: 'UCT',
+  message: 'Payment for order #1234',
 });
 
 // Wait for response (with 2 minute timeout)

@@ -206,7 +206,7 @@ for (const token of tokens) {
 const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',
-  coinId: 'ALPHA',
+  coinId: 'UCT',
   memo: 'Payment for coffee',
 });
 
@@ -214,7 +214,7 @@ const result = await sphere.payments.send({
 const result = await sphere.payments.send({
   recipient: '02abc123...',
   amount: '500000',
-  coinId: 'ALPHA',
+  coinId: 'UCT',
 });
 
 if (result.success) {
@@ -253,8 +253,8 @@ Payment requests allow you to request payment from another user and track the re
 // Request payment from @bob
 const result = await sphere.payments.sendPaymentRequest('@bob', {
   amount: '1000000',
-  coinId: 'ALPHA',
-  message: 'Lottery ticket #42',
+  coinId: 'UCT',
+  message: 'Payment for order #1234',
 });
 
 if (result.success) {
@@ -268,8 +268,8 @@ if (result.success) {
 // Send and wait for response (with timeout)
 const result = await sphere.payments.sendPaymentRequest('@bob', {
   amount: '1000000',
-  coinId: 'ALPHA',
-  message: 'Lottery ticket',
+  coinId: 'UCT',
+  message: 'Coffee purchase',
 });
 
 if (result.success) {
@@ -592,7 +592,7 @@ try {
 const validation = await sphere.payments.validateTransfer({
   recipient: '@alice',
   amount: '1000000',
-  coinId: 'ALPHA',
+  coinId: 'UCT',
 });
 
 if (!validation.valid) {
