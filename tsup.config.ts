@@ -11,10 +11,10 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
-    // Don't bundle dependencies - let consumer's bundler handle them
+    // Bundle @unicitylabs packages for Node.js compatibility
+    noExternal: [/^@unicitylabs\//],
     external: [
       /^@noble\//,
-      /^@unicitylabs\//,
       'bip39',
       'buffer',
       'crypto-js',
@@ -34,9 +34,10 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
+    // Bundle @unicitylabs packages for Node.js compatibility
+    noExternal: [/^@unicitylabs\//],
     external: [
       /^@noble\//,
-      /^@unicitylabs\//,
       'bip39',
       'buffer',
       'crypto-js',
@@ -61,7 +62,7 @@ export default defineConfig([
       'elliptic',
     ],
   },
-  // Browser implementation
+  // Browser implementation (keep @unicitylabs external - browser uses bundler)
   {
     entry: { 'impl/browser/index': 'impl/browser/index.ts' },
     format: ['esm', 'cjs'],
@@ -89,9 +90,9 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
+    noExternal: [/^@unicitylabs\//],
     external: [
       /^@noble\//,
-      /^@unicitylabs\//,
       'helia',
       '@helia/ipns',
       '@helia/json',

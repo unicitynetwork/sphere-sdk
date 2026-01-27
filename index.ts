@@ -217,30 +217,16 @@ export {
 export type { NetworkType } from './constants';
 
 // =============================================================================
-// Browser Implementations (re-exported for convenience)
+// Browser Implementations
 // =============================================================================
-
-export {
-  // Storage
-  createLocalStorageProvider,
-  LocalStorageProvider,
-  // Transport
-  createNostrTransportProvider,
-  NostrTransportProvider,
-  // Oracle
-  createUnicityAggregatorProvider,
-  UnicityAggregatorProvider,
-  // Convenience factory
-  createBrowserProviders,
-} from './impl/browser';
-
-export type {
-  LocalStorageProviderConfig,
-  NostrTransportProviderConfig,
-  UnicityAggregatorProviderConfig,
-  BrowserProvidersConfig,
-  BrowserProviders,
-} from './impl/browser';
+// NOTE: Browser-specific implementations are NOT re-exported from main entry
+// to allow this package to work in pure Node.js environments without helia.
+//
+// Import browser implementations explicitly:
+//   import { createLocalStorageProvider, createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+//
+// Or use the /core entry for Node.js projects that don't need browser features:
+//   import { Sphere } from '@unicitylabs/sphere-sdk/core';
 
 // =============================================================================
 // Serialization (Legacy File Parsing)
