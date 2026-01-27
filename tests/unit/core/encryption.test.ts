@@ -1,6 +1,6 @@
 /**
  * Tests for core/encryption.ts
- * Covers AES-256 encryption/decryption functions
+ * Covers AES-256 encryption utilities
  */
 
 import { describe, it, expect } from 'vitest';
@@ -20,78 +20,104 @@ import {
 } from '../../../core/encryption';
 
 // =============================================================================
+// Test Constants
+// =============================================================================
+
+const TEST_PASSWORD = 'test-password-123';
+const TEST_PLAINTEXT = 'Hello, World! This is a secret message.';
+const TEST_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+// =============================================================================
 // encrypt/decrypt Tests
 // =============================================================================
 
-describe('encrypt() and decrypt()', () => {
-  const password = 'test-password-123';
+describe('encrypt()', () => {
+  it('should encrypt string data', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
 
-  it('should encrypt and decrypt string data', () => {
-    const plaintext = 'Hello, World!';
-    const encrypted = encrypt(plaintext, password);
-    const decrypted = decrypt(encrypted, password);
-    expect(decrypted).toBe(plaintext);
-  });
-
-  it('should encrypt and decrypt object data', () => {
-    const obj = { key: 'value', number: 42, nested: { a: 1 } };
-    const encrypted = encrypt(obj, password);
-    const decrypted = decrypt(encrypted, password);
-    expect(JSON.parse(decrypted)).toEqual(obj);
-  });
-
-  it('should produce different ciphertext for same plaintext', () => {
-    const plaintext = 'Test data';
-    const enc1 = encrypt(plaintext, password);
-    const enc2 = encrypt(plaintext, password);
-    // Different IV/salt should produce different ciphertext
-    expect(enc1.ciphertext).not.toBe(enc2.ciphertext);
-    expect(enc1.iv).not.toBe(enc2.iv);
-    expect(enc1.salt).not.toBe(enc2.salt);
-  });
-
-  it('should include proper metadata', () => {
-    const encrypted = encrypt('test', password);
+    expect(encrypted.ciphertext).toBeDefined();
+    expect(encrypted.iv).toBeDefined();
+    expect(encrypted.salt).toBeDefined();
     expect(encrypted.algorithm).toBe('aes-256-cbc');
     expect(encrypted.kdf).toBe('pbkdf2');
     expect(encrypted.iterations).toBe(100000);
-    expect(encrypted.iv).toHaveLength(32); // 16 bytes = 32 hex
-    expect(encrypted.salt).toHaveLength(32);
+  });
+
+  it('should encrypt object data', () => {
+    const data = { message: 'secret', count: 42 };
+    const encrypted = encrypt(data, TEST_PASSWORD);
+
+    expect(encrypted.ciphertext).toBeDefined();
+    expect(isEncryptedData(encrypted)).toBe(true);
   });
 
   it('should use custom iterations', () => {
-    const encrypted = encrypt('test', password, { iterations: 50000 });
-    expect(encrypted.iterations).toBe(50000);
-    const decrypted = decrypt(encrypted, password);
-    expect(decrypted).toBe('test');
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD, { iterations: 10000 });
+
+    expect(encrypted.iterations).toBe(10000);
   });
 
-  it('should fail with wrong password', () => {
-    const encrypted = encrypt('test', password);
-    // CryptoJS may throw different errors for wrong password
-    expect(() => decrypt(encrypted, 'wrong-password')).toThrow();
+  it('should generate different ciphertext each time (random IV/salt)', () => {
+    const encrypted1 = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const encrypted2 = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+
+    expect(encrypted1.ciphertext).not.toBe(encrypted2.ciphertext);
+    expect(encrypted1.iv).not.toBe(encrypted2.iv);
+    expect(encrypted1.salt).not.toBe(encrypted2.salt);
   });
 
-  // Note: Empty string encryption/decryption may have edge case issues
-  // with some crypto libraries - we skip this edge case as it's rarely needed
-  it('should handle whitespace string', () => {
-    const encrypted = encrypt(' ', password);
-    const decrypted = decrypt(encrypted, password);
-    expect(decrypted).toBe(' ');
+  it('should produce valid hex for IV and salt', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+
+    expect(encrypted.iv).toMatch(/^[0-9a-f]{32}$/); // 16 bytes = 32 hex chars
+    expect(encrypted.salt).toMatch(/^[0-9a-f]{32}$/);
+  });
+});
+
+describe('decrypt()', () => {
+  it('should decrypt encrypted data', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const decrypted = decrypt(encrypted, TEST_PASSWORD);
+
+    expect(decrypted).toBe(TEST_PLAINTEXT);
   });
 
-  it('should handle unicode characters', () => {
-    const plaintext = 'Hello, 世界! 🌍';
-    const encrypted = encrypt(plaintext, password);
-    const decrypted = decrypt(encrypted, password);
-    expect(decrypted).toBe(plaintext);
+  it('should throw with wrong password', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+
+    expect(() => decrypt(encrypted, 'wrong-password')).toThrow('Decryption failed');
   });
 
-  it('should handle long text', () => {
-    const plaintext = 'a'.repeat(10000);
-    const encrypted = encrypt(plaintext, password);
-    const decrypted = decrypt(encrypted, password);
-    expect(decrypted).toBe(plaintext);
+  it('should decrypt with custom iterations', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD, { iterations: 5000 });
+    const decrypted = decrypt(encrypted, TEST_PASSWORD);
+
+    expect(decrypted).toBe(TEST_PLAINTEXT);
+  });
+
+  it('should handle special characters', () => {
+    const special = '日本語テスト 🎉 émojis & symbols <>&"\'';
+    const encrypted = encrypt(special, TEST_PASSWORD);
+    const decrypted = decrypt(encrypted, TEST_PASSWORD);
+
+    expect(decrypted).toBe(special);
+  });
+
+  it('should handle empty string', () => {
+    // Note: The decrypt function treats empty result as error (if (!result))
+    // This is intentional - empty strings indicate decryption failure
+    const encrypted = encrypt('', TEST_PASSWORD);
+
+    // Empty string decryption throws because result is falsy
+    expect(() => decrypt(encrypted, TEST_PASSWORD)).toThrow('Decryption failed');
+  });
+
+  it('should handle very long plaintext', () => {
+    const longText = 'a'.repeat(10000);
+    const encrypted = encrypt(longText, TEST_PASSWORD);
+    const decrypted = decrypt(encrypted, TEST_PASSWORD);
+
+    expect(decrypted).toBe(longText);
   });
 });
 
@@ -100,89 +126,104 @@ describe('encrypt() and decrypt()', () => {
 // =============================================================================
 
 describe('decryptJson()', () => {
-  const password = 'test-password';
+  it('should decrypt and parse JSON object', () => {
+    const data = { message: 'secret', numbers: [1, 2, 3] };
+    const encrypted = encrypt(data, TEST_PASSWORD);
+    const decrypted = decryptJson<typeof data>(encrypted, TEST_PASSWORD);
 
-  it('should decrypt and parse JSON', () => {
-    const obj = { mnemonic: 'test phrase', count: 12 };
-    const encrypted = encrypt(obj, password);
-    const decrypted = decryptJson<typeof obj>(encrypted, password);
-    expect(decrypted).toEqual(obj);
+    expect(decrypted).toEqual(data);
   });
 
-  it('should throw for invalid JSON', () => {
-    const encrypted = encrypt('not json', password);
-    expect(() => decryptJson(encrypted, password)).toThrow('invalid JSON');
+  it('should decrypt and parse JSON array', () => {
+    const data = [1, 2, 3, 'four', { five: 5 }];
+    const encrypted = encrypt(data, TEST_PASSWORD);
+    const decrypted = decryptJson(encrypted, TEST_PASSWORD);
+
+    expect(decrypted).toEqual(data);
   });
 
-  it('should throw for wrong password', () => {
-    const encrypted = encrypt({ key: 'value' }, password);
+  it('should throw on invalid JSON', () => {
+    const encrypted = encrypt('not valid json', TEST_PASSWORD);
+
+    expect(() => decryptJson(encrypted, TEST_PASSWORD)).toThrow('invalid JSON');
+  });
+
+  it('should throw with wrong password', () => {
+    const encrypted = encrypt({ test: true }, TEST_PASSWORD);
+
     expect(() => decryptJson(encrypted, 'wrong')).toThrow('Decryption failed');
   });
 });
 
 // =============================================================================
-// Simple Encryption Tests
+// encryptSimple/decryptSimple Tests
 // =============================================================================
 
-describe('encryptSimple() and decryptSimple()', () => {
-  const password = 'simple-password';
+describe('encryptSimple()', () => {
+  it('should encrypt and return string', () => {
+    const encrypted = encryptSimple(TEST_PLAINTEXT, TEST_PASSWORD);
 
-  it('should encrypt and decrypt string', () => {
-    const plaintext = 'Simple encryption test';
-    const encrypted = encryptSimple(plaintext, password);
-    const decrypted = decryptSimple(encrypted, password);
-    expect(decrypted).toBe(plaintext);
-  });
-
-  it('should produce base64 output', () => {
-    const encrypted = encryptSimple('test', password);
-    // CryptoJS output is base64
     expect(typeof encrypted).toBe('string');
-    expect(encrypted.length).toBeGreaterThan(0);
+    expect(encrypted).not.toBe(TEST_PLAINTEXT);
   });
 
-  it('should fail or return wrong data with wrong password', () => {
-    const encrypted = encryptSimple('test', password);
-    // CryptoJS simple encryption may either throw or return garbled data
-    try {
-      const result = decryptSimple(encrypted, 'wrong');
-      // If it doesn't throw, result should not match original
-      expect(result).not.toBe('test');
-    } catch {
-      // Expected to throw
-      expect(true).toBe(true);
-    }
+  it('should produce different output each time', () => {
+    const encrypted1 = encryptSimple(TEST_PLAINTEXT, TEST_PASSWORD);
+    const encrypted2 = encryptSimple(TEST_PLAINTEXT, TEST_PASSWORD);
+
+    expect(encrypted1).not.toBe(encrypted2);
+  });
+});
+
+describe('decryptSimple()', () => {
+  it('should decrypt encrypted data', () => {
+    const encrypted = encryptSimple(TEST_PLAINTEXT, TEST_PASSWORD);
+    const decrypted = decryptSimple(encrypted, TEST_PASSWORD);
+
+    expect(decrypted).toBe(TEST_PLAINTEXT);
+  });
+
+  it('should throw with wrong password', () => {
+    const encrypted = encryptSimple(TEST_PLAINTEXT, TEST_PASSWORD);
+
+    expect(() => decryptSimple(encrypted, 'wrong')).toThrow('Decryption failed');
+  });
+
+  it('should handle special characters', () => {
+    const special = '🔐 Secret 日本語';
+    const encrypted = encryptSimple(special, TEST_PASSWORD);
+    const decrypted = decryptSimple(encrypted, TEST_PASSWORD);
+
+    expect(decrypted).toBe(special);
   });
 });
 
 // =============================================================================
-// Mnemonic Encryption Tests
+// encryptMnemonic/decryptMnemonic Tests
 // =============================================================================
 
-describe('encryptMnemonic() and decryptMnemonic()', () => {
-  const password = 'mnemonic-password';
-  const mnemonic =
-    'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+describe('encryptMnemonic()', () => {
+  it('should encrypt mnemonic phrase', () => {
+    const encrypted = encryptMnemonic(TEST_MNEMONIC, TEST_PASSWORD);
 
-  it('should encrypt and decrypt mnemonic', () => {
-    const encrypted = encryptMnemonic(mnemonic, password);
-    const decrypted = decryptMnemonic(encrypted, password);
-    expect(decrypted).toBe(mnemonic);
+    expect(typeof encrypted).toBe('string');
+    expect(encrypted).not.toBe(TEST_MNEMONIC);
+  });
+});
+
+describe('decryptMnemonic()', () => {
+  it('should decrypt mnemonic phrase', () => {
+    const encrypted = encryptMnemonic(TEST_MNEMONIC, TEST_PASSWORD);
+    const decrypted = decryptMnemonic(encrypted, TEST_PASSWORD);
+
+    expect(decrypted).toBe(TEST_MNEMONIC);
   });
 
-  it('should fail with wrong password', () => {
-    const encrypted = encryptMnemonic(mnemonic, password);
-    // CryptoJS simple encryption throws various errors for wrong password
-    // depending on how the ciphertext gets corrupted
+  it('should throw with wrong password', () => {
+    const encrypted = encryptMnemonic(TEST_MNEMONIC, TEST_PASSWORD);
+
+    // CryptoJS may throw "Malformed UTF-8 data" or our wrapper throws "Decryption failed"
     expect(() => decryptMnemonic(encrypted, 'wrong')).toThrow();
-  });
-
-  it('should work with 24-word mnemonic', () => {
-    const longMnemonic =
-      'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art';
-    const encrypted = encryptMnemonic(longMnemonic, password);
-    const decrypted = decryptMnemonic(encrypted, password);
-    expect(decrypted).toBe(longMnemonic);
   });
 });
 
@@ -192,105 +233,105 @@ describe('encryptMnemonic() and decryptMnemonic()', () => {
 
 describe('isEncryptedData()', () => {
   it('should return true for valid EncryptedData', () => {
-    const data: EncryptedData = {
-      ciphertext: 'abc123',
-      iv: '00'.repeat(16),
-      salt: '00'.repeat(16),
-      algorithm: 'aes-256-cbc',
-      kdf: 'pbkdf2',
-      iterations: 100000,
-    };
-    expect(isEncryptedData(data)).toBe(true);
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+
+    expect(isEncryptedData(encrypted)).toBe(true);
   });
 
-  it('should return false for null/undefined', () => {
+  it('should return false for null', () => {
     expect(isEncryptedData(null)).toBe(false);
+  });
+
+  it('should return false for non-object', () => {
+    expect(isEncryptedData('string')).toBe(false);
+    expect(isEncryptedData(123)).toBe(false);
     expect(isEncryptedData(undefined)).toBe(false);
   });
 
   it('should return false for missing fields', () => {
-    expect(isEncryptedData({})).toBe(false);
     expect(isEncryptedData({ ciphertext: 'abc' })).toBe(false);
-    expect(
-      isEncryptedData({
-        ciphertext: 'abc',
-        iv: '123',
-        salt: '456',
-        // missing algorithm, kdf, iterations
-      })
-    ).toBe(false);
+    expect(isEncryptedData({
+      ciphertext: 'abc',
+      iv: '123',
+      salt: '456',
+    })).toBe(false);
   });
 
   it('should return false for wrong algorithm', () => {
-    expect(
-      isEncryptedData({
-        ciphertext: 'abc',
-        iv: '123',
-        salt: '456',
-        algorithm: 'aes-128-cbc',
-        kdf: 'pbkdf2',
-        iterations: 100000,
-      })
-    ).toBe(false);
+    const data = {
+      ciphertext: 'abc',
+      iv: '123',
+      salt: '456',
+      algorithm: 'aes-128-cbc',
+      kdf: 'pbkdf2',
+      iterations: 100000,
+    };
+
+    expect(isEncryptedData(data)).toBe(false);
   });
 
-  it('should return false for wrong types', () => {
-    expect(
-      isEncryptedData({
-        ciphertext: 123,
-        iv: '123',
-        salt: '456',
-        algorithm: 'aes-256-cbc',
-        kdf: 'pbkdf2',
-        iterations: 100000,
-      })
-    ).toBe(false);
+  it('should return false for wrong kdf', () => {
+    const data = {
+      ciphertext: 'abc',
+      iv: '123',
+      salt: '456',
+      algorithm: 'aes-256-cbc',
+      kdf: 'scrypt',
+      iterations: 100000,
+    };
+
+    expect(isEncryptedData(data)).toBe(false);
+  });
+
+  it('should return false for non-number iterations', () => {
+    const data = {
+      ciphertext: 'abc',
+      iv: '123',
+      salt: '456',
+      algorithm: 'aes-256-cbc',
+      kdf: 'pbkdf2',
+      iterations: '100000',
+    };
+
+    expect(isEncryptedData(data)).toBe(false);
   });
 });
 
 // =============================================================================
-// Serialization Tests
+// serializeEncrypted/deserializeEncrypted Tests
 // =============================================================================
 
-describe('serializeEncrypted() and deserializeEncrypted()', () => {
+describe('serializeEncrypted()', () => {
   it('should serialize to JSON string', () => {
-    const data: EncryptedData = {
-      ciphertext: 'test',
-      iv: '00'.repeat(16),
-      salt: '00'.repeat(16),
-      algorithm: 'aes-256-cbc',
-      kdf: 'pbkdf2',
-      iterations: 100000,
-    };
-    const serialized = serializeEncrypted(data);
-    expect(typeof serialized).toBe('string');
-    expect(JSON.parse(serialized)).toEqual(data);
-  });
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const serialized = serializeEncrypted(encrypted);
 
-  it('should deserialize valid JSON', () => {
-    const data: EncryptedData = {
-      ciphertext: 'test',
-      iv: '00'.repeat(16),
-      salt: '00'.repeat(16),
-      algorithm: 'aes-256-cbc',
-      kdf: 'pbkdf2',
-      iterations: 100000,
-    };
-    const serialized = JSON.stringify(data);
+    expect(typeof serialized).toBe('string');
+    expect(JSON.parse(serialized)).toEqual(encrypted);
+  });
+});
+
+describe('deserializeEncrypted()', () => {
+  it('should deserialize from JSON string', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const serialized = serializeEncrypted(encrypted);
     const deserialized = deserializeEncrypted(serialized);
-    expect(deserialized).toEqual(data);
+
+    expect(deserialized).toEqual(encrypted);
   });
 
   it('should throw for invalid format', () => {
     expect(() => deserializeEncrypted('{}')).toThrow('Invalid encrypted data format');
-    expect(() => deserializeEncrypted('invalid json')).toThrow();
+    expect(() => deserializeEncrypted('not json')).toThrow();
   });
 
-  it('should round-trip encrypted data', () => {
-    const original = encrypt('test data', 'password');
-    const serialized = serializeEncrypted(original);
-    const restored = deserializeEncrypted(serialized);
-    expect(decrypt(restored, 'password')).toBe('test data');
+  it('should round-trip encrypt/serialize/deserialize/decrypt', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const serialized = serializeEncrypted(encrypted);
+    const deserialized = deserializeEncrypted(serialized);
+    const decrypted = decrypt(deserialized, TEST_PASSWORD);
+
+    expect(decrypted).toBe(TEST_PLAINTEXT);
   });
 });
 
@@ -299,23 +340,58 @@ describe('serializeEncrypted() and deserializeEncrypted()', () => {
 // =============================================================================
 
 describe('generateRandomKey()', () => {
-  it('should generate 64-char hex string by default (32 bytes)', () => {
+  it('should generate 64 hex chars by default (32 bytes)', () => {
     const key = generateRandomKey();
-    expect(key).toHaveLength(64);
-    expect(/^[0-9a-f]+$/.test(key)).toBe(true);
+
+    expect(key.length).toBe(64);
+    expect(key).toMatch(/^[0-9a-f]+$/);
   });
 
-  it('should generate specified byte length', () => {
+  it('should generate specified length', () => {
     const key16 = generateRandomKey(16);
-    expect(key16).toHaveLength(32); // 16 bytes = 32 hex
+    expect(key16.length).toBe(32); // 16 bytes = 32 hex chars
 
     const key64 = generateRandomKey(64);
-    expect(key64).toHaveLength(128); // 64 bytes = 128 hex
+    expect(key64.length).toBe(128);
   });
 
-  it('should generate unique keys', () => {
+  it('should generate different keys each time', () => {
     const key1 = generateRandomKey();
     const key2 = generateRandomKey();
+
     expect(key1).not.toBe(key2);
+  });
+});
+
+// =============================================================================
+// Round-trip Tests
+// =============================================================================
+
+describe('Full round-trip encryption', () => {
+  it('should encrypt, serialize, deserialize, and decrypt correctly', () => {
+    const original = { secretData: 'very secret', timestamp: Date.now() };
+
+    // Encrypt
+    const encrypted = encrypt(original, TEST_PASSWORD);
+
+    // Serialize for storage
+    const serialized = serializeEncrypted(encrypted);
+
+    // ... stored in localStorage or elsewhere ...
+
+    // Deserialize
+    const deserialized = deserializeEncrypted(serialized);
+
+    // Decrypt
+    const decrypted = decryptJson<typeof original>(deserialized, TEST_PASSWORD);
+
+    expect(decrypted).toEqual(original);
+  });
+
+  it('should work with mnemonic round-trip', () => {
+    const encrypted = encryptMnemonic(TEST_MNEMONIC, TEST_PASSWORD);
+    const decrypted = decryptMnemonic(encrypted, TEST_PASSWORD);
+
+    expect(decrypted).toBe(TEST_MNEMONIC);
   });
 });

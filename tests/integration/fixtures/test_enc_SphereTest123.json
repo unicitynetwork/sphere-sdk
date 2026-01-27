@@ -1,0 +1,9 @@
+{
+  "encrypted": true,
+  "ciphertext": "KM8qow8iASTRr7rZ0GZaF+KweMKpGr+iAVnRfm1IL4rLFwobOQzZ3VqbuwYkmYWfTxZi2dHQkwqFaqSHEO2SXHJ5n4ojGIHBGPkY2maHR83UcRKT2hXxTNW4MSXzpYTQGHqLAU1Lj8TIPeLYjyjXXh9BIHi0QKGWI1a5GCHiYlElDip1b0NmMsJwGaClieHsW7mIJuNy06z5ZJdQQZszJO/EYaKusVXzMhtAXMCjxHk=",
+  "iv": "167ab07c617eadf64db725d233653dcd",
+  "salt": "1ef18c0df35f726c7d5b1c9d2c4f5eb5",
+  "algorithm": "aes-256-cbc",
+  "kdf": "pbkdf2",
+  "iterations": 100000
+}

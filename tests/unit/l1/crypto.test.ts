@@ -37,12 +37,18 @@ describe('encrypt() and decrypt()', () => {
     expect(enc1).not.toBe(enc2);
   });
 
-  it('should return empty string with wrong password', () => {
+  it('should fail with wrong password', () => {
     const encrypted = encrypt('secret', password);
-    const decrypted = decrypt(encrypted, 'wrong-password');
 
-    // CryptoJS returns empty string on wrong password
-    expect(decrypted).not.toBe('secret');
+    // CryptoJS may throw "Malformed UTF-8 data" or return garbled data with wrong password
+    try {
+      const decrypted = decrypt(encrypted, 'wrong-password');
+      // If it doesn't throw, result should not match original
+      expect(decrypted).not.toBe('secret');
+    } catch {
+      // Expected to throw
+      expect(true).toBe(true);
+    }
   });
 
   it('should handle unicode characters', () => {

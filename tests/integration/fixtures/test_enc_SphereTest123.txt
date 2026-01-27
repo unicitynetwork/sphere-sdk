@@ -1,0 +1,23 @@
+UNICITY WALLET DETAILS
+===========================
+
+ENCRYPTED MASTER KEY (password protected):
+U2FsdGVkX186dHt0yJYbyjkwdaL/w4Px+kiQWhOaHOlMwWP37TkmR0GyJfpv3UX5NBeSjK50yv2qADA4SIAjBivCesrvVMMA6+qcn7CtmtM+4jUsUqMKLTb3WEDryYqD
+
+MASTER CHAIN CODE (for BIP32 HD wallet compatibility):
+b1b2b3b4b5b6b7b8b9b0b1b2b3b4b5b6b7b8b9b0b1b2b3b4b5b6b7b8b9b0b1b2
+
+DESCRIPTOR PATH: 84'/1'/0'
+
+WALLET TYPE: BIP32 hierarchical deterministic wallet
+
+ENCRYPTION STATUS: Encrypted with password
+To use this key, you will need the password you set in the wallet.
+
+YOUR ADDRESSES:
+Address 1: ATestAddress1 (Path: m/84'/1'/0'/0/0)
+
+Generated on: 1/27/2026, 6:41:45 PM
+
+WARNING: Keep your master private key safe and secure.
+Anyone with your master private key can access all your funds.

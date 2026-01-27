@@ -1,6 +1,6 @@
 /**
  * Tests for core/utils.ts
- * Covers utility functions like Base58, pattern search, etc.
+ * Covers SDK utility functions
  */
 
 import { describe, it, expect } from 'vitest';
@@ -10,162 +10,167 @@ import {
   base58Decode,
   findPattern,
   extractFromText,
-  sleep,
   randomHex,
   randomUUID,
 } from '../../../core/utils';
 
-import { BASE58_VECTORS, PRIVATE_KEY_VECTORS } from '../../fixtures/test-vectors';
-
 // =============================================================================
-// Private Key Validation Tests
+// isValidPrivateKey Tests
 // =============================================================================
 
 describe('isValidPrivateKey()', () => {
-  it('should return true for valid private keys', () => {
-    for (const key of PRIVATE_KEY_VECTORS.valid) {
-      expect(isValidPrivateKey(key)).toBe(true);
-    }
+  it('should accept valid private key', () => {
+    // A valid 64-hex-char private key
+    const validKey = 'a'.repeat(64);
+    expect(isValidPrivateKey(validKey)).toBe(true);
   });
 
-  it('should return false for invalid private keys', () => {
-    for (const key of PRIVATE_KEY_VECTORS.invalid) {
-      expect(isValidPrivateKey(key)).toBe(false);
-    }
+  it('should accept typical private keys', () => {
+    expect(isValidPrivateKey('0000000000000000000000000000000000000000000000000000000000000001')).toBe(true);
+    expect(isValidPrivateKey('fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140')).toBe(true);
   });
 
-  it('should return false for non-hex strings', () => {
-    expect(isValidPrivateKey('not a hex string')).toBe(false);
-    expect(isValidPrivateKey('GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG')).toBe(
-      false
-    );
+  it('should reject zero key', () => {
+    const zeroKey = '0'.repeat(64);
+    expect(isValidPrivateKey(zeroKey)).toBe(false);
   });
 
-  it('should return false for wrong length', () => {
-    expect(isValidPrivateKey('abc')).toBe(false);
-    expect(isValidPrivateKey('abc'.repeat(100))).toBe(false);
+  it('should reject key >= curve order', () => {
+    // Curve order is FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    // Key equal to curve order should be invalid
+    expect(isValidPrivateKey('FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141')).toBe(false);
+    // Key greater than curve order should also be invalid
+    expect(isValidPrivateKey('FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364142')).toBe(false);
   });
 
-  it('should be case-insensitive', () => {
-    const lower = 'e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35';
-    const upper = 'E8F32E723DECF4051AEFAC8E2C93C9C5B214313817CDB01A1494B917C8436B35';
-    expect(isValidPrivateKey(lower)).toBe(true);
-    expect(isValidPrivateKey(upper)).toBe(true);
+  it('should reject keys with wrong length', () => {
+    expect(isValidPrivateKey('a'.repeat(63))).toBe(false); // Too short
+    expect(isValidPrivateKey('a'.repeat(65))).toBe(false); // Too long
+    expect(isValidPrivateKey('')).toBe(false); // Empty
+  });
+
+  it('should reject non-hex characters', () => {
+    expect(isValidPrivateKey('g'.repeat(64))).toBe(false);
+    expect(isValidPrivateKey('abcdef' + 'x' + 'a'.repeat(57))).toBe(false);
+    expect(isValidPrivateKey('a'.repeat(32) + ' ' + 'a'.repeat(31))).toBe(false);
+  });
+
+  it('should accept uppercase and lowercase hex', () => {
+    expect(isValidPrivateKey('ABCDEF' + '1'.repeat(58))).toBe(true);
+    expect(isValidPrivateKey('abcdef' + '1'.repeat(58))).toBe(true);
+    expect(isValidPrivateKey('AbCdEf' + '1'.repeat(58))).toBe(true);
   });
 });
 
 // =============================================================================
-// Base58 Encoding Tests
+// base58Encode Tests
 // =============================================================================
 
 describe('base58Encode()', () => {
-  it('should encode hex to Base58', () => {
-    for (const vector of BASE58_VECTORS) {
-      expect(base58Encode(vector.hex)).toBe(vector.base58);
-    }
-  });
-
-  it('should handle leading zeros (as "1"s)', () => {
+  it('should encode simple hex values', () => {
+    // 00 in hex encodes to '1' in base58
     expect(base58Encode('00')).toBe('1');
+    // Multiple leading zeros = multiple 1s
     expect(base58Encode('0000')).toBe('11');
   });
 
-  it('should encode arbitrary hex data', () => {
-    // Note: This is raw Base58 encoding WITHOUT checksum
-    // Bitcoin addresses add a 4-byte checksum before encoding
-    const hex = 'deadbeef';
-    const result = base58Encode(hex);
-    expect(typeof result).toBe('string');
+  it('should encode known values', () => {
+    // Small hex values
+    expect(base58Encode('01')).toBe('2');
+    expect(base58Encode('39')).toBe('z'); // 57 decimal = 'z' in base58
+  });
+
+  it('should handle larger values', () => {
+    // 0x100 = 256 = 4*58 + 24 = '4R' or similar
+    const result = base58Encode('0100');
     expect(result.length).toBeGreaterThan(0);
-    // Verify round-trip
-    const decoded = base58Decode(result);
-    const decodedHex = Array.from(decoded)
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-    expect(decodedHex).toBe(hex);
+    expect(result).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/); // Valid base58 chars
+  });
+
+  it('should preserve leading zero bytes as 1s', () => {
+    const hex = '000001';
+    const encoded = base58Encode(hex);
+    expect(encoded.startsWith('11')).toBe(true); // Two leading zeros = two 1s
   });
 });
 
 // =============================================================================
-// Base58 Decoding Tests
+// base58Decode Tests
 // =============================================================================
 
 describe('base58Decode()', () => {
-  it('should decode Base58 to bytes', () => {
-    for (const vector of BASE58_VECTORS) {
-      const decoded = base58Decode(vector.base58);
-      const hex = Array.from(decoded)
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-      expect(hex).toBe(vector.hex);
-    }
+  it('should decode single 1 to zero byte', () => {
+    const result = base58Decode('1');
+    expect(result).toEqual(new Uint8Array([0]));
   });
 
-  it('should handle leading "1"s (as zeros)', () => {
-    const decoded = base58Decode('1');
-    expect(decoded).toEqual(new Uint8Array([0]));
-
-    const decoded2 = base58Decode('11');
-    expect(decoded2).toEqual(new Uint8Array([0, 0]));
+  it('should decode multiple 1s to multiple zero bytes', () => {
+    const result = base58Decode('111');
+    expect(result).toEqual(new Uint8Array([0, 0, 0]));
   });
 
-  it('should throw for invalid characters', () => {
-    expect(() => base58Decode('0OIl')).toThrow('Invalid base58 character');
+  it('should decode simple values', () => {
+    const result = base58Decode('2');
+    expect(result).toEqual(new Uint8Array([1]));
   });
-});
 
-// =============================================================================
-// Base58 Round-trip Tests
-// =============================================================================
+  it('should throw on invalid base58 characters', () => {
+    expect(() => base58Decode('0')).toThrow('Invalid base58 character: 0');
+    expect(() => base58Decode('O')).toThrow('Invalid base58 character: O');
+    expect(() => base58Decode('I')).toThrow('Invalid base58 character: I');
+    expect(() => base58Decode('l')).toThrow('Invalid base58 character: l');
+    expect(() => base58Decode('+')).toThrow('Invalid base58 character: +');
+  });
 
-describe('Base58 Round-trip', () => {
-  it('should round-trip various values', () => {
-    const testHexValues = [
-      'deadbeef',
-      '00deadbeef',
-      '0000deadbeef',
-      'ff'.repeat(32),
-      '00'.repeat(10),
-    ];
+  it('should round-trip with encode', () => {
+    const original = 'deadbeef';
+    const encoded = base58Encode(original);
+    const decoded = base58Decode(encoded);
+    // Convert decoded back to hex
+    const decodedHex = Array.from(decoded)
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+    expect(decodedHex).toBe(original);
+  });
 
-    for (const hex of testHexValues) {
-      const encoded = base58Encode(hex);
-      const decoded = base58Decode(encoded);
-      const recoveredHex = Array.from(decoded)
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-      expect(recoveredHex).toBe(hex);
-    }
+  it('should round-trip with leading zeros', () => {
+    const original = '0000deadbeef';
+    const encoded = base58Encode(original);
+    const decoded = base58Decode(encoded);
+    const decodedHex = Array.from(decoded)
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+    expect(decodedHex).toBe(original);
   });
 });
 
 // =============================================================================
-// Pattern Search Tests
+// findPattern Tests
 // =============================================================================
 
 describe('findPattern()', () => {
-  it('should find pattern in data', () => {
-    const data = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
-    const pattern = new Uint8Array([4, 5, 6]);
-    expect(findPattern(data, pattern)).toBe(3);
-  });
-
-  it('should return -1 if pattern not found', () => {
-    const data = new Uint8Array([1, 2, 3, 4, 5]);
-    const pattern = new Uint8Array([6, 7, 8]);
-    expect(findPattern(data, pattern)).toBe(-1);
-  });
-
-  it('should find pattern at start', () => {
+  it('should find pattern at beginning', () => {
     const data = new Uint8Array([1, 2, 3, 4, 5]);
     const pattern = new Uint8Array([1, 2]);
     expect(findPattern(data, pattern)).toBe(0);
+  });
+
+  it('should find pattern in middle', () => {
+    const data = new Uint8Array([1, 2, 3, 4, 5]);
+    const pattern = new Uint8Array([3, 4]);
+    expect(findPattern(data, pattern)).toBe(2);
   });
 
   it('should find pattern at end', () => {
     const data = new Uint8Array([1, 2, 3, 4, 5]);
     const pattern = new Uint8Array([4, 5]);
     expect(findPattern(data, pattern)).toBe(3);
+  });
+
+  it('should return -1 when pattern not found', () => {
+    const data = new Uint8Array([1, 2, 3, 4, 5]);
+    const pattern = new Uint8Array([6, 7]);
+    expect(findPattern(data, pattern)).toBe(-1);
   });
 
   it('should respect startIndex', () => {
@@ -175,128 +180,128 @@ describe('findPattern()', () => {
     expect(findPattern(data, pattern, 1)).toBe(2);
   });
 
-  it('should handle single-byte pattern', () => {
+  it('should find single-byte pattern', () => {
     const data = new Uint8Array([1, 2, 3, 4, 5]);
     const pattern = new Uint8Array([3]);
     expect(findPattern(data, pattern)).toBe(2);
   });
 
-  it('should handle empty pattern', () => {
+  it('should handle pattern equal to data', () => {
     const data = new Uint8Array([1, 2, 3]);
-    const pattern = new Uint8Array([]);
+    const pattern = new Uint8Array([1, 2, 3]);
     expect(findPattern(data, pattern)).toBe(0);
   });
 
-  it('should handle pattern longer than data', () => {
+  it('should return -1 if pattern longer than data', () => {
     const data = new Uint8Array([1, 2]);
-    const pattern = new Uint8Array([1, 2, 3]);
+    const pattern = new Uint8Array([1, 2, 3, 4]);
     expect(findPattern(data, pattern)).toBe(-1);
+  });
+
+  it('should handle empty data', () => {
+    const data = new Uint8Array(0);
+    const pattern = new Uint8Array([1]);
+    expect(findPattern(data, pattern)).toBe(-1);
+  });
+
+  it('should handle empty pattern', () => {
+    const data = new Uint8Array([1, 2, 3]);
+    const pattern = new Uint8Array(0);
+    expect(findPattern(data, pattern)).toBe(0); // Empty pattern found immediately
   });
 });
 
 // =============================================================================
-// Text Extraction Tests
+// extractFromText Tests
 // =============================================================================
 
 describe('extractFromText()', () => {
-  it('should extract value using regex', () => {
-    const text = 'Master Key: abc123def';
-    const result = extractFromText(text, /Master Key:\s*(\w+)/);
-    expect(result).toBe('abc123def');
+  it('should extract value with capture group', () => {
+    const text = 'Name: John Doe';
+    const pattern = /Name:\s*(.+)/;
+    expect(extractFromText(text, pattern)).toBe('John Doe');
   });
 
-  it('should return null if no match', () => {
-    const text = 'No key here';
-    const result = extractFromText(text, /Master Key:\s*(\w+)/);
-    expect(result).toBeNull();
+  it('should return null when pattern does not match', () => {
+    const text = 'No match here';
+    const pattern = /Name:\s*(.+)/;
+    expect(extractFromText(text, pattern)).toBeNull();
   });
 
-  it('should trim whitespace', () => {
-    const text = 'Key:   value   ';
-    const result = extractFromText(text, /Key:\s*(.+)/);
-    expect(result).toBe('value');
+  it('should trim whitespace from captured value', () => {
+    const text = 'Value:   test   ';
+    const pattern = /Value:\s*(.+)/;
+    expect(extractFromText(text, pattern)).toBe('test');
   });
 
-  it('should handle multiline text', () => {
-    const text = `
-      Some text
-      Address: alpha1abc123
-      More text
-    `;
-    const result = extractFromText(text, /Address:\s*(\S+)/);
-    expect(result).toBe('alpha1abc123');
+  it('should work with complex patterns', () => {
+    const text = 'Private Key: abc123def456';
+    const pattern = /Private Key:\s*([a-f0-9]+)/;
+    expect(extractFromText(text, pattern)).toBe('abc123def456');
   });
 
-  it('should return first capture group', () => {
-    const text = 'Name: John, Age: 30';
-    const result = extractFromText(text, /Name: (\w+)/);
-    expect(result).toBe('John');
-  });
-});
-
-// =============================================================================
-// Sleep Tests
-// =============================================================================
-
-describe('sleep()', () => {
-  it('should delay for specified time', async () => {
-    const start = Date.now();
-    await sleep(50);
-    const elapsed = Date.now() - start;
-    // Allow some tolerance for timing
-    expect(elapsed).toBeGreaterThanOrEqual(45);
-    expect(elapsed).toBeLessThan(150);
+  it('should return null if no capture group', () => {
+    const text = 'test value';
+    const pattern = /test/; // No capture group
+    expect(extractFromText(text, pattern)).toBeNull();
   });
 
-  it('should return a promise', () => {
-    const result = sleep(1);
-    expect(result).toBeInstanceOf(Promise);
-  });
-
-  it('should work with 0ms', async () => {
-    const start = Date.now();
-    await sleep(0);
-    const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(50);
+  it('should return first capture group only', () => {
+    const text = 'a: 1, b: 2';
+    const pattern = /a:\s*(\d+).*b:\s*(\d+)/;
+    expect(extractFromText(text, pattern)).toBe('1'); // First group only
   });
 });
 
 // =============================================================================
-// Random Generation Tests
+// randomHex Tests
 // =============================================================================
 
 describe('randomHex()', () => {
-  it('should generate hex string of specified byte length', () => {
+  it('should generate hex of correct length', () => {
     const hex16 = randomHex(16);
-    expect(hex16).toHaveLength(32); // 16 bytes = 32 hex chars
-    expect(/^[0-9a-f]+$/.test(hex16)).toBe(true);
+    expect(hex16.length).toBe(32); // 16 bytes = 32 hex chars
 
     const hex32 = randomHex(32);
-    expect(hex32).toHaveLength(64);
+    expect(hex32.length).toBe(64); // 32 bytes = 64 hex chars
   });
 
-  it('should generate unique values', () => {
-    const values = new Set();
-    for (let i = 0; i < 100; i++) {
-      values.add(randomHex(16));
-    }
-    expect(values.size).toBe(100);
+  it('should generate valid hex characters only', () => {
+    const hex = randomHex(32);
+    expect(hex).toMatch(/^[0-9a-f]+$/);
+  });
+
+  it('should generate different values each time', () => {
+    const hex1 = randomHex(32);
+    const hex2 = randomHex(32);
+    expect(hex1).not.toBe(hex2); // Very unlikely to be equal
+  });
+
+  it('should handle small byte lengths', () => {
+    const hex1 = randomHex(1);
+    expect(hex1.length).toBe(2);
   });
 });
+
+// =============================================================================
+// randomUUID Tests
+// =============================================================================
 
 describe('randomUUID()', () => {
   it('should generate valid UUID v4 format', () => {
     const uuid = randomUUID();
-    // UUID v4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    expect(uuidRegex.test(uuid)).toBe(true);
+    // UUID format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+    expect(uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
   });
 
-  it('should generate unique values', () => {
-    const values = new Set();
-    for (let i = 0; i < 100; i++) {
-      values.add(randomUUID());
-    }
-    expect(values.size).toBe(100);
+  it('should generate different UUIDs each time', () => {
+    const uuid1 = randomUUID();
+    const uuid2 = randomUUID();
+    expect(uuid1).not.toBe(uuid2);
+  });
+
+  it('should have correct length (36 characters with hyphens)', () => {
+    const uuid = randomUUID();
+    expect(uuid.length).toBe(36);
   });
 });

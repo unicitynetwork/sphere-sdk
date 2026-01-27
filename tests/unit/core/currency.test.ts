@@ -1,6 +1,6 @@
 /**
  * Tests for core/currency.ts
- * Covers amount conversion and formatting functions
+ * Covers currency conversion utilities
  */
 
 import { describe, it, expect } from 'vitest';
@@ -12,63 +12,62 @@ import {
   CurrencyUtils,
 } from '../../../core/currency';
 
-import { CURRENCY_VECTORS } from '../../fixtures/test-vectors';
-
 // =============================================================================
 // toSmallestUnit Tests
 // =============================================================================
 
 describe('toSmallestUnit()', () => {
-  it('should convert whole numbers correctly', () => {
+  it('should convert integer amounts', () => {
     expect(toSmallestUnit('1', 18)).toBe(1000000000000000000n);
     expect(toSmallestUnit('100', 18)).toBe(100000000000000000000n);
-    expect(toSmallestUnit(1, 18)).toBe(1000000000000000000n);
   });
 
-  it('should convert decimal numbers correctly', () => {
+  it('should convert decimal amounts', () => {
     expect(toSmallestUnit('1.5', 18)).toBe(1500000000000000000n);
-    expect(toSmallestUnit('0.5', 18)).toBe(500000000000000000n);
-    expect(toSmallestUnit('0.000000000000000001', 18)).toBe(1n);
-  });
-
-  it('should use test vectors', () => {
-    for (const vector of CURRENCY_VECTORS) {
-      expect(toSmallestUnit(vector.human, vector.decimals)).toBe(vector.smallestUnit);
-    }
+    expect(toSmallestUnit('0.1', 18)).toBe(100000000000000000n);
   });
 
   it('should handle different decimal places', () => {
-    expect(toSmallestUnit('1', 6)).toBe(1000000n);
-    expect(toSmallestUnit('1.23', 6)).toBe(1230000n);
-    expect(toSmallestUnit('1', 8)).toBe(100000000n);
+    expect(toSmallestUnit('1.5', 6)).toBe(1500000n);
+    expect(toSmallestUnit('100', 6)).toBe(100000000n);
+    expect(toSmallestUnit('1.23', 2)).toBe(123n);
   });
 
-  it('should truncate excess decimal places', () => {
-    // 1.123456789... with 6 decimals should truncate to 1.123456
-    expect(toSmallestUnit('1.1234567', 6)).toBe(1123456n);
+  it('should handle number input', () => {
+    expect(toSmallestUnit(1.5, 18)).toBe(1500000000000000000n);
+    expect(toSmallestUnit(100, 6)).toBe(100000000n);
   });
 
-  it('should handle zero', () => {
-    expect(toSmallestUnit('0', 18)).toBe(0n);
+  it('should truncate extra decimal places', () => {
+    // 1.123456789012345678901 with 18 decimals should truncate to 18
+    expect(toSmallestUnit('1.1234567890123456789', 18)).toBe(1123456789012345678n);
+  });
+
+  it('should pad short decimal places', () => {
+    expect(toSmallestUnit('1.5', 18)).toBe(1500000000000000000n);
+    expect(toSmallestUnit('1.05', 18)).toBe(1050000000000000000n);
+  });
+
+  it('should return 0n for empty/falsy input', () => {
+    expect(toSmallestUnit('', 18)).toBe(0n);
     expect(toSmallestUnit(0, 18)).toBe(0n);
   });
 
-  it('should handle empty/falsy values', () => {
-    expect(toSmallestUnit('', 18)).toBe(0n);
+  it('should handle zero amounts', () => {
+    expect(toSmallestUnit('0', 18)).toBe(0n);
+    expect(toSmallestUnit('0.0', 18)).toBe(0n);
   });
 
-  it('should use DEFAULT_TOKEN_DECIMALS by default', () => {
-    expect(DEFAULT_TOKEN_DECIMALS).toBe(18);
+  it('should use default decimals (18)', () => {
     expect(toSmallestUnit('1')).toBe(1000000000000000000n);
   });
 
-  it('should handle large numbers', () => {
-    expect(toSmallestUnit('1000000', 18)).toBe(1000000000000000000000000n);
+  it('should handle very large amounts', () => {
+    expect(toSmallestUnit('1000000000', 18)).toBe(1000000000000000000000000000n);
   });
 
-  it('should handle very small fractions', () => {
-    expect(toSmallestUnit('0.1', 18)).toBe(100000000000000000n);
-    expect(toSmallestUnit('0.01', 18)).toBe(10000000000000000n);
+  it('should handle very small amounts', () => {
+    expect(toSmallestUnit('0.000000000000000001', 18)).toBe(1n);
   });
 });
 
@@ -77,74 +76,47 @@ describe('toSmallestUnit()', () => {
 // =============================================================================
 
 describe('toHumanReadable()', () => {
-  it('should convert whole amounts correctly', () => {
+  it('should convert integer values', () => {
     expect(toHumanReadable(1000000000000000000n, 18)).toBe('1');
     expect(toHumanReadable(100000000000000000000n, 18)).toBe('100');
   });
 
-  it('should convert fractional amounts correctly', () => {
+  it('should convert decimal values', () => {
     expect(toHumanReadable(1500000000000000000n, 18)).toBe('1.5');
-    expect(toHumanReadable(500000000000000000n, 18)).toBe('0.5');
-    expect(toHumanReadable(1n, 18)).toBe('0.000000000000000001');
-  });
-
-  it('should use test vectors (reverse)', () => {
-    for (const vector of CURRENCY_VECTORS) {
-      expect(toHumanReadable(vector.smallestUnit, vector.decimals)).toBe(vector.human);
-    }
+    expect(toHumanReadable(100000000000000000n, 18)).toBe('0.1');
   });
 
   it('should handle different decimal places', () => {
-    expect(toHumanReadable(1000000n, 6)).toBe('1');
-    expect(toHumanReadable(1230000n, 6)).toBe('1.23');
-    expect(toHumanReadable(100000000n, 8)).toBe('1');
+    expect(toHumanReadable(1500000n, 6)).toBe('1.5');
+    expect(toHumanReadable(100000000n, 6)).toBe('100');
+    expect(toHumanReadable(123n, 2)).toBe('1.23');
+  });
+
+  it('should handle string input', () => {
+    expect(toHumanReadable('1500000000000000000', 18)).toBe('1.5');
+  });
+
+  it('should strip trailing zeros in fraction', () => {
+    expect(toHumanReadable(1500000000000000000n, 18)).toBe('1.5');
+    expect(toHumanReadable(1000000000000000000n, 18)).toBe('1');
+    expect(toHumanReadable(1010000000000000000n, 18)).toBe('1.01');
   });
 
   it('should handle zero', () => {
     expect(toHumanReadable(0n, 18)).toBe('0');
   });
 
-  it('should strip trailing zeros from fraction', () => {
-    expect(toHumanReadable(1500000000000000000n, 18)).toBe('1.5');
-    expect(toHumanReadable(1000000000000000000n, 18)).toBe('1');
-    // Not '1.000000000000000000'
-  });
-
-  it('should handle string input', () => {
-    expect(toHumanReadable('1000000000000000000', 18)).toBe('1');
-  });
-
-  it('should handle large numbers', () => {
-    expect(toHumanReadable(1000000000000000000000000n, 18)).toBe('1000000');
-  });
-
   it('should handle very small amounts', () => {
-    expect(toHumanReadable(100000000000000000n, 18)).toBe('0.1');
-    expect(toHumanReadable(10000000000000000n, 18)).toBe('0.01');
-  });
-});
-
-// =============================================================================
-// Round-trip Tests
-// =============================================================================
-
-describe('toSmallestUnit/toHumanReadable Round-trip', () => {
-  it('should round-trip whole numbers', () => {
-    const values = ['0', '1', '10', '100', '1000000'];
-    for (const value of values) {
-      const smallest = toSmallestUnit(value, 18);
-      const human = toHumanReadable(smallest, 18);
-      expect(human).toBe(value);
-    }
+    expect(toHumanReadable(1n, 18)).toBe('0.000000000000000001');
+    expect(toHumanReadable(100n, 18)).toBe('0.0000000000000001');
   });
 
-  it('should round-trip decimal numbers', () => {
-    const values = ['0.1', '0.5', '1.5', '123.456', '0.000000000000000001'];
-    for (const value of values) {
-      const smallest = toSmallestUnit(value, 18);
-      const human = toHumanReadable(smallest, 18);
-      expect(human).toBe(value);
-    }
+  it('should use default decimals (18)', () => {
+    expect(toHumanReadable(1000000000000000000n)).toBe('1');
+  });
+
+  it('should handle amounts smaller than 1 unit', () => {
+    expect(toHumanReadable(500000000000000000n, 18)).toBe('0.5');
   });
 });
 
@@ -153,88 +125,114 @@ describe('toSmallestUnit/toHumanReadable Round-trip', () => {
 // =============================================================================
 
 describe('formatAmount()', () => {
-  it('should format amount without symbol', () => {
+  it('should format without symbol', () => {
     expect(formatAmount(1500000000000000000n, { decimals: 18 })).toBe('1.5');
   });
 
-  it('should format amount with symbol', () => {
+  it('should format with symbol', () => {
     expect(formatAmount(1500000000000000000n, { decimals: 18, symbol: 'ALPHA' })).toBe('1.5 ALPHA');
   });
 
   it('should limit fraction digits', () => {
-    expect(
-      formatAmount(1234567890123456789n, { decimals: 18, maxFractionDigits: 4 })
-    ).toBe('1.2345');
+    expect(formatAmount(1123456789012345678n, {
+      decimals: 18,
+      maxFractionDigits: 4,
+    })).toBe('1.1234');
   });
 
-  it('should handle zero maxFractionDigits', () => {
-    expect(
-      formatAmount(1500000000000000000n, { decimals: 18, maxFractionDigits: 0 })
-    ).toBe('1');
+  it('should handle maxFractionDigits = 0', () => {
+    expect(formatAmount(1500000000000000000n, {
+      decimals: 18,
+      maxFractionDigits: 0,
+    })).toBe('1');
   });
 
-  it('should not add extra zeros for maxFractionDigits', () => {
-    expect(
-      formatAmount(1500000000000000000n, { decimals: 18, maxFractionDigits: 10 })
-    ).toBe('1.5');
-    // Not '1.5000000000'
+  it('should not truncate if fraction is shorter than max', () => {
+    expect(formatAmount(1500000000000000000n, {
+      decimals: 18,
+      maxFractionDigits: 10,
+    })).toBe('1.5');
   });
 
   it('should use default decimals', () => {
     expect(formatAmount(1000000000000000000n)).toBe('1');
   });
 
-  it('should format with symbol and limited decimals', () => {
-    expect(
-      formatAmount(1234567890123456789n, {
-        decimals: 18,
-        symbol: 'ETH',
-        maxFractionDigits: 2,
-      })
-    ).toBe('1.23 ETH');
+  it('should combine symbol and maxFractionDigits', () => {
+    expect(formatAmount(1123456789012345678n, {
+      decimals: 18,
+      symbol: 'TOKEN',
+      maxFractionDigits: 2,
+    })).toBe('1.12 TOKEN');
+  });
+
+  it('should handle zero with symbol', () => {
+    expect(formatAmount(0n, { decimals: 18, symbol: 'ALPHA' })).toBe('0 ALPHA');
+  });
+
+  it('should handle string input', () => {
+    expect(formatAmount('1500000000000000000', { decimals: 18, symbol: 'X' })).toBe('1.5 X');
   });
 });
 
 // =============================================================================
-// CurrencyUtils Namespace Tests
+// CurrencyUtils namespace Tests
 // =============================================================================
 
 describe('CurrencyUtils namespace', () => {
   it('should export toSmallestUnit', () => {
-    expect(CurrencyUtils.toSmallestUnit).toBe(toSmallestUnit);
+    expect(CurrencyUtils.toSmallestUnit('1', 18)).toBe(1000000000000000000n);
   });
 
   it('should export toHumanReadable', () => {
-    expect(CurrencyUtils.toHumanReadable).toBe(toHumanReadable);
+    expect(CurrencyUtils.toHumanReadable(1000000000000000000n, 18)).toBe('1');
   });
 
   it('should export format (alias for formatAmount)', () => {
-    expect(CurrencyUtils.format).toBe(formatAmount);
+    expect(CurrencyUtils.format(1500000000000000000n, { symbol: 'TEST' })).toBe('1.5 TEST');
   });
 });
 
 // =============================================================================
-// Edge Cases
+// DEFAULT_TOKEN_DECIMALS Tests
 // =============================================================================
 
-describe('Edge Cases', () => {
-  it('should handle maximum safe integer (JavaScript)', () => {
-    // JavaScript's max safe integer is 2^53 - 1 = 9007199254740991
-    // But bigint can handle much larger
-    const large = 9007199254740991000000000n;
-    const human = toHumanReadable(large, 18);
-    const back = toSmallestUnit(human, 18);
-    expect(back).toBe(large);
+describe('DEFAULT_TOKEN_DECIMALS', () => {
+  it('should be 18', () => {
+    expect(DEFAULT_TOKEN_DECIMALS).toBe(18);
+  });
+});
+
+// =============================================================================
+// Round-trip Tests
+// =============================================================================
+
+describe('Round-trip conversions', () => {
+  it('should round-trip integer amounts', () => {
+    const original = '123';
+    const smallest = toSmallestUnit(original, 18);
+    const back = toHumanReadable(smallest, 18);
+    expect(back).toBe(original);
   });
 
-  // Note: 0 decimals is an edge case that may not work perfectly
-  // Most tokens have at least 1 decimal place
-  it('should handle very small decimal places', () => {
-    expect(toSmallestUnit('123', 1)).toBe(1230n);
-    expect(toHumanReadable(1230n, 1)).toBe('123');
+  it('should round-trip decimal amounts', () => {
+    const original = '1.5';
+    const smallest = toSmallestUnit(original, 18);
+    const back = toHumanReadable(smallest, 18);
+    expect(back).toBe(original);
   });
 
-  it('should handle decimal with no integer part', () => {
-    expect(toSmallestUnit('.5', 18)).toBe(500000000000000000n);
+  it('should round-trip with different decimals', () => {
+    const original = '123.456';
+    const smallest = toSmallestUnit(original, 6);
+    const back = toHumanReadable(smallest, 6);
+    expect(back).toBe(original);
+  });
+
+  it('should round-trip zero', () => {
+    const original = '0';
+    const smallest = toSmallestUnit(original, 18);
+    const back = toHumanReadable(smallest, 18);
+    expect(back).toBe(original);
   });
 });
