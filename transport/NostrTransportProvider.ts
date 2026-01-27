@@ -172,6 +172,125 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   // ===========================================================================
+  // Dynamic Relay Management
+  // ===========================================================================
+
+  /**
+   * Get list of configured relay URLs
+   */
+  getRelays(): string[] {
+    return [...this.config.relays];
+  }
+
+  /**
+   * Get list of currently connected relay URLs
+   */
+  getConnectedRelays(): string[] {
+    return Array.from(this.connections.keys());
+  }
+
+  /**
+   * Add a new relay dynamically
+   * Will connect immediately if provider is already connected
+   */
+  async addRelay(relayUrl: string): Promise<boolean> {
+    // Check if already configured
+    if (this.config.relays.includes(relayUrl)) {
+      this.log('Relay already configured:', relayUrl);
+      return false;
+    }
+
+    // Add to config
+    this.config.relays.push(relayUrl);
+
+    // Connect if provider is connected
+    if (this.status === 'connected') {
+      try {
+        await this.connectToRelay(relayUrl);
+        this.log('Added and connected to relay:', relayUrl);
+        this.emitEvent({
+          type: 'transport:relay_added',
+          timestamp: Date.now(),
+          data: { relay: relayUrl, connected: true },
+        });
+        return true;
+      } catch (error) {
+        this.log('Failed to connect to new relay:', relayUrl, error);
+        this.emitEvent({
+          type: 'transport:relay_added',
+          timestamp: Date.now(),
+          data: { relay: relayUrl, connected: false, error: String(error) },
+        });
+        return false;
+      }
+    }
+
+    this.emitEvent({
+      type: 'transport:relay_added',
+      timestamp: Date.now(),
+      data: { relay: relayUrl, connected: false },
+    });
+    return true;
+  }
+
+  /**
+   * Remove a relay dynamically
+   * Will disconnect from the relay if connected
+   */
+  async removeRelay(relayUrl: string): Promise<boolean> {
+    const index = this.config.relays.indexOf(relayUrl);
+    if (index === -1) {
+      this.log('Relay not found:', relayUrl);
+      return false;
+    }
+
+    // Remove from config
+    this.config.relays.splice(index, 1);
+
+    // Disconnect if connected
+    const ws = this.connections.get(relayUrl);
+    if (ws) {
+      ws.close();
+      this.connections.delete(relayUrl);
+      this.reconnectAttempts.delete(relayUrl);
+      this.log('Removed and disconnected from relay:', relayUrl);
+    }
+
+    this.emitEvent({
+      type: 'transport:relay_removed',
+      timestamp: Date.now(),
+      data: { relay: relayUrl },
+    });
+
+    // Check if we still have connections
+    if (this.connections.size === 0 && this.status === 'connected') {
+      this.status = 'error';
+      this.emitEvent({
+        type: 'transport:error',
+        timestamp: Date.now(),
+        data: { error: 'No connected relays remaining' },
+      });
+    }
+
+    return true;
+  }
+
+  /**
+   * Check if a relay is configured
+   */
+  hasRelay(relayUrl: string): boolean {
+    return this.config.relays.includes(relayUrl);
+  }
+
+  /**
+   * Check if a relay is currently connected
+   */
+  isRelayConnected(relayUrl: string): boolean {
+    const ws = this.connections.get(relayUrl);
+    return ws !== undefined && ws.readyState === WebSocketReadyState.OPEN;
+  }
+
+  // ===========================================================================
   // TransportProvider Implementation
   // ===========================================================================
 

@@ -54,7 +54,7 @@ import type { TransportProvider } from '../transport';
 import type { OracleProvider } from '../oracle';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
-import { STORAGE_KEYS, DEFAULT_DERIVATION_PATH, DEFAULT_BASE_PATH, LIMITS, DEFAULT_ENCRYPTION_KEY } from '../constants';
+import { STORAGE_KEYS, DEFAULT_DERIVATION_PATH, DEFAULT_BASE_PATH, LIMITS, DEFAULT_ENCRYPTION_KEY, type NetworkType } from '../constants';
 import {
   generateMnemonic as generateBip39Mnemonic,
   validateMnemonic as validateBip39Mnemonic,
@@ -83,6 +83,10 @@ import {
   isSQLiteDatabase,
   isWalletDatEncrypted,
 } from '../serialization/wallet-dat';
+import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
+import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
+import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
+import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
 import type {
   LegacyFileType,
   DecryptionProgressCallback,
@@ -110,6 +114,12 @@ export interface SphereCreateOptions {
   oracle: OracleProvider;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /**
+   * Network type (mainnet, testnet, dev) - informational only.
+   * Actual network configuration comes from provider URLs.
+   * Use createBrowserProviders({ network: 'testnet' }) to set up testnet providers.
+   */
+  network?: NetworkType;
 }
 
 /** Options for loading existing wallet */
@@ -124,6 +134,12 @@ export interface SphereLoadOptions {
   oracle: OracleProvider;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /**
+   * Network type (mainnet, testnet, dev) - informational only.
+   * Actual network configuration comes from provider URLs.
+   * Use createBrowserProviders({ network: 'testnet' }) to set up testnet providers.
+   */
+  network?: NetworkType;
 }
 
 /** Options for importing a wallet */
@@ -184,6 +200,12 @@ export interface SphereInitOptions {
   nametag?: string;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /**
+   * Network type (mainnet, testnet, dev) - informational only.
+   * Actual network configuration comes from provider URLs.
+   * Use createBrowserProviders({ network: 'testnet' }) to set up testnet providers.
+   */
+  network?: NetworkType;
 }
 
 /** Result of init operation */
@@ -194,6 +216,34 @@ export interface SphereInitResult {
   created: boolean;
   /** Generated mnemonic (only if autoGenerate was used) */
   generatedMnemonic?: string;
+}
+
+// =============================================================================
+// L3 Predicate Address Derivation
+// =============================================================================
+
+/** Token type for Unicity network (used for L3 predicate address derivation) */
+const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
+
+/**
+ * Derive L3 predicate address (DIRECT://...) from private key
+ * Uses UnmaskedPredicateReference for stable wallet address
+ */
+async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
+  const secret = Buffer.from(privateKey, 'hex');
+  const signingService = await SigningService.createFromSecret(secret);
+
+  const tokenTypeBytes = Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex');
+  const tokenType = new TokenType(tokenTypeBytes);
+
+  const predicateRef = UnmaskedPredicateReference.create(
+    tokenType,
+    signingService.algorithm,
+    signingService.publicKey,
+    HashAlgorithm.SHA256
+  );
+
+  return (await (await predicateRef).toAddress()).toString();
 }
 
 // =============================================================================
@@ -221,10 +271,12 @@ export class Sphere {
   private _source: WalletSource = 'unknown';
   private _derivationMode: DerivationMode = 'bip32';
   private _basePath: string = DEFAULT_BASE_PATH;
+  private _currentAddressIndex: number = 0;
+  private _addressNametags: Map<number, string> = new Map();
 
   // Providers
   private _storage: StorageProvider;
-  private _tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  private _tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>> = new Map();
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
 
@@ -247,9 +299,13 @@ export class Sphere {
     l1Config?: L1Config
   ) {
     this._storage = storage;
-    this._tokenStorage = tokenStorage;
     this._transport = transport;
     this._oracle = oracle;
+
+    // Initialize token storage providers map
+    if (tokenStorage) {
+      this._tokenStorageProviders.set(tokenStorage.id, tokenStorage);
+    }
 
     this._payments = createPaymentsModule({ l1: l1Config });
     this._communications = createCommunicationsModule();
@@ -556,6 +612,7 @@ export class Sphere {
     return {
       publicKey: this._identity.publicKey,
       address: this._identity.address,
+      predicateAddress: this._identity.predicateAddress,
       ipnsName: this._identity.ipnsName,
       nametag: this._identity.nametag,
     };
@@ -574,8 +631,72 @@ export class Sphere {
     return this._storage;
   }
 
+  /**
+   * Get first token storage provider (for backward compatibility)
+   * @deprecated Use getTokenStorageProviders() for multiple providers
+   */
   getTokenStorage(): TokenStorageProvider<TxfStorageDataBase> | undefined {
-    return this._tokenStorage;
+    const providers = Array.from(this._tokenStorageProviders.values());
+    return providers.length > 0 ? providers[0] : undefined;
+  }
+
+  /**
+   * Get all token storage providers
+   */
+  getTokenStorageProviders(): Map<string, TokenStorageProvider<TxfStorageDataBase>> {
+    return new Map(this._tokenStorageProviders);
+  }
+
+  /**
+   * Add a token storage provider dynamically (e.g., from UI)
+   * Provider will be initialized and connected automatically
+   */
+  async addTokenStorageProvider(provider: TokenStorageProvider<TxfStorageDataBase>): Promise<void> {
+    if (this._tokenStorageProviders.has(provider.id)) {
+      throw new Error(`Token storage provider '${provider.id}' already exists`);
+    }
+
+    // Set identity if wallet is initialized
+    if (this._identity) {
+      provider.setIdentity(this._identity);
+      await provider.initialize();
+    }
+
+    this._tokenStorageProviders.set(provider.id, provider);
+
+    // Update payments module with new providers
+    if (this._initialized) {
+      this._payments.updateTokenStorageProviders(this._tokenStorageProviders);
+    }
+  }
+
+  /**
+   * Remove a token storage provider dynamically
+   */
+  async removeTokenStorageProvider(providerId: string): Promise<boolean> {
+    const provider = this._tokenStorageProviders.get(providerId);
+    if (!provider) {
+      return false;
+    }
+
+    // Shutdown provider gracefully
+    await provider.shutdown();
+
+    this._tokenStorageProviders.delete(providerId);
+
+    // Update payments module
+    if (this._initialized) {
+      this._payments.updateTokenStorageProviders(this._tokenStorageProviders);
+    }
+
+    return true;
+  }
+
+  /**
+   * Check if a token storage provider is registered
+   */
+  hasTokenStorageProvider(providerId: string): boolean {
+    return this._tokenStorageProviders.has(providerId);
   }
 
   getTransport(): TransportProvider {
@@ -1207,6 +1328,150 @@ export class Sphere {
   }
 
   /**
+   * Get the current active address index
+   *
+   * @example
+   * ```ts
+   * const currentIndex = sphere.getCurrentAddressIndex();
+   * console.log(currentIndex); // 0
+   *
+   * await sphere.switchToAddress(2);
+   * console.log(sphere.getCurrentAddressIndex()); // 2
+   * ```
+   */
+  getCurrentAddressIndex(): number {
+    return this._currentAddressIndex;
+  }
+
+  /**
+   * Get nametag for a specific address index
+   *
+   * @param index - Address index (default: current address)
+   * @returns Nametag or undefined if not registered
+   */
+  getNametagForAddress(index?: number): string | undefined {
+    const addressIndex = index ?? this._currentAddressIndex;
+    return this._addressNametags.get(addressIndex);
+  }
+
+  /**
+   * Get all registered address nametags
+   *
+   * @returns Map of address index to nametag
+   */
+  getAllAddressNametags(): Map<number, string> {
+    return new Map(this._addressNametags);
+  }
+
+  /**
+   * Switch to a different address by index
+   * This changes the active identity to the derived address at the specified index.
+   *
+   * @param index - Address index to switch to (0, 1, 2, ...)
+   *
+   * @example
+   * ```ts
+   * // Switch to second address
+   * await sphere.switchToAddress(1);
+   * console.log(sphere.identity?.address); // alpha1... (address at index 1)
+   *
+   * // Register nametag for this address
+   * await sphere.registerNametag('bob');
+   *
+   * // Switch back to first address
+   * await sphere.switchToAddress(0);
+   * ```
+   */
+  async switchToAddress(index: number): Promise<void> {
+    this.ensureReady();
+
+    if (!this._masterKey) {
+      throw new Error('HD derivation requires master key with chain code. Cannot switch addresses.');
+    }
+
+    if (index < 0) {
+      throw new Error('Address index must be non-negative');
+    }
+
+    // Derive the address at the given index
+    const addressInfo = this.deriveAddress(index, false);
+
+    // Generate IPNS name from public key hash
+    const ipnsHash = sha256(addressInfo.publicKey, 'hex').slice(0, 40);
+
+    // Derive L3 predicate address (DIRECT://...)
+    const predicateAddress = await deriveL3PredicateAddress(addressInfo.privateKey);
+
+    // Get nametag for this address (if registered)
+    const nametag = this._addressNametags.get(index);
+
+    // Update identity
+    this._identity = {
+      privateKey: addressInfo.privateKey,
+      publicKey: addressInfo.publicKey,
+      address: addressInfo.address,
+      predicateAddress,
+      ipnsName: '12D3KooW' + ipnsHash,
+      nametag,
+    };
+
+    // Update current index
+    this._currentAddressIndex = index;
+
+    // Persist current index
+    await this._storage.set(STORAGE_KEYS.CURRENT_ADDRESS_INDEX, index.toString());
+
+    // Re-initialize providers with new identity
+    this._storage.setIdentity(this._identity);
+    this._transport.setIdentity(this._identity);
+
+    // Update token storage providers
+    for (const provider of this._tokenStorageProviders.values()) {
+      provider.setIdentity(this._identity);
+    }
+
+    // Re-initialize modules with new identity
+    await this.reinitializeModulesForNewAddress();
+
+    this.emitEvent('identity:changed', {
+      address: this._identity.address,
+      predicateAddress: this._identity.predicateAddress,
+      publicKey: this._identity.publicKey,
+      nametag: this._identity.nametag,
+      addressIndex: index,
+    });
+
+    console.log(`[Sphere] Switched to address ${index}:`, this._identity.address);
+  }
+
+  /**
+   * Re-initialize modules after address switch
+   */
+  private async reinitializeModulesForNewAddress(): Promise<void> {
+    const emitEvent = this.emitEvent.bind(this);
+
+    this._payments.initialize({
+      identity: this._identity!,
+      storage: this._storage,
+      tokenStorageProviders: this._tokenStorageProviders,
+      transport: this._transport,
+      oracle: this._oracle,
+      emitEvent,
+      chainCode: this._masterKey?.chainCode,
+    });
+
+    this._communications.initialize({
+      identity: this._identity!,
+      storage: this._storage,
+      transport: this._transport,
+      emitEvent,
+    });
+
+    await this._payments.load();
+    await this._communications.load();
+  }
+
+  /**
    * Derive address at a specific index
    *
    * @param index - Address index (0, 1, 2, ...)
@@ -1392,17 +1657,21 @@ export class Sphere {
   }
 
   /**
-   * Register a nametag for this wallet
-   * Can be called after wallet creation if nametag wasn't provided in config
+   * Register a nametag for the current active address
+   * Each address can have its own independent nametag
    *
    * @example
    * ```ts
-   * // Create wallet without nametag
-   * const sphere = await Sphere.create({ mnemonic, storage, transport, oracle });
-   *
-   * // Later, register nametag
+   * // Register nametag for first address (index 0)
    * await sphere.registerNametag('alice');
-   * console.log(sphere.getNametag()); // 'alice'
+   *
+   * // Switch to second address and register different nametag
+   * await sphere.switchToAddress(1);
+   * await sphere.registerNametag('bob');
+   *
+   * // Now:
+   * // - Address 0 has nametag @alice
+   * // - Address 1 has nametag @bob
    * ```
    */
   async registerNametag(nametag: string): Promise<void> {
@@ -1414,9 +1683,9 @@ export class Sphere {
       throw new Error('Invalid nametag format. Use alphanumeric characters, 3-20 chars.');
     }
 
-    // Check if already registered
+    // Check if current address already has a nametag
     if (this._identity?.nametag) {
-      throw new Error(`Nametag already registered: @${this._identity.nametag}`);
+      throw new Error(`Nametag already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`);
     }
 
     // Register with transport provider
@@ -1430,11 +1699,47 @@ export class Sphere {
     // Update identity
     this._identity!.nametag = cleanNametag;
 
-    // Persist to storage
-    await this._storage.set(STORAGE_KEYS.NAMETAG, cleanNametag);
+    // Store in address nametags map
+    this._addressNametags.set(this._currentAddressIndex, cleanNametag);
 
-    this.emitEvent('nametag:registered', { nametag: cleanNametag });
-    console.log('[Sphere] Nametag registered:', cleanNametag);
+    // Persist to storage (both legacy and new format)
+    await this._storage.set(STORAGE_KEYS.NAMETAG, cleanNametag);
+    await this.persistAddressNametags();
+
+    this.emitEvent('nametag:registered', {
+      nametag: cleanNametag,
+      addressIndex: this._currentAddressIndex,
+    });
+    console.log(`[Sphere] Nametag registered for address ${this._currentAddressIndex}:`, cleanNametag);
+  }
+
+  /**
+   * Persist address nametags to storage
+   */
+  private async persistAddressNametags(): Promise<void> {
+    const nametagsObj: Record<string, string> = {};
+    this._addressNametags.forEach((nametag, index) => {
+      nametagsObj[index.toString()] = nametag;
+    });
+    await this._storage.set(STORAGE_KEYS.ADDRESS_NAMETAGS, JSON.stringify(nametagsObj));
+  }
+
+  /**
+   * Load address nametags from storage
+   */
+  private async loadAddressNametags(): Promise<void> {
+    try {
+      const saved = await this._storage.get(STORAGE_KEYS.ADDRESS_NAMETAGS);
+      if (saved) {
+        const nametagsObj = JSON.parse(saved) as Record<string, string>;
+        this._addressNametags.clear();
+        for (const [indexStr, nametag] of Object.entries(nametagsObj)) {
+          this._addressNametags.set(parseInt(indexStr, 10), nametag);
+        }
+      }
+    } catch {
+      // Ignore parse errors - start fresh
+    }
   }
 
   /**
@@ -1545,11 +1850,16 @@ export class Sphere {
     const savedBasePath = await this._storage.get(STORAGE_KEYS.BASE_PATH);
     const savedDerivationMode = await this._storage.get(STORAGE_KEYS.DERIVATION_MODE);
     const savedSource = await this._storage.get(STORAGE_KEYS.WALLET_SOURCE);
+    const savedAddressIndex = await this._storage.get(STORAGE_KEYS.CURRENT_ADDRESS_INDEX);
 
     // Restore wallet metadata
     this._basePath = savedBasePath ?? DEFAULT_BASE_PATH;
     this._derivationMode = (savedDerivationMode as DerivationMode) ?? 'bip32';
     this._source = (savedSource as WalletSource) ?? 'unknown';
+    this._currentAddressIndex = savedAddressIndex ? parseInt(savedAddressIndex, 10) : 0;
+
+    // Load address nametags
+    await this.loadAddressNametags();
 
     if (encryptedMnemonic) {
       const mnemonic = this.decrypt(encryptedMnemonic);
@@ -1577,10 +1887,40 @@ export class Sphere {
       throw new Error('No wallet data found in storage');
     }
 
-    // Restore saved nametag
-    if (savedNametag && this._identity) {
-      this._identity.nametag = savedNametag;
-      console.log('[Sphere] Restored nametag:', savedNametag);
+    // If we have a saved address index > 0 and master key, switch to that address
+    if (this._currentAddressIndex > 0 && this._masterKey) {
+      // Re-derive identity for the saved address index
+      const addressInfo = this.deriveAddress(this._currentAddressIndex, false);
+      const ipnsHash = sha256(addressInfo.publicKey, 'hex').slice(0, 40);
+      const predicateAddress = await deriveL3PredicateAddress(addressInfo.privateKey);
+      const nametag = this._addressNametags.get(this._currentAddressIndex);
+
+      this._identity = {
+        privateKey: addressInfo.privateKey,
+        publicKey: addressInfo.publicKey,
+        address: addressInfo.address,
+        predicateAddress,
+        ipnsName: '12D3KooW' + ipnsHash,
+        nametag,
+      };
+      console.log(`[Sphere] Restored to address ${this._currentAddressIndex}:`, this._identity.address);
+    } else {
+      // Restore saved nametag for address 0 (legacy support)
+      if (savedNametag && this._identity) {
+        this._identity.nametag = savedNametag;
+        // Also add to address nametags map if not already there
+        if (!this._addressNametags.has(0)) {
+          this._addressNametags.set(0, savedNametag);
+        }
+        console.log('[Sphere] Restored nametag:', savedNametag);
+      } else if (this._identity) {
+        // Check if we have a nametag in the map for address 0
+        const nametag = this._addressNametags.get(0);
+        if (nametag) {
+          this._identity.nametag = nametag;
+          console.log('[Sphere] Restored nametag from map:', nametag);
+        }
+      }
     }
   }
 
@@ -1609,10 +1949,14 @@ export class Sphere {
     // Generate IPNS name from public key hash
     const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
 
+    // Derive L3 predicate address (DIRECT://...)
+    const predicateAddress = await deriveL3PredicateAddress(derivedKey.privateKey);
+
     this._identity = {
       privateKey: derivedKey.privateKey,
       publicKey,
       address: 'alpha1' + addressHash.slice(0, 38),
+      predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
 
@@ -1650,10 +1994,14 @@ export class Sphere {
     const addressHash = hash160(publicKey);
     const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
 
+    // Derive L3 predicate address (DIRECT://...)
+    const predicateAddress = await deriveL3PredicateAddress(privateKey);
+
     this._identity = {
       privateKey,
       publicKey,
       address: 'alpha1' + addressHash.slice(0, 38),
+      predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
 
@@ -1669,8 +2017,9 @@ export class Sphere {
     this._storage.setIdentity(this._identity!);
     this._transport.setIdentity(this._identity!);
 
-    if (this._tokenStorage) {
-      this._tokenStorage.setIdentity(this._identity!);
+    // Set identity on all token storage providers
+    for (const provider of this._tokenStorageProviders.values()) {
+      provider.setIdentity(this._identity!);
     }
 
     // Connect providers
@@ -1678,8 +2027,9 @@ export class Sphere {
     await this._transport.connect();
     await this._oracle.initialize();
 
-    if (this._tokenStorage) {
-      await this._tokenStorage.initialize();
+    // Initialize all token storage providers
+    for (const provider of this._tokenStorageProviders.values()) {
+      await provider.initialize();
     }
   }
 
@@ -1689,7 +2039,7 @@ export class Sphere {
     this._payments.initialize({
       identity: this._identity!,
       storage: this._storage,
-      tokenStorage: this._tokenStorage,
+      tokenStorageProviders: this._tokenStorageProviders,
       transport: this._transport,
       oracle: this._oracle,
       emitEvent,

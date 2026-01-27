@@ -29,7 +29,10 @@ export interface BaseProvider extends ProviderMetadata {
 
 export interface Identity {
   readonly publicKey: string;
+  /** L1 address (alpha1...) */
   readonly address: string;
+  /** L3 predicate address (DIRECT://...) */
+  readonly predicateAddress?: string;
   readonly ipnsName?: string;
   readonly nametag?: string;
 }
@@ -284,9 +287,11 @@ export type SphereEventType =
   | 'message:broadcast'
   | 'sync:started'
   | 'sync:completed'
+  | 'sync:provider'
   | 'sync:error'
   | 'connection:changed'
-  | 'nametag:registered';
+  | 'nametag:registered'
+  | 'identity:changed';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -301,9 +306,11 @@ export interface SphereEventMap {
   'message:broadcast': BroadcastMessage;
   'sync:started': { source: string };
   'sync:completed': { source: string; count: number };
+  'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
   'connection:changed': { provider: string; connected: boolean };
-  'nametag:registered': { nametag: string };
+  'nametag:registered': { nametag: string; addressIndex: number };
+  'identity:changed': { address: string; predicateAddress?: string; publicKey: string; nametag?: string; addressIndex: number };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (

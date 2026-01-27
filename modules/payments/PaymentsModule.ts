@@ -369,7 +369,10 @@ export interface PaymentsModuleConfig {
 export interface PaymentsModuleDependencies {
   identity: FullIdentity;
   storage: StorageProvider;
+  /** @deprecated Use tokenStorageProviders instead */
   tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /** Multiple token storage providers (e.g., IPFS, MongoDB, file) */
+  tokenStorageProviders?: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
   transport: TransportProvider;
   oracle: OracleProvider;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
@@ -1562,7 +1565,8 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Sync with storage (IPFS)
+   * Sync with all token storage providers (IPFS, MongoDB, etc.)
+   * Syncs with each provider and merges results
    */
   async sync(): Promise<{ added: number; removed: number }> {
     this.ensureInitialized();
@@ -1570,38 +1574,94 @@ export class PaymentsModule {
     this.deps!.emitEvent('sync:started', { source: 'payments' });
 
     try {
-      // If we have token storage provider, use it
-      if (this.deps!.tokenStorage) {
-        const localData = await this.createStorageData();
-        const result = await this.deps!.tokenStorage.sync(localData);
+      // Get all token storage providers
+      const providers = this.getTokenStorageProviders();
 
-        if (result.success && result.merged) {
-          this.loadFromStorageData(result.merged);
-        }
-
+      if (providers.size === 0) {
+        // No providers - just save locally
+        await this.save();
         this.deps!.emitEvent('sync:completed', {
           source: 'payments',
           count: this.tokens.size,
         });
-
-        return { added: result.added, removed: result.removed };
+        return { added: 0, removed: 0 };
       }
 
-      // Fallback: just save
-      await this.save();
+      // Create local data once
+      const localData = await this.createStorageData();
+
+      let totalAdded = 0;
+      let totalRemoved = 0;
+
+      // Sync with each provider
+      for (const [providerId, provider] of providers) {
+        try {
+          const result = await provider.sync(localData);
+
+          if (result.success && result.merged) {
+            // Apply merged data from each provider
+            this.loadFromStorageData(result.merged);
+            totalAdded += result.added;
+            totalRemoved += result.removed;
+          }
+
+          this.deps!.emitEvent('sync:provider', {
+            providerId,
+            success: result.success,
+            added: result.added,
+            removed: result.removed,
+          });
+        } catch (providerError) {
+          // Log error but continue with other providers
+          console.warn(`[PaymentsModule] Sync failed for provider ${providerId}:`, providerError);
+          this.deps!.emitEvent('sync:provider', {
+            providerId,
+            success: false,
+            error: providerError instanceof Error ? providerError.message : String(providerError),
+          });
+        }
+      }
 
       this.deps!.emitEvent('sync:completed', {
         source: 'payments',
         count: this.tokens.size,
       });
 
-      return { added: 0, removed: 0 };
+      return { added: totalAdded, removed: totalRemoved };
     } catch (error) {
       this.deps!.emitEvent('sync:error', {
         source: 'payments',
         error: error instanceof Error ? error.message : String(error),
       });
       throw error;
+    }
+  }
+
+  /**
+   * Get all active token storage providers
+   */
+  private getTokenStorageProviders(): Map<string, TokenStorageProvider<TxfStorageDataBase>> {
+    // Prefer new multi-provider map
+    if (this.deps!.tokenStorageProviders && this.deps!.tokenStorageProviders.size > 0) {
+      return this.deps!.tokenStorageProviders;
+    }
+
+    // Fallback to deprecated single provider
+    if (this.deps!.tokenStorage) {
+      const map = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
+      map.set(this.deps!.tokenStorage.id, this.deps!.tokenStorage);
+      return map;
+    }
+
+    return new Map();
+  }
+
+  /**
+   * Update token storage providers (called when providers are added/removed dynamically)
+   */
+  updateTokenStorageProviders(providers: Map<string, TokenStorageProvider<TxfStorageDataBase>>): void {
+    if (this.deps) {
+      this.deps.tokenStorageProviders = providers;
     }
   }
 

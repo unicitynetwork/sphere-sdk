@@ -35,8 +35,12 @@ export const STORAGE_KEYS = {
   WALLET_SOURCE: `${STORAGE_PREFIX}wallet_source`,
   /** Wallet existence flag */
   WALLET_EXISTS: `${STORAGE_PREFIX}wallet_exists`,
-  /** Registered nametag */
+  /** Registered nametag (legacy - single address) */
   NAMETAG: `${STORAGE_PREFIX}nametag`,
+  /** Current active address index */
+  CURRENT_ADDRESS_INDEX: `${STORAGE_PREFIX}current_address_index`,
+  /** Address nametags map (JSON: { "0": "alice", "1": "bob" }) */
+  ADDRESS_NAMETAGS: `${STORAGE_PREFIX}address_nametags`,
   /** Token data */
   TOKENS: `${STORAGE_PREFIX}tokens`,
   /** Pending transfers */
@@ -143,8 +147,23 @@ export const COIN_TYPES = {
 } as const;
 
 // =============================================================================
+// L1 (ALPHA Blockchain) Defaults
+// =============================================================================
+
+/** Default Fulcrum electrum server for mainnet */
+export const DEFAULT_ELECTRUM_URL = 'wss://fulcrum.alpha.unicity.network:50004' as const;
+
+/** Testnet Fulcrum electrum server */
+export const TEST_ELECTRUM_URL = 'wss://fulcrum.alpha.testnet.unicity.network:50004' as const;
+
+// =============================================================================
 // Network Defaults
 // =============================================================================
+
+/** Testnet Nostr relays */
+export const TEST_NOSTR_RELAYS = [
+  'wss://nostr-relay.testnet.unicity.network',
+] as const;
 
 /** Network configurations */
 export const NETWORKS = {
@@ -153,22 +172,26 @@ export const NETWORKS = {
     aggregatorUrl: DEFAULT_AGGREGATOR_URL,
     nostrRelays: DEFAULT_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
+    electrumUrl: DEFAULT_ELECTRUM_URL,
   },
   testnet: {
     name: 'Testnet',
     aggregatorUrl: TEST_AGGREGATOR_URL,
-    nostrRelays: DEFAULT_NOSTR_RELAYS,
+    nostrRelays: TEST_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
+    electrumUrl: TEST_ELECTRUM_URL,
   },
   dev: {
     name: 'Development',
     aggregatorUrl: DEV_AGGREGATOR_URL,
-    nostrRelays: ['wss://relay.damus.io'],
+    nostrRelays: TEST_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
+    electrumUrl: TEST_ELECTRUM_URL,
   },
 } as const;
 
 export type NetworkType = keyof typeof NETWORKS;
+export type NetworkConfig = (typeof NETWORKS)[NetworkType];
 
 // =============================================================================
 // Timeouts & Limits

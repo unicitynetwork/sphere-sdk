@@ -271,8 +271,8 @@ export class L1PaymentsModule {
     const allUtxos = await this._getAllUtxos();
 
     // Classify if vesting is enabled
-    let classifiedVested: Set<string> = new Set();
-    let classifiedCoinbaseHeights: Map<string, number | null> = new Map();
+    const classifiedVested: Set<string> = new Set();
+    const classifiedCoinbaseHeights: Map<string, number | null> = new Map();
 
     if (this._config.enableVesting) {
       await vestingClassifier.initDB();

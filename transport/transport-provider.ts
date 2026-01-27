@@ -98,6 +98,42 @@ export interface TransportProvider extends BaseProvider {
    * @returns Unsubscribe function
    */
   onPaymentRequestResponse?(handler: PaymentRequestResponseHandler): () => void;
+
+  // ===========================================================================
+  // Dynamic Relay Management (optional)
+  // ===========================================================================
+
+  /**
+   * Get list of configured relay URLs
+   */
+  getRelays?(): string[];
+
+  /**
+   * Get list of currently connected relay URLs
+   */
+  getConnectedRelays?(): string[];
+
+  /**
+   * Add a relay dynamically
+   * @returns true if added successfully
+   */
+  addRelay?(relayUrl: string): Promise<boolean>;
+
+  /**
+   * Remove a relay dynamically
+   * @returns true if removed successfully
+   */
+  removeRelay?(relayUrl: string): Promise<boolean>;
+
+  /**
+   * Check if a relay is configured
+   */
+  hasRelay?(relayUrl: string): boolean;
+
+  /**
+   * Check if a relay is currently connected
+   */
+  isRelayConnected?(relayUrl: string): boolean;
 }
 
 // =============================================================================
@@ -236,6 +272,8 @@ export type TransportEventType =
   | 'transport:disconnected'
   | 'transport:reconnecting'
   | 'transport:error'
+  | 'transport:relay_added'
+  | 'transport:relay_removed'
   | 'message:received'
   | 'message:sent'
   | 'transfer:received'

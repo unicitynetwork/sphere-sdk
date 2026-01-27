@@ -28,10 +28,11 @@ npm install @unicitylabs/sphere-sdk
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
 
-// Create providers (browser)
-const providers = createBrowserProviders({
-  oracle: { url: '/rpc' },
-});
+// Create providers (browser) - defaults to mainnet
+const providers = createBrowserProviders();
+
+// Or use testnet for development
+const testnetProviders = createBrowserProviders({ network: 'testnet' });
 
 // Initialize (auto-creates wallet if needed)
 const { sphere, created, generatedMnemonic } = await Sphere.init({
@@ -60,6 +61,33 @@ const result = await sphere.payments.send({
 // Derive additional addresses
 const addr1 = sphere.deriveAddress(1);
 console.log('Address 1:', addr1.address);
+```
+
+## Network Configuration
+
+The SDK supports three network presets that configure all services automatically:
+
+| Network | Aggregator | Nostr Relay | Electrum (L1) |
+|---------|------------|-------------|---------------|
+| `mainnet` | aggregator.unicity.network | relay.unicity.network | fulcrum.alpha.unicity.network |
+| `testnet` | goggregator-test.unicity.network | nostr-relay.testnet.unicity.network | fulcrum.alpha.testnet.unicity.network |
+| `dev` | dev-aggregator.dyndns.org | nostr-relay.testnet.unicity.network | fulcrum.alpha.testnet.unicity.network |
+
+```typescript
+// Use testnet for all services
+const providers = createBrowserProviders({ network: 'testnet' });
+
+// Override specific services while using network preset
+const providers = createBrowserProviders({
+  network: 'testnet',
+  oracle: { url: 'https://custom-aggregator.example.com' }, // custom oracle
+});
+
+// Enable L1 with network defaults
+const providers = createBrowserProviders({
+  network: 'testnet',
+  l1: { enableVesting: true },  // uses testnet electrum URL automatically
+});
 ```
 
 ## Payment Requests
@@ -390,11 +418,77 @@ Providers (injectable dependencies)
 ├── OracleProvider       - State validation (Aggregator)
 └── TokenStorageProvider - Token backup (IPFS)
 
+Implementation (platform-specific)
+├── impl/shared/         - Common interfaces & resolvers
+│   ├── config.ts        - Base configuration types
+│   └── resolvers.ts     - Extend/override pattern utilities
+├── impl/browser/        - Browser implementations
+│   ├── LocalStorageProvider
+│   ├── IndexedDBTokenStorageProvider
+│   └── createBrowserProviders()
+└── impl/nodejs/         - Node.js implementations
+    ├── FileStorageProvider
+    ├── FileTokenStorageProvider
+    └── createNodeProviders()
+
 Core Utilities
 ├── crypto     - Key derivation, hashing, signatures
 ├── currency   - Amount formatting and conversion
 ├── bech32     - Address encoding (BIP-173)
 └── utils      - Base58, patterns, sleep, random
+```
+
+## Shared Configuration Pattern
+
+Both browser and Node.js implementations share common configuration interfaces and resolution logic:
+
+```typescript
+// Base interfaces (impl/shared/config.ts)
+import type {
+  BaseTransportConfig,  // Common transport options
+  BaseOracleConfig,     // Common oracle options
+  L1Config,             // L1 configuration (same for all platforms)
+  BaseProviders,        // Common result structure
+} from '@unicitylabs/sphere-sdk/impl/shared';
+
+// Resolver utilities (impl/shared/resolvers.ts)
+import {
+  getNetworkConfig,        // Get mainnet/testnet/dev config
+  resolveTransportConfig,  // Apply extend/override pattern for relays
+  resolveOracleConfig,     // Resolve oracle URL with fallback
+  resolveL1Config,         // Resolve L1 with network defaults
+  resolveArrayConfig,      // Generic array merge helper
+} from '@unicitylabs/sphere-sdk/impl/shared';
+```
+
+### Extend/Override Pattern
+
+The configuration resolution follows a consistent pattern across platforms:
+
+```typescript
+// Priority for arrays: replace > extend > defaults
+const result = resolveArrayConfig(
+  networkDefaults,    // ['a', 'b']
+  config.relays,      // If set, replaces entirely
+  config.additionalRelays  // If set, extends defaults
+);
+
+// Examples:
+// No config → ['a', 'b'] (defaults)
+// { relays: ['x'] } → ['x'] (replace)
+// { additionalRelays: ['c'] } → ['a', 'b', 'c'] (extend)
+```
+
+### Platform-Specific Extensions
+
+Each platform extends the base interfaces with platform-specific options:
+
+```typescript
+// Browser: adds reconnectDelay, maxReconnectAttempts
+type TransportConfig = BaseTransportConfig & BrowserTransportExtensions;
+
+// Node.js: adds trustBasePath for file-based trust base
+type NodeOracleConfig = BaseOracleConfig & NodeOracleExtensions;
 ```
 
 ## Documentation
@@ -416,6 +510,44 @@ The SDK includes browser-ready provider implementations:
 ## Node.js Providers
 
 For CLI and server applications:
+
+```typescript
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+// Quick start with testnet
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens',
+});
+
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+});
+
+// Full configuration
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens',
+  transport: {
+    additionalRelays: ['wss://my-relay.com'],
+    timeout: 10000,
+    debug: true,
+  },
+  oracle: {
+    apiKey: 'my-api-key',
+    trustBasePath: './trustbase.json',  // Node.js specific
+  },
+  l1: {
+    enableVesting: true,
+  },
+});
+```
+
+### Manual Provider Creation
 
 ```typescript
 import {
@@ -443,18 +575,350 @@ const trustBase = await trustBaseLoader.load();
 
 ## Custom Providers Configuration
 
+The SDK uses an **extend/override pattern** for flexible configuration:
+
+| Option | Behavior |
+|--------|----------|
+| `relays` | **Replaces** default relays entirely |
+| `additionalRelays` | **Adds** to default relays |
+| `gateways` | **Replaces** default IPFS gateways |
+| `additionalGateways` | **Adds** to default gateways |
+| `url`, `electrumUrl` | **Replaces** default URL (uses network default if not set) |
+
 ```typescript
+// Simple: use network preset
+const providers = createBrowserProviders({ network: 'testnet' });
+
+// Add extra relays to testnet defaults
 const providers = createBrowserProviders({
-  storage: {
-    prefix: 'myapp_',  // localStorage key prefix
-  },
+  network: 'testnet',
   transport: {
-    relays: ['wss://relay.unicity.network'],
-  },
-  oracle: {
-    url: 'https://aggregator.unicity.network',
+    additionalRelays: ['wss://my-relay.com', 'wss://backup-relay.com'],
+    // Result: testnet relay + my-relay + backup-relay
   },
 });
+
+// Replace relays entirely (ignores network defaults)
+const providers = createBrowserProviders({
+  network: 'testnet',
+  transport: {
+    relays: ['wss://only-this-relay.com'],
+    // Result: only-this-relay (testnet default ignored)
+  },
+});
+
+// Override aggregator, keep other testnet defaults
+const providers = createBrowserProviders({
+  network: 'testnet',
+  oracle: {
+    url: 'https://my-aggregator.com',  // replaces testnet aggregator
+    apiKey: 'my-api-key',
+  },
+});
+
+// Full custom configuration
+const providers = createBrowserProviders({
+  network: 'testnet',
+  storage: {
+    prefix: 'myapp_',
+  },
+  transport: {
+    additionalRelays: ['wss://extra-relay.com'],
+    timeout: 15000,
+    autoReconnect: true,
+    debug: true,
+  },
+  oracle: {
+    url: 'https://custom-aggregator.com',
+    apiKey: 'secret',
+    timeout: 60000,
+  },
+  l1: {
+    electrumUrl: 'wss://custom-fulcrum.com:50004',
+    defaultFeeRate: 5,
+    enableVesting: true,
+  },
+  tokenSync: {
+    ipfs: {
+      enabled: true,
+      additionalGateways: ['https://my-ipfs-gateway.com'],
+    },
+  },
+});
+
+// Enable multiple sync backends
+const providers = createBrowserProviders({
+  network: 'mainnet',
+  tokenSync: {
+    ipfs: { enabled: true, useDht: true },
+    cloud: { enabled: true, provider: 'aws', bucket: 'my-backup' },  // future
+  },
+});
+```
+
+## Token Sync Backends
+
+The SDK supports multiple token sync backends that can be enabled independently:
+
+| Backend | Status | Description |
+|---------|--------|-------------|
+| `ipfs` | ✅ Ready | Decentralized IPFS/IPNS with Helia browser DHT |
+| `mongodb` | ✅ Ready | MongoDB for centralized token storage |
+| `file` | 🚧 Planned | Local file system (Node.js) |
+| `cloud` | 🚧 Planned | Cloud storage (AWS S3, GCP, Azure) |
+
+```typescript
+// Enable IPFS sync with custom gateways
+const providers = createBrowserProviders({
+  network: 'testnet',
+  tokenSync: {
+    ipfs: {
+      enabled: true,
+      additionalGateways: ['https://my-gateway.com'],
+      useDht: true,  // Enable browser DHT (Helia)
+    },
+  },
+});
+
+// Enable MongoDB sync
+const providers = createBrowserProviders({
+  network: 'mainnet',
+  tokenSync: {
+    mongodb: {
+      enabled: true,
+      uri: 'mongodb://localhost:27017',
+      database: 'sphere_wallet',
+      collection: 'tokens',
+    },
+  },
+});
+
+// Multiple backends for redundancy
+const providers = createBrowserProviders({
+  tokenSync: {
+    ipfs: { enabled: true },
+    mongodb: { enabled: true, uri: 'mongodb://localhost:27017', database: 'wallet' },
+    file: { enabled: true, directory: './tokens', format: 'txf' },
+    cloud: { enabled: true, provider: 'aws', bucket: 'wallet-backup' },
+  },
+});
+```
+
+## Custom Token Storage Provider
+
+You can implement your own `TokenStorageProvider` for custom storage backends:
+
+```typescript
+import type { TokenStorageProvider, TxfStorageDataBase, SaveResult, LoadResult, SyncResult } from '@unicitylabs/sphere-sdk/storage';
+import type { FullIdentity, ProviderStatus } from '@unicitylabs/sphere-sdk/types';
+
+class MyCustomStorageProvider implements TokenStorageProvider<TxfStorageDataBase> {
+  readonly id = 'my-storage';
+  readonly name = 'My Custom Storage';
+  readonly type = 'remote' as const;
+
+  private status: ProviderStatus = 'disconnected';
+  private identity: FullIdentity | null = null;
+
+  setIdentity(identity: FullIdentity): void {
+    this.identity = identity;
+  }
+
+  async initialize(): Promise<boolean> {
+    // Connect to your storage backend
+    this.status = 'connected';
+    return true;
+  }
+
+  async shutdown(): Promise<void> {
+    this.status = 'disconnected';
+  }
+
+  async connect(): Promise<void> {
+    await this.initialize();
+  }
+
+  async disconnect(): Promise<void> {
+    await this.shutdown();
+  }
+
+  isConnected(): boolean {
+    return this.status === 'connected';
+  }
+
+  getStatus(): ProviderStatus {
+    return this.status;
+  }
+
+  async load(): Promise<LoadResult<TxfStorageDataBase>> {
+    // Load tokens from your storage
+    return {
+      success: true,
+      data: { _meta: { version: 1, address: this.identity?.address ?? '', formatVersion: '2.0', updatedAt: Date.now() } },
+      source: 'remote',
+      timestamp: Date.now(),
+    };
+  }
+
+  async save(data: TxfStorageDataBase): Promise<SaveResult> {
+    // Save tokens to your storage
+    return { success: true, timestamp: Date.now() };
+  }
+
+  async sync(localData: TxfStorageDataBase): Promise<SyncResult<TxfStorageDataBase>> {
+    // Merge local and remote data
+    await this.save(localData);
+    return { success: true, merged: localData, added: 0, removed: 0, conflicts: 0 };
+  }
+}
+
+// Use your custom provider
+const myProvider = new MyCustomStorageProvider();
+
+const { sphere } = await Sphere.init({
+  ...providers,
+  tokenStorage: myProvider,
+  autoGenerate: true,
+});
+```
+
+## Dynamic Provider Management (Runtime)
+
+After `Sphere.init()` is called, you can add/remove token storage providers dynamically through UI:
+
+```typescript
+import { createMongoDbStorageProvider } from './my-mongodb-provider';
+
+// Add a new provider at runtime (e.g., user enables MongoDB sync in settings)
+const mongoProvider = createMongoDbStorageProvider({
+  uri: 'mongodb://localhost:27017',
+  database: 'sphere_wallet',
+});
+
+await sphere.addTokenStorageProvider(mongoProvider);
+
+// Provider is now active and will be used in sync operations
+
+// Check if provider exists
+if (sphere.hasTokenStorageProvider('mongodb-token-storage')) {
+  console.log('MongoDB sync is enabled');
+}
+
+// Get all active providers
+const providers = sphere.getTokenStorageProviders();
+console.log('Active providers:', Array.from(providers.keys()));
+
+// Remove a provider (e.g., user disables MongoDB sync)
+await sphere.removeTokenStorageProvider('mongodb-token-storage');
+
+// Listen for per-provider sync events
+sphere.on('sync:provider', (event) => {
+  console.log(`Provider ${event.providerId}: ${event.success ? 'synced' : 'failed'}`);
+  if (event.success) {
+    console.log(`  Added: ${event.added}, Removed: ${event.removed}`);
+  } else {
+    console.log(`  Error: ${event.error}`);
+  }
+});
+
+// Trigger sync (syncs with all active providers)
+await sphere.payments.sync();
+```
+
+### Multiple Providers Example
+
+```typescript
+// User configures multiple sync backends via UI
+const ipfsProvider = createIpfsStorageProvider({ gateways: ['https://ipfs.io'] });
+const mongoProvider = createMongoDbStorageProvider({ uri: 'mongodb://...' });
+const s3Provider = createS3StorageProvider({ bucket: 'wallet-backup' });
+
+// Add all providers
+await sphere.addTokenStorageProvider(ipfsProvider);
+await sphere.addTokenStorageProvider(mongoProvider);
+await sphere.addTokenStorageProvider(s3Provider);
+
+// Sync syncs with ALL active providers
+// If one fails, others continue (fault-tolerant)
+const result = await sphere.payments.sync();
+console.log(`Synced: +${result.added} -${result.removed}`);
+```
+
+## Dynamic Relay Management
+
+Nostr relays can be added or removed at runtime through the transport provider:
+
+```typescript
+const transport = sphere.getTransport();
+
+// Get current relays
+const configuredRelays = transport.getRelays();       // All configured
+const connectedRelays = transport.getConnectedRelays(); // Currently connected
+
+// Add a new relay (connects immediately if provider is connected)
+await transport.addRelay('wss://new-relay.com');
+
+// Remove a relay (disconnects if connected)
+await transport.removeRelay('wss://old-relay.com');
+
+// Check relay status
+transport.hasRelay('wss://relay.com');         // Is configured?
+transport.isRelayConnected('wss://relay.com'); // Is connected?
+```
+
+### Relay Events
+
+```typescript
+// Listen for relay changes
+sphere.on('transport:relay_added', (event) => {
+  console.log(`Relay added: ${event.data.relay}`);
+  console.log(`Connected: ${event.data.connected}`);
+});
+
+sphere.on('transport:relay_removed', (event) => {
+  console.log(`Relay removed: ${event.data.relay}`);
+});
+
+sphere.on('transport:error', (event) => {
+  console.log(`Transport error: ${event.data.error}`);
+});
+```
+
+### UI Integration Example
+
+```typescript
+// User adds relay via settings UI
+async function handleAddRelay(relayUrl: string) {
+  const transport = sphere.getTransport();
+
+  if (transport.hasRelay(relayUrl)) {
+    showError('Relay already configured');
+    return;
+  }
+
+  const success = await transport.addRelay(relayUrl);
+  if (success) {
+    showSuccess(`Added ${relayUrl}`);
+  } else {
+    showWarning(`Added but failed to connect to ${relayUrl}`);
+  }
+}
+
+// User removes relay via settings UI
+async function handleRemoveRelay(relayUrl: string) {
+  const transport = sphere.getTransport();
+  await transport.removeRelay(relayUrl);
+  showSuccess(`Removed ${relayUrl}`);
+}
+
+// Display relay status in UI
+function getRelayStatuses() {
+  const transport = sphere.getTransport();
+  return transport.getRelays().map(relay => ({
+    url: relay,
+    connected: transport.isRelayConnected(relay),
+  }));
+}
 ```
 
 ## Known Limitations / TODO

@@ -186,6 +186,7 @@ async function main() {
         const valid = isValidPrivateKey(hex);
         console.log(JSON.stringify({ valid, length: hex.length }));
         process.exit(valid ? 0 : 1);
+        break;
       }
 
       case 'hex-to-wif': {
