@@ -3,21 +3,59 @@
   "version": "0.1.0",
   "description": "Modular TypeScript SDK for Unicity wallet operations",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     },
     "./impl/browser": {
-      "import": "./dist/impl/browser/index.js",
-      "types": "./dist/impl/browser/index.d.ts"
+      "import": {
+        "types": "./dist/impl/browser/index.d.ts",
+        "default": "./dist/impl/browser/index.js"
+      },
+      "require": {
+        "types": "./dist/impl/browser/index.d.cts",
+        "default": "./dist/impl/browser/index.cjs"
+      }
     },
     "./impl/nodejs": {
-      "import": "./dist/impl/nodejs/index.js",
-      "types": "./dist/impl/nodejs/index.d.ts"
+      "import": {
+        "types": "./dist/impl/nodejs/index.d.ts",
+        "default": "./dist/impl/nodejs/index.js"
+      },
+      "require": {
+        "types": "./dist/impl/nodejs/index.d.cts",
+        "default": "./dist/impl/nodejs/index.cjs"
+      }
+    },
+    "./core": {
+      "import": {
+        "types": "./dist/core/index.d.ts",
+        "default": "./dist/core/index.js"
+      },
+      "require": {
+        "types": "./dist/core/index.d.cts",
+        "default": "./dist/core/index.cjs"
+      }
+    },
+    "./l1": {
+      "import": {
+        "types": "./dist/l1/index.d.ts",
+        "default": "./dist/l1/index.js"
+      },
+      "require": {
+        "types": "./dist/l1/index.d.cts",
+        "default": "./dist/l1/index.cjs"
+      }
     }
   },
   "files": [
@@ -25,8 +63,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
-    "build:watch": "tsc --watch",
+    "build": "tsup",
+    "build:watch": "tsup --watch",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build",
     "test": "vitest",
@@ -68,6 +106,7 @@
     "@types/elliptic": "^6.4.18",
     "@types/node": "^22.0.0",
     "fake-indexeddb": "^6.2.5",
+    "tsup": "^8.5.1",
     "typescript": "~5.6.0",
     "vitest": "^2.0.0"
   },

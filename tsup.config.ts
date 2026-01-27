@@ -1,0 +1,100 @@
+import { defineConfig } from 'tsup';
+
+export default defineConfig([
+  // Main entry - universal (works in browser with bundler, and Node.js)
+  {
+    entry: { 'index': 'index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: true,
+    splitting: false,
+    sourcemap: true,
+    platform: 'node',
+    target: 'es2022',
+    // Don't bundle dependencies - let consumer's bundler handle them
+    external: [
+      /^@noble\//,
+      /^@unicitylabs\//,
+      'bip39',
+      'buffer',
+      'crypto-js',
+      'elliptic',
+      'helia',
+      '@helia/ipns',
+      '@helia/json',
+    ],
+  },
+  // Core only (no browser impl with helia) - for Node.js projects
+  {
+    entry: { 'core/index': 'core/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'node',
+    target: 'es2022',
+    external: [
+      /^@noble\//,
+      /^@unicitylabs\//,
+      'bip39',
+      'buffer',
+      'crypto-js',
+      'elliptic',
+    ],
+  },
+  // L1 module (for direct crypto operations)
+  {
+    entry: { 'l1/index': 'l1/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'node',
+    target: 'es2022',
+    external: [
+      /^@noble\//,
+      'bip39',
+      'buffer',
+      'crypto-js',
+      'elliptic',
+    ],
+  },
+  // Browser implementation
+  {
+    entry: { 'impl/browser/index': 'impl/browser/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'browser',
+    target: 'es2022',
+    external: [
+      /^@noble\//,
+      /^@unicitylabs\//,
+      'helia',
+      '@helia/ipns',
+      '@helia/json',
+    ],
+  },
+  // Node.js implementation
+  {
+    entry: { 'impl/nodejs/index': 'impl/nodejs/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'node',
+    target: 'es2022',
+    external: [
+      /^@noble\//,
+      /^@unicitylabs\//,
+      'helia',
+      '@helia/ipns',
+      '@helia/json',
+    ],
+  },
+]);
