@@ -1,4 +1,4 @@
-# SDK2 Integration Guide
+# Sphere SDK Integration Guide
 
 ## Table of Contents
 
@@ -11,6 +11,7 @@
 7. [Custom Providers](#custom-providers)
 8. [Events](#events)
 9. [Error Handling](#error-handling)
+10. [Testing](#testing)
 
 ---
 
@@ -346,45 +347,76 @@ sphere.payments.clearCompletedOutgoingPaymentRequests();
 
 ## L1 Payments
 
+L1 module handles ALPHA blockchain transactions with vesting classification support.
+
 ### Get L1 Balance
 
 ```typescript
-const balance = await sphere.l1.getBalance();
-// Returns: { confirmed: '100000000', unconfirmed: '0', total: '100000000' }
+const balance = await sphere.payments.l1.getBalance();
+
+console.log('Total:', balance.total);           // Total in satoshis
+console.log('Confirmed:', balance.confirmed);   // Confirmed balance
+console.log('Unconfirmed:', balance.unconfirmed);
+console.log('Vested:', balance.vested);         // Coins from blocks ≤280,000
+console.log('Unvested:', balance.unvested);     // Coins from blocks >280,000
 ```
 
 ### Get UTXOs
 
 ```typescript
-const utxos = await sphere.l1.getUtxos();
+const utxos = await sphere.payments.l1.getUtxos();
 
 for (const utxo of utxos) {
   console.log(`${utxo.txid}:${utxo.vout} - ${utxo.amount} sats`);
+  console.log(`  Vested: ${utxo.isVested}`);
+  console.log(`  Confirmations: ${utxo.confirmations}`);
+  if (utxo.coinbaseHeight) {
+    console.log(`  Coinbase height: ${utxo.coinbaseHeight}`);
+  }
 }
 ```
 
 ### Send L1 Transaction
 
 ```typescript
-const result = await sphere.l1.send({
+const result = await sphere.payments.l1.send({
   to: 'alpha1abc123...',
   amount: '10000000',  // in satoshis
 });
 
 if (result.success) {
   console.log('TX Hash:', result.txHash);
-  console.log('Fee:', result.fee);
+} else {
+  console.error('Error:', result.error);
 }
 ```
 
 ### Get Transaction History
 
 ```typescript
-const history = await sphere.l1.getHistory(10);  // last 10 transactions
+const history = await sphere.payments.l1.getHistory(10);  // last 10 transactions
 
 for (const tx of history) {
-  console.log(`${tx.type}: ${tx.amount} (${tx.confirmations} confirmations)`);
+  console.log(`${tx.type}: ${tx.amount} sats`);
+  console.log(`  Confirmations: ${tx.confirmations}`);
+  console.log(`  Timestamp: ${new Date(tx.timestamp * 1000)}`);
 }
+```
+
+### Vesting Classification
+
+ALPHA coins are classified as "vested" or "unvested" based on their coinbase origin:
+- **Vested**: Coins traced back to coinbase transactions in blocks ≤280,000
+- **Unvested**: Coins from blocks >280,000
+
+```typescript
+// Vesting is enabled by default, configure via L1PaymentsModule:
+import { createL1PaymentsModule } from '@unicitylabs/sphere-sdk';
+
+const l1Module = createL1PaymentsModule({
+  electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',
+  enableVesting: true,  // default: true
+});
 ```
 
 ---
@@ -622,5 +654,79 @@ sphere.on('connection:changed', async ({ provider, connected }) => {
     console.log(`${provider} disconnected, attempting reconnect...`);
     // SDK handles reconnection automatically
   }
+});
+```
+
+---
+
+## Testing
+
+The SDK includes a comprehensive test suite using Vitest.
+
+### Running Tests
+
+```bash
+# Run all tests (watch mode)
+npm test
+
+# Run once (CI mode)
+npm run test:run
+
+# Run specific test file
+npx vitest run tests/unit/core/crypto.test.ts
+
+# Run with coverage
+npm test -- --coverage
+```
+
+### Test Coverage
+
+| Module | Tests | Description |
+|--------|-------|-------------|
+| `core/crypto` | 43 | BIP39, BIP32, hashing, address generation |
+| `core/bech32` | 30 | Bech32 encoding/decoding |
+| `core/currency` | 34 | Amount conversion and formatting |
+| `core/encryption` | 30 | AES-256-CBC encryption |
+| `core/utils` | 32 | Base58, validation, utilities |
+| `l1/address` | 18 | HD key derivation |
+| `l1/addressToScriptHash` | 7 | Electrum scripthash |
+| `l1/tx` | 23 | SegWit transactions, UTXO selection |
+| `serialization/txf` | 44 | TXF token format |
+| **Total** | **261** | All passing |
+
+### Writing Tests
+
+Tests follow the structure:
+
+```
+tests/
+├── unit/
+│   ├── core/
+│   │   ├── crypto.test.ts
+│   │   ├── bech32.test.ts
+│   │   └── ...
+│   ├── l1/
+│   │   ├── address.test.ts
+│   │   └── ...
+│   └── serialization/
+│       └── txf-serializer.test.ts
+└── fixtures/
+    └── test-vectors.ts
+```
+
+Example test:
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { generateMnemonic, validateMnemonic } from '../../../core/crypto';
+
+describe('generateMnemonic()', () => {
+  it('should generate valid 12-word mnemonic', () => {
+    const mnemonic = generateMnemonic(12);
+    const words = mnemonic.split(' ');
+
+    expect(words).toHaveLength(12);
+    expect(validateMnemonic(mnemonic)).toBe(true);
+  });
 });
 ```
