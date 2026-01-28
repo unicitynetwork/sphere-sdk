@@ -436,6 +436,10 @@ export class Sphere {
     await sphere.initializeProviders();
     await sphere.initializeModules();
 
+    // Mark wallet as created only after successful initialization
+    // This prevents "Wallet already exists" errors if init fails partway through
+    await sphere.finalizeWalletCreation();
+
     sphere._initialized = true;
     Sphere.instance = sphere;
 
@@ -537,6 +541,9 @@ export class Sphere {
     // Initialize everything
     await sphere.initializeProviders();
     await sphere.initializeModules();
+
+    // Mark wallet as created only after successful initialization
+    await sphere.finalizeWalletCreation();
 
     sphere._initialized = true;
     Sphere.instance = sphere;
@@ -1886,7 +1893,7 @@ export class Sphere {
     await this._storage.set(STORAGE_KEYS.BASE_PATH, effectiveBasePath);
     await this._storage.set(STORAGE_KEYS.DERIVATION_MODE, this._derivationMode);
     await this._storage.set(STORAGE_KEYS.WALLET_SOURCE, this._source);
-    await this._storage.set(STORAGE_KEYS.WALLET_EXISTS, 'true');
+    // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization
   }
 
   private async storeMasterKey(
@@ -1923,6 +1930,15 @@ export class Sphere {
     await this._storage.set(STORAGE_KEYS.BASE_PATH, effectiveBasePath);
     await this._storage.set(STORAGE_KEYS.DERIVATION_MODE, this._derivationMode);
     await this._storage.set(STORAGE_KEYS.WALLET_SOURCE, this._source);
+    // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization
+  }
+
+  /**
+   * Mark wallet as fully created (after successful initialization)
+   * This is called at the end of create()/import() to ensure wallet is only
+   * marked as existing after all initialization steps succeed.
+   */
+  private async finalizeWalletCreation(): Promise<void> {
     await this._storage.set(STORAGE_KEYS.WALLET_EXISTS, 'true');
   }
 
