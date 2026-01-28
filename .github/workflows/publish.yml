@@ -1,29 +1,44 @@
 name: Publish to npm
+run-name: Publish v${{ inputs.version }}
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 1.0.0, 1.0.1-beta.1)'
+        required: true
+        type: string
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      id-token: write
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Validate version format
+        run: |
+          if ! echo "${{ inputs.version }}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "Error: Invalid version format. Use semver (e.g., 1.0.0, 1.0.1-beta.1)"
+            exit 1
+          fi
+
+      - name: Update package version
+        run: npm version ${{ inputs.version }} --no-git-tag-version
 
       - name: Install dependencies
         run: npm install
 
       - name: Run tests
-        run: npm test -- --run
+        run: npm run test:run
 
       - name: Build
         run: npm run build
@@ -32,3 +47,12 @@ jobs:
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore: release v${{ inputs.version }}"
+          git tag "v${{ inputs.version }}"
+          git push origin HEAD --tags
