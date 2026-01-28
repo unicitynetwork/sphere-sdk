@@ -1088,7 +1088,28 @@ export class NostrTransportProvider implements TransportProvider {
       senderPubkey
     );
 
-    return decrypted;
+    // Strip known prefixes for compatibility with nostr-js-sdk
+    return this.stripContentPrefix(decrypted);
+  }
+
+  /**
+   * Strip known content prefixes (nostr-js-sdk compatibility)
+   * Handles: payment_request:, token_transfer:, etc.
+   */
+  private stripContentPrefix(content: string): string {
+    const prefixes = [
+      'payment_request:',
+      'token_transfer:',
+      'payment_response:',
+    ];
+
+    for (const prefix of prefixes) {
+      if (content.startsWith(prefix)) {
+        return content.slice(prefix.length);
+      }
+    }
+
+    return content;
   }
 
   // ===========================================================================
