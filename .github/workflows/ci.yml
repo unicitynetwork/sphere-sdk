@@ -25,6 +25,9 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Install optional dependencies for type checking
+        run: npm install helia @helia/json @helia/ipns @libp2p/bootstrap @libp2p/crypto @libp2p/peer-id @libp2p/interface multiformats --no-save
+
       - name: Type check
         run: npm run typecheck
 
