@@ -1728,6 +1728,39 @@ export class Sphere {
   }
 
   /**
+   * Mint a nametag token on-chain (like Sphere wallet and lottery)
+   * This creates the nametag token required for receiving tokens via PROXY addresses (@nametag)
+   *
+   * @param nametag - The nametag to mint (e.g., "alice" or "@alice")
+   * @returns MintNametagResult with success status and token if successful
+   *
+   * @example
+   * ```typescript
+   * // Mint nametag token for receiving via @alice
+   * const result = await sphere.mintNametag('alice');
+   * if (result.success) {
+   *   console.log('Nametag minted:', result.nametagData?.name);
+   * } else {
+   *   console.error('Mint failed:', result.error);
+   * }
+   * ```
+   */
+  async mintNametag(nametag: string): Promise<import('../modules/payments').MintNametagResult> {
+    this.ensureReady();
+    return this._payments.mintNametag(nametag);
+  }
+
+  /**
+   * Check if a nametag is available for minting
+   * @param nametag - The nametag to check (e.g., "alice" or "@alice")
+   * @returns true if available, false if taken or error
+   */
+  async isNametagAvailable(nametag: string): Promise<boolean> {
+    this.ensureReady();
+    return this._payments.isNametagAvailable(nametag);
+  }
+
+  /**
    * Load address nametags from storage
    */
   private async loadAddressNametags(): Promise<void> {
