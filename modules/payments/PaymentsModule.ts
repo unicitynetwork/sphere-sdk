@@ -61,8 +61,13 @@ import {
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
+import { TransferTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction';
 import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
 import { ProxyAddress } from '@unicitylabs/state-transition-sdk/lib/address/ProxyAddress';
+import { AddressScheme } from '@unicitylabs/state-transition-sdk/lib/address/AddressScheme';
+import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
+import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
+import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
 import type { IAddress } from '@unicitylabs/state-transition-sdk/lib/address/IAddress';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 
@@ -1801,15 +1806,103 @@ export class PaymentsModule {
 
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
     try {
+      // Check payload format - Sphere wallet sends { sourceToken, transferTx }
+      // SDK format is { token, proof }
+      const payload = transfer.payload as unknown as Record<string, unknown>;
+
+      let tokenData: unknown;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let finalizedSdkToken: SdkToken<any> | null = null;
+
+      if (payload.sourceToken && payload.transferTx) {
+        // Sphere wallet format - needs finalization for PROXY addresses
+        this.log('Processing Sphere wallet format transfer...');
+
+        const sourceTokenInput = typeof payload.sourceToken === 'string'
+          ? JSON.parse(payload.sourceToken as string)
+          : payload.sourceToken;
+        const transferTxInput = typeof payload.transferTx === 'string'
+          ? JSON.parse(payload.transferTx as string)
+          : payload.transferTx;
+
+        if (!sourceTokenInput || !transferTxInput) {
+          console.warn('[Payments] Invalid Sphere wallet transfer format');
+          return;
+        }
+
+        const sourceToken = await SdkToken.fromJSON(sourceTokenInput);
+        const transferTx = await TransferTransaction.fromJSON(transferTxInput);
+
+        // Check if this is a PROXY address transfer (needs finalization)
+        const recipientAddress = transferTx.data.recipient;
+        const addressScheme = recipientAddress.scheme;
+
+        if (addressScheme === AddressScheme.PROXY) {
+          // Need to finalize with nametag token
+          if (!this.nametag?.token) {
+            console.warn('[Payments] Cannot finalize PROXY transfer - no nametag token');
+            // Try to save without finalization
+            tokenData = sourceTokenInput;
+          } else {
+            try {
+              const nametagToken = await SdkToken.fromJSON(this.nametag.token);
+              const signingService = await this.createSigningService();
+              const transferSalt = transferTx.data.salt;
+
+              const recipientPredicate = await UnmaskedPredicate.create(
+                sourceToken.id,
+                sourceToken.type,
+                signingService,
+                HashAlgorithm.SHA256,
+                transferSalt
+              );
+
+              const recipientState = new TokenState(recipientPredicate, null);
+
+              const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+
+              if (!stClient || !trustBase) {
+                console.warn('[Payments] Cannot finalize - missing state transition client or trust base');
+                tokenData = sourceTokenInput;
+              } else {
+                finalizedSdkToken = await stClient.finalizeTransaction(
+                  trustBase,
+                  sourceToken,
+                  recipientState,
+                  transferTx,
+                  [nametagToken]
+                );
+                tokenData = finalizedSdkToken.toJSON();
+                this.log('Token finalized successfully');
+              }
+            } catch (finalizeError) {
+              console.error('[Payments] Finalization failed:', finalizeError);
+              tokenData = sourceTokenInput;
+            }
+          }
+        } else {
+          // Direct address - no finalization needed
+          tokenData = sourceTokenInput;
+        }
+      } else if (payload.token) {
+        // SDK format
+        tokenData = payload.token;
+      } else {
+        console.warn('[Payments] Unknown transfer payload format');
+        return;
+      }
+
       // Validate token
-      const validation = await this.deps!.oracle.validateToken(transfer.payload.token);
+      const validation = await this.deps!.oracle.validateToken(tokenData);
       if (!validation.valid) {
         console.warn('[Payments] Received invalid token');
         return;
       }
 
       // Parse token info from SDK data
-      const tokenInfo = await parseTokenInfo(transfer.payload.token);
+      const tokenInfo = await parseTokenInfo(tokenData);
 
       // Create token entry
       const token: Token = {
@@ -1821,9 +1914,9 @@ export class PaymentsModule {
         status: 'confirmed',
         createdAt: Date.now(),
         updatedAt: Date.now(),
-        sdkData: typeof transfer.payload.token === 'string'
-          ? transfer.payload.token
-          : JSON.stringify(transfer.payload.token),
+        sdkData: typeof tokenData === 'string'
+          ? tokenData
+          : JSON.stringify(tokenData),
       };
 
       // Check if tombstoned
@@ -1840,7 +1933,7 @@ export class PaymentsModule {
         id: transfer.id,
         senderPubkey: transfer.senderPubkey,
         tokens: [token],
-        memo: transfer.payload.memo,
+        memo: payload.memo as string | undefined,
         receivedAt: transfer.timestamp,
       };
 

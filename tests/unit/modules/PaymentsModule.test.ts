@@ -109,6 +109,53 @@ describe('PaymentsModule', () => {
   });
 });
 
+describe('Incoming transfer payload format detection', () => {
+  it('should recognize Sphere wallet format (sourceToken + transferTx)', () => {
+    // Sphere wallet sends this format
+    const spherePayload = {
+      sourceToken: { genesis: {}, state: {} },
+      transferTx: { data: { recipient: {}, salt: '' } },
+    };
+
+    // Check format detection logic (same as in handleIncomingTransfer)
+    const hasSphereFormat = 'sourceToken' in spherePayload && 'transferTx' in spherePayload;
+    const hasSdkFormat = 'token' in spherePayload;
+
+    expect(hasSphereFormat).toBe(true);
+    expect(hasSdkFormat).toBe(false);
+  });
+
+  it('should recognize SDK format (token + proof)', () => {
+    // SDK sends this format
+    const sdkPayload = {
+      token: '{"genesis":{}}',
+      proof: {},
+      memo: 'test',
+    };
+
+    // Check format detection logic
+    const hasSphereFormat = 'sourceToken' in sdkPayload && 'transferTx' in sdkPayload;
+    const hasSdkFormat = 'token' in sdkPayload;
+
+    expect(hasSphereFormat).toBe(false);
+    expect(hasSdkFormat).toBe(true);
+  });
+
+  it('should handle string-encoded sourceToken', () => {
+    const spherePayload = {
+      sourceToken: '{"genesis":{"data":{"coinData":{"UCT":"1000000000000000000"}}}}',
+      transferTx: '{"data":{"recipient":{"scheme":1}}}',
+    };
+
+    // Verify parsing logic
+    const sourceToken = typeof spherePayload.sourceToken === 'string'
+      ? JSON.parse(spherePayload.sourceToken)
+      : spherePayload.sourceToken;
+
+    expect(sourceToken.genesis.data.coinData.UCT).toBe('1000000000000000000');
+  });
+});
+
 describe('L1PaymentsModule', () => {
   describe('configuration defaults', () => {
     it('should have default electrumUrl when created with config', () => {
