@@ -14,10 +14,10 @@ import { WebSocketReadyState } from '../../../transport/websocket';
 
 class MockWebSocket implements IWebSocket {
   readyState: number = WebSocketReadyState.CONNECTING;
-  onopen: ((event: Event) => void) | null = null;
+  onopen: ((event: unknown) => void) | null = null;
   onmessage: ((event: IMessageEvent) => void) | null = null;
-  onerror: ((event: Event) => void) | null = null;
-  onclose: ((event: CloseEvent) => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+  onclose: ((event: unknown) => void) | null = null;
 
   private _url: string;
   private shouldFail: boolean;
@@ -251,13 +251,12 @@ describe('Nametag binding format', () => {
     const publicKey = 'a'.repeat(64);
     const hashedNametag = hashNametag(nametag);
 
-    // Expected format from nostr-js-sdk
+    // Expected format from nostr-js-sdk (no 'p' tag)
     const expectedTags = [
       ['d', hashedNametag],
       ['nametag', hashedNametag],
       ['t', hashedNametag],
       ['address', publicKey],
-      ['p', publicKey],
     ];
 
     const expectedContent = {
@@ -268,7 +267,7 @@ describe('Nametag binding format', () => {
 
     // Verify the tags include all required fields
     for (const [tagName] of expectedTags) {
-      expect(['d', 'nametag', 't', 'address', 'p']).toContain(tagName);
+      expect(['d', 'nametag', 't', 'address']).toContain(tagName);
     }
 
     // Verify content structure
@@ -289,7 +288,7 @@ describe('Nametag binding format', () => {
     const addressTag1 = event1.tags.find((t: string[]) => t[0] === 'address');
     expect(addressTag1?.[1]).toBe(publicKey);
 
-    // Format 2: SDK style with 'p' tag
+    // Format 2: Legacy SDK style with 'p' tag (backward compatibility)
     const event2 = {
       tags: [['p', publicKey], ['d', 'hash']],
       content: publicKey,

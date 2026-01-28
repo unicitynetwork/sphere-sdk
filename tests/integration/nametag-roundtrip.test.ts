@@ -25,10 +25,10 @@ interface NostrEvent {
 
 class MockRelayWebSocket implements IWebSocket {
   readyState: number = WebSocketReadyState.CONNECTING;
-  onopen: ((event: Event) => void) | null = null;
+  onopen: ((event: unknown) => void) | null = null;
   onmessage: ((event: IMessageEvent) => void) | null = null;
-  onerror: ((event: Event) => void) | null = null;
-  onclose: ((event: CloseEvent) => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+  onclose: ((event: unknown) => void) | null = null;
 
   private url: string;
   private static storedEvents: NostrEvent[] = [];
@@ -178,13 +178,12 @@ describe('Nametag roundtrip integration', () => {
     const event = storedEvents[0];
     expect(event.kind).toBe(30078); // NAMETAG_BINDING
 
-    // Check tags include all required fields
+    // Check tags include all required fields (matching nostr-js-sdk format)
     const tagNames = event.tags.map(t => t[0]);
     expect(tagNames).toContain('d');
     expect(tagNames).toContain('t');
     expect(tagNames).toContain('nametag');
     expect(tagNames).toContain('address');
-    expect(tagNames).toContain('p');
 
     // Check address tag has correct value
     const addressTag = event.tags.find(t => t[0] === 'address');

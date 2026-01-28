@@ -549,7 +549,6 @@ export class NostrTransportProvider implements TransportProvider {
       ['nametag', hashedNametag],
       ['t', hashedNametag],
       ['address', publicKey],
-      ['p', publicKey],
     ]);
 
     await this.publishEvent(event);
