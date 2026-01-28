@@ -29,6 +29,8 @@ import type {
   NametagData,
 } from '../../types/txf';
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
+import { TokenSplitCalculator } from './TokenSplitCalculator';
+import { TokenSplitExecutor } from './TokenSplitExecutor';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type {
   TransportProvider,
@@ -592,6 +594,7 @@ export class PaymentsModule {
 
   /**
    * Send tokens to recipient
+   * Supports automatic token splitting when exact amount is needed
    */
   async send(request: TransferRequest): Promise<TransferResult> {
     this.ensureInitialized();
@@ -613,12 +616,37 @@ export class PaymentsModule {
       // Create signing service
       const signingService = await this.createSigningService();
 
-      // Select tokens for amount
-      const tokensToSend = this.selectTokens(request.coinId, BigInt(request.amount));
-      if (tokensToSend.length === 0) {
+      // Get state transition client and trust base
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      if (!stClient) {
+        throw new Error('State transition client not available. Oracle provider must implement getStateTransitionClient()');
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+      if (!trustBase) {
+        throw new Error('Trust base not available. Oracle provider must implement getTrustBase()');
+      }
+
+      // Calculate optimal split plan
+      const calculator = new TokenSplitCalculator();
+      const availableTokens = Array.from(this.tokens.values());
+      const splitPlan = await calculator.calculateOptimalSplit(
+        availableTokens,
+        BigInt(request.amount),
+        request.coinId
+      );
+
+      if (!splitPlan) {
         throw new Error('Insufficient balance');
       }
 
+      this.log(`Split plan: requiresSplit=${splitPlan.requiresSplit}, directTokens=${splitPlan.tokensToTransferDirectly.length}`);
+
+      // Collect all tokens involved
+      const tokensToSend: Token[] = splitPlan.tokensToTransferDirectly.map(t => t.uiToken);
+      if (splitPlan.tokenToSplit) {
+        tokensToSend.push(splitPlan.tokenToSplit.uiToken);
+      }
       result.tokens = tokensToSend;
 
       // Mark as transferring
@@ -630,19 +658,64 @@ export class PaymentsModule {
       // Save to outbox for recovery
       await this.saveToOutbox(result, recipientPubkey);
 
-      // Submit to aggregator
       result.status = 'submitted';
 
-      for (const token of tokensToSend) {
+      const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
+
+      // Handle split if required
+      if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+        this.log('Executing token split...');
+
+        const executor = new TokenSplitExecutor({
+          stateTransitionClient: stClient,
+          trustBase,
+          signingService,
+        });
+
+        const splitResult = await executor.executeSplit(
+          splitPlan.tokenToSplit.sdkToken,
+          splitPlan.splitAmount!,
+          splitPlan.remainderAmount!,
+          splitPlan.coinId,
+          recipientAddress
+        );
+
+        // Save change token for sender
+        const changeTokenData = splitResult.tokenForSender.toJSON();
+        const changeToken: Token = {
+          id: crypto.randomUUID(),
+          coinId: request.coinId,
+          symbol: this.getCoinSymbol(request.coinId),
+          name: this.getCoinName(request.coinId),
+          amount: splitPlan.remainderAmount!.toString(),
+          status: 'confirmed',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          sdkData: JSON.stringify(changeTokenData),
+        };
+        await this.addToken(changeToken, true); // Skip history for change
+        this.log(`Change token saved: ${changeToken.id}, amount: ${changeToken.amount}`);
+
+        // Send recipient token via Nostr (Sphere format)
+        await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+          sourceToken: JSON.stringify(splitResult.tokenForRecipient.toJSON()),
+          transferTx: JSON.stringify(splitResult.recipientTransferTx.toJSON()),
+          memo: request.memo,
+        } as unknown as import('../../transport').TokenTransferPayload);
+
+        // Remove the original token that was split
+        await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
+
+        result.txHash = 'split-' + Date.now().toString(16);
+        this.log(`Split transfer completed`);
+      }
+
+      // Transfer direct tokens (no split needed)
+      for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
+        const token = tokenWithAmount.uiToken;
+
         // Create SDK transfer commitment
         const commitment = await this.createSdkCommitment(token, recipientAddress, signingService);
-
-        // Get state transition client from oracle provider
-        const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-
-        if (!stClient) {
-          throw new Error('State transition client not available. Oracle provider must implement getStateTransitionClient()');
-        }
 
         // Submit commitment via SDK
         const response = await stClient.submitTransferCommitment(commitment);
@@ -666,36 +739,36 @@ export class PaymentsModule {
           ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
           : String(requestIdBytes);
 
-        // Parse SDK token for Nostr payload
-        const tokenData = token.sdkData
-          ? (typeof token.sdkData === 'string' ? JSON.parse(token.sdkData) : token.sdkData)
-          : token;
-        const sdkToken = await SdkToken.fromJSON(tokenData);
-
-        // Build payload for Nostr delivery (Sphere wallet format)
         // Send via transport (Nostr) - use Sphere-compatible format
         await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-          sourceToken: JSON.stringify(sdkToken.toJSON()),
+          sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
           transferTx: JSON.stringify(transferTx.toJSON()),
           memo: request.memo,
         } as unknown as import('../../transport').TokenTransferPayload);
 
         this.log(`Token ${token.id} transferred, txHash: ${result.txHash}`);
+
+        // Remove sent token (creates tombstone)
+        await this.removeToken(token.id, recipientNametag);
       }
 
       result.status = 'delivered';
-
-      // Remove sent tokens (creates tombstones)
-      const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
-      for (const token of tokensToSend) {
-        await this.removeToken(token.id, recipientNametag);
-      }
 
       // Save state
       await this.save();
       await this.removeFromOutbox(result.id);
 
       result.status = 'completed';
+
+      // Add to transaction history
+      await this.addToHistory({
+        type: 'SENT',
+        amount: request.amount,
+        coinId: request.coinId,
+        symbol: this.getCoinSymbol(request.coinId),
+        timestamp: Date.now(),
+        recipientNametag,
+      });
 
       this.deps!.emitEvent('transfer:confirmed', result);
       return result;
@@ -712,6 +785,28 @@ export class PaymentsModule {
       this.deps!.emitEvent('transfer:failed', result);
       throw error;
     }
+  }
+
+  /**
+   * Get coin symbol from coinId
+   */
+  private getCoinSymbol(coinId: string): string {
+    // Common coin mappings
+    const symbols: Record<string, string> = {
+      'UCT': 'UCT',
+      // Add more as needed
+    };
+    return symbols[coinId] || coinId.slice(0, 6).toUpperCase();
+  }
+
+  /**
+   * Get coin name from coinId
+   */
+  private getCoinName(coinId: string): string {
+    const names: Record<string, string> = {
+      'UCT': 'Unicity Token',
+    };
+    return names[coinId] || coinId;
   }
 
   // ===========================================================================
@@ -1217,8 +1312,51 @@ export class PaymentsModule {
     }
 
     await this.save();
+
+    // Save as individual token file (like lottery pattern)
+    await this.saveTokenToFileStorage(token);
+
     this.log(`Added token ${token.id}, total: ${this.tokens.size}`);
     return true;
+  }
+
+  /**
+   * Save token as individual file to token storage providers
+   * Similar to lottery's saveReceivedToken() pattern
+   */
+  private async saveTokenToFileStorage(token: Token): Promise<void> {
+    const providers = this.getTokenStorageProviders();
+    if (providers.size === 0) return;
+
+    // Extract SDK token ID for filename
+    const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
+    const tokenIdPrefix = sdkTokenId ? sdkTokenId.slice(0, 16) : token.id.slice(0, 16);
+    const filename = `token-${tokenIdPrefix}-${Date.now()}`;
+
+    // Token data to save (similar to lottery format)
+    const tokenData = {
+      token: token.sdkData ? JSON.parse(token.sdkData) : null,
+      receivedAt: Date.now(),
+      meta: {
+        id: token.id,
+        coinId: token.coinId,
+        symbol: token.symbol,
+        amount: token.amount,
+        status: token.status,
+      },
+    };
+
+    // Save to all token storage providers
+    for (const [providerId, provider] of providers) {
+      try {
+        if (provider.saveToken) {
+          await provider.saveToken(filename, tokenData);
+          this.log(`Saved token file ${filename} to ${providerId}`);
+        }
+      } catch (error) {
+        console.warn(`[Payments] Failed to save token to ${providerId}:`, error);
+      }
+    }
   }
 
   /**
@@ -1697,29 +1835,6 @@ export class PaymentsModule {
    */
   getPendingTransfers(): TransferResult[] {
     return Array.from(this.pendingTransfers.values());
-  }
-
-  // ===========================================================================
-  // Private: Token Selection
-  // ===========================================================================
-
-  private selectTokens(coinId: string, amount: bigint): Token[] {
-    const available = this.getTokens({ coinId, status: 'confirmed' });
-    available.sort((a, b) => {
-      const diff = BigInt(b.amount) - BigInt(a.amount);
-      return diff > 0n ? 1 : diff < 0n ? -1 : 0;
-    });
-
-    const selected: Token[] = [];
-    let total = 0n;
-
-    for (const token of available) {
-      if (total >= amount) break;
-      selected.push(token);
-      total += BigInt(token.amount);
-    }
-
-    return total >= amount ? selected : [];
   }
 
   // ===========================================================================

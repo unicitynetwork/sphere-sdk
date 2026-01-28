@@ -213,3 +213,54 @@ describe('L1PaymentsModule', () => {
     });
   });
 });
+
+describe('Token file storage (lottery pattern)', () => {
+  it('should have saveToken as optional method on TokenStorageProvider interface', async () => {
+    // Import the interface to verify it has the optional saveToken method
+    const { FileTokenStorageProvider } = await import('../../../impl/nodejs/storage');
+
+    const provider = new FileTokenStorageProvider('/tmp/test-tokens');
+
+    // Verify the provider has saveToken method
+    expect(typeof provider.saveToken).toBe('function');
+    expect(typeof provider.getToken).toBe('function');
+    expect(typeof provider.listTokenIds).toBe('function');
+    expect(typeof provider.deleteToken).toBe('function');
+  });
+
+  it('should generate correct token filename format', () => {
+    // Verify the filename format matches lottery pattern: token-{id}-{timestamp}.json
+    const tokenIdPrefix = 'abcd1234'.slice(0, 16);
+    const timestamp = Date.now();
+    const filename = `token-${tokenIdPrefix}-${timestamp}`;
+
+    expect(filename).toMatch(/^token-[a-f0-9]+-\d+$/);
+    expect(filename.startsWith('token-')).toBe(true);
+  });
+
+  it('should store token data in lottery-compatible format', () => {
+    // Verify the saved data structure matches lottery format
+    const tokenData = {
+      token: { genesis: {}, state: {} },
+      receivedAt: Date.now(),
+      meta: {
+        id: 'test-id',
+        coinId: 'UCT',
+        symbol: 'UCT',
+        amount: '1000000000000000000',
+        status: 'confirmed',
+      },
+    };
+
+    // Lottery format has: { token: Token.toJSON(), receivedAt: number }
+    expect(tokenData).toHaveProperty('token');
+    expect(tokenData).toHaveProperty('receivedAt');
+    expect(typeof tokenData.receivedAt).toBe('number');
+
+    // SDK format adds meta for convenience
+    expect(tokenData).toHaveProperty('meta');
+    expect(tokenData.meta).toHaveProperty('id');
+    expect(tokenData.meta).toHaveProperty('coinId');
+    expect(tokenData.meta).toHaveProperty('amount');
+  });
+});

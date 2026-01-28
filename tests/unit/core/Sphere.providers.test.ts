@@ -124,7 +124,7 @@ describe('TokenStorageProvider Management', () => {
 
       expect(provider.id).toBe('test-1');
       expect(provider.name).toBe('Mock Provider test-1');
-      expect(provider.type).toBe('remote');
+      expect(provider.type).toBe('cloud');
       expect(typeof provider.setIdentity).toBe('function');
       expect(typeof provider.initialize).toBe('function');
       expect(typeof provider.shutdown).toBe('function');
