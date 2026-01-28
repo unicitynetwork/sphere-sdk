@@ -461,20 +461,48 @@ export class NostrTransportProvider implements TransportProvider {
     this.ensureReady();
 
     // Query for nametag binding events using hashed nametag (privacy-preserving)
+    // Try both '#d' and '#t' filters for compatibility with nostr-js-sdk
     const hashedNametag = hashNametag(nametag);
-    const filter = {
-      kinds: [EVENT_KINDS.NAMETAG_BINDING],
-      '#d': [hashedNametag],
-      limit: 1,
-    };
 
-    const events = await this.queryEvents(filter);
+    // First try '#t' tag (nostr-js-sdk format)
+    let events = await this.queryEvents({
+      kinds: [EVENT_KINDS.NAMETAG_BINDING],
+      '#t': [hashedNametag],
+      limit: 1,
+    });
+
+    // Fallback to '#d' tag (legacy format)
+    if (events.length === 0) {
+      events = await this.queryEvents({
+        kinds: [EVENT_KINDS.NAMETAG_BINDING],
+        '#d': [hashedNametag],
+        limit: 1,
+      });
+    }
+
     if (events.length === 0) return null;
 
-    // Parse binding event - try 'p' tag first, fallback to event author pubkey
+    // Parse binding event - try multiple formats for compatibility
     const bindingEvent = events[0];
+
+    // 1. Try 'address' tag (nostr-js-sdk format)
+    const addressTag = bindingEvent.tags.find((t: string[]) => t[0] === 'address');
+    if (addressTag?.[1]) return addressTag[1];
+
+    // 2. Try 'p' tag (SDK format)
     const pubkeyTag = bindingEvent.tags.find((t: string[]) => t[0] === 'p');
-    return pubkeyTag?.[1] ?? bindingEvent.pubkey ?? null;
+    if (pubkeyTag?.[1]) return pubkeyTag[1];
+
+    // 3. Try content JSON (nostr-js-sdk format)
+    try {
+      const content = JSON.parse(bindingEvent.content);
+      if (content.address) return content.address;
+    } catch {
+      // Content is not JSON, might be raw pubkey
+    }
+
+    // 4. Fallback to content as raw value or event author
+    return bindingEvent.content || bindingEvent.pubkey || null;
   }
 
   async publishNametag(nametag: string, address: string): Promise<void> {
@@ -508,10 +536,19 @@ export class NostrTransportProvider implements TransportProvider {
       return true;
     }
 
-    // Publish nametag binding with hashed nametag (privacy-preserving)
+    // Publish nametag binding matching nostr-js-sdk format
     const hashedNametag = hashNametag(nametag);
-    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, publicKey, [
+    const content = JSON.stringify({
+      nametag_hash: hashedNametag,
+      address: publicKey,
+      verified: Date.now(),
+    });
+
+    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, [
       ['d', hashedNametag],
+      ['nametag', hashedNametag],
+      ['t', hashedNametag],
+      ['address', publicKey],
       ['p', publicKey],
     ]);
 
