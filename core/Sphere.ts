@@ -1746,9 +1746,9 @@ export class Sphere {
    * Validate nametag format
    */
   private validateNametag(nametag: string): boolean {
-    // Alphanumeric characters and underscores allowed
+    // Alphanumeric characters, underscores and hyphens allowed
     const pattern = new RegExp(
-      `^[a-zA-Z0-9_]{${LIMITS.NAMETAG_MIN_LENGTH},${LIMITS.NAMETAG_MAX_LENGTH}}$`
+      `^[a-zA-Z0-9_-]{${LIMITS.NAMETAG_MIN_LENGTH},${LIMITS.NAMETAG_MAX_LENGTH}}$`
     );
     return pattern.test(nametag);
   }

@@ -73,17 +73,17 @@ export const DEFAULT_NOSTR_RELAYS = [
   'wss://relay.nostr.band',
 ] as const;
 
-/** Nostr event kinds used by SDK */
+/** Nostr event kinds used by SDK - must match @unicitylabs/nostr-js-sdk */
 export const NOSTR_EVENT_KINDS = {
   /** NIP-04 encrypted direct message */
   DIRECT_MESSAGE: 4,
-  /** Token transfer (custom) */
-  TOKEN_TRANSFER: 21000,
-  /** Payment request (custom) */
-  PAYMENT_REQUEST: 21001,
-  /** Payment request response (custom) */
-  PAYMENT_REQUEST_RESPONSE: 21002,
-  /** Nametag binding (custom NIP-30078 replaceable) */
+  /** Token transfer (Unicity custom - 31113) */
+  TOKEN_TRANSFER: 31113,
+  /** Payment request (Unicity custom - 31115) */
+  PAYMENT_REQUEST: 31115,
+  /** Payment request response (Unicity custom - 31116) */
+  PAYMENT_REQUEST_RESPONSE: 31116,
+  /** Nametag binding (NIP-78 app-specific data) */
   NAMETAG_BINDING: 30078,
   /** Public broadcast */
   BROADCAST: 1,

@@ -15,6 +15,7 @@ import {
   NostrKeyManager,
   NIP04,
   Event as NostrEventClass,
+  hashNametag,
 } from '@unicitylabs/nostr-js-sdk';
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
@@ -374,25 +375,36 @@ export class NostrTransportProvider implements TransportProvider {
   ): Promise<string> {
     this.ensureReady();
 
-    // Build request content
+    const requestId = this.config.generateUUID();
+    const amount = typeof payload.amount === 'bigint' ? payload.amount.toString() : payload.amount;
+
+    // Build request content matching nostr-js-sdk format
     const requestContent = {
-      requestId: this.config.generateUUID(),
-      amount: typeof payload.amount === 'bigint' ? payload.amount.toString() : payload.amount,
+      requestId,
+      amount,
       coinId: payload.coinId,
       message: payload.message,
       recipientNametag: payload.recipientNametag,
-      metadata: payload.metadata,
+      deadline: Date.now() + 5 * 60 * 1000, // 5 minutes default
     };
 
-    // Create encrypted payment request event
-    const content = JSON.stringify(requestContent);
+    // Content must have "payment_request:" prefix for nostr-js-sdk compatibility
+    const content = 'payment_request:' + JSON.stringify(requestContent);
+
+    // Build tags matching nostr-js-sdk format
+    const tags: string[][] = [
+      ['p', recipientPubkey],
+      ['type', 'payment_request'],
+      ['amount', amount],
+    ];
+    if (payload.recipientNametag) {
+      tags.push(['recipient', payload.recipientNametag]);
+    }
+
     const event = await this.createEncryptedEvent(
       EVENT_KINDS.PAYMENT_REQUEST,
       content,
-      [
-        ['p', recipientPubkey],
-        ['d', 'payment-request'],
-      ]
+      tags
     );
 
     await this.publishEvent(event);
@@ -448,27 +460,30 @@ export class NostrTransportProvider implements TransportProvider {
   async resolveNametag(nametag: string): Promise<string | null> {
     this.ensureReady();
 
-    // Query for nametag binding events
+    // Query for nametag binding events using hashed nametag (privacy-preserving)
+    const hashedNametag = hashNametag(nametag);
     const filter = {
       kinds: [EVENT_KINDS.NAMETAG_BINDING],
-      '#d': [nametag],
+      '#d': [hashedNametag],
       limit: 1,
     };
 
     const events = await this.queryEvents(filter);
     if (events.length === 0) return null;
 
-    // Parse binding event
+    // Parse binding event - try 'p' tag first, fallback to event author pubkey
     const bindingEvent = events[0];
     const pubkeyTag = bindingEvent.tags.find((t: string[]) => t[0] === 'p');
-    return pubkeyTag?.[1] ?? null;
+    return pubkeyTag?.[1] ?? bindingEvent.pubkey ?? null;
   }
 
   async publishNametag(nametag: string, address: string): Promise<void> {
     this.ensureReady();
 
+    // Use hashed nametag (privacy-preserving)
+    const hashedNametag = hashNametag(nametag);
     const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, address, [
-      ['d', nametag],
+      ['d', hashedNametag],
       ['a', address],
     ]);
 
@@ -481,8 +496,9 @@ export class NostrTransportProvider implements TransportProvider {
 
     // Check if nametag is already taken
     const existing = await this.resolveNametag(nametag);
+    this.log('registerNametag:', nametag, 'existing:', existing, 'myPubkey:', publicKey);
     if (existing && existing !== publicKey) {
-      this.log('Nametag already taken:', nametag);
+      this.log('Nametag already taken:', nametag, '- owner:', existing);
       return false;
     }
 
@@ -492,9 +508,10 @@ export class NostrTransportProvider implements TransportProvider {
       return true;
     }
 
-    // Publish nametag binding
+    // Publish nametag binding with hashed nametag (privacy-preserving)
+    const hashedNametag = hashNametag(nametag);
     const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, publicKey, [
-      ['d', nametag],
+      ['d', hashedNametag],
       ['p', publicKey],
     ]);
 
