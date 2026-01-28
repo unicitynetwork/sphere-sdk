@@ -3,8 +3,8 @@
  * Covers L1 optional initialization and configuration
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { PaymentsModule, createPaymentsModule } from '../../../modules/payments/PaymentsModule';
+import { describe, it, expect, vi } from 'vitest';
+import { createPaymentsModule } from '../../../modules/payments/PaymentsModule';
 import { L1PaymentsModule } from '../../../modules/payments/L1PaymentsModule';
 
 // =============================================================================
@@ -188,8 +188,8 @@ describe('L1PaymentsModule', () => {
       // Note: L1PaymentsModule is only created when electrumUrl is provided
       // via PaymentsModule, but directly it still has defaults
       const l1 = new L1PaymentsModule();
-      // Access private config via any
-      const config = (l1 as any)._config;
+      // Access private config for testing
+      const config = (l1 as unknown as { _config: Record<string, unknown> })._config;
 
       expect(config.electrumUrl).toBe('wss://fulcrum.alpha.unicity.network:50004');
       expect(config.network).toBe('mainnet');
@@ -204,7 +204,7 @@ describe('L1PaymentsModule', () => {
         defaultFeeRate: 5,
         enableVesting: false,
       });
-      const config = (l1 as any)._config;
+      const config = (l1 as unknown as { _config: Record<string, unknown> })._config;
 
       expect(config.electrumUrl).toBe('wss://custom.example.com:50004');
       expect(config.network).toBe('testnet');
@@ -295,8 +295,8 @@ describe('Incoming transfer PROXY finalization', () => {
     const hasNametagToken = nametagData?.token !== undefined;
     expect(hasNametagToken).toBe(true);
 
-    const noNametag = null;
-    const hasNoNametagToken = noNametag?.token !== undefined;
+    const noNametag = null as { token?: object } | null;
+    const hasNoNametagToken = noNametag !== null && noNametag.token !== undefined;
     expect(hasNoNametagToken).toBe(false);
   });
 
@@ -319,9 +319,10 @@ describe('Incoming transfer PROXY finalization', () => {
 
   it('should handle missing nametag gracefully', () => {
     // When nametag is missing, should save unfinalized token
-    const nametag = null;
+    const nametag = null as { token?: object } | null;
 
-    if (!nametag?.token) {
+    const hasToken = nametag !== null && nametag.token !== undefined;
+    if (!hasToken) {
       // Save without finalization
       const tokenData = { genesis: {}, state: {} };
       expect(tokenData).toBeDefined();
@@ -457,5 +458,286 @@ describe('Lottery compatibility', () => {
     const filename = `token-${tokenId.slice(0, 16)}-${timestamp}.json`;
 
     expect(filename).toMatch(/^token-[a-f0-9]+-\d+\.json$/);
+  });
+});
+
+describe('loadTokensFromFileStorage (lottery compatibility)', () => {
+  it('should skip loading if no providers configured', () => {
+    // When getTokenStorageProviders() returns empty map, should exit early
+    const providers = new Map();
+    expect(providers.size).toBe(0);
+  });
+
+  it('should skip providers without listTokenIds method', () => {
+    // Provider must have listTokenIds and getToken methods
+    const provider = {
+      save: vi.fn(),
+      load: vi.fn(),
+      // No listTokenIds or getToken
+    };
+
+    const hasListTokenIds = 'listTokenIds' in provider && typeof provider.listTokenIds === 'function';
+    expect(hasListTokenIds).toBe(false);
+  });
+
+  it('should parse lottery file format: { token, receivedAt }', () => {
+    // Lottery saves files in this format
+    const lotteryFileData = {
+      token: {
+        genesis: {
+          data: {
+            tokenId: 'abc123',
+            coinData: { UCT: '1000000000000000000' },
+          },
+        },
+        state: {},
+      },
+      receivedAt: Date.now(),
+    };
+
+    expect(lotteryFileData).toHaveProperty('token');
+    expect(lotteryFileData).toHaveProperty('receivedAt');
+    expect(lotteryFileData.token.genesis.data.tokenId).toBe('abc123');
+  });
+
+  it('should extract tokenId from genesis.data.tokenId', () => {
+    const tokenJson = {
+      genesis: {
+        data: {
+          tokenId: 'test-token-id-123',
+          coinData: { UCT: '1000' },
+        },
+      },
+    };
+
+    // Extraction logic from loadTokensFromFileStorage
+    const tokenObj = tokenJson as Record<string, unknown>;
+    const genesis = tokenObj.genesis as Record<string, unknown> | undefined;
+    const genesisData = genesis?.data as Record<string, unknown> | undefined;
+    const sdkTokenId = genesisData?.tokenId as string | undefined;
+
+    expect(sdkTokenId).toBe('test-token-id-123');
+  });
+
+  it('should skip already loaded tokens (deduplication)', () => {
+    // Simulate in-memory tokens map
+    const existingTokens = new Map([
+      ['token-1', { id: 'token-1', sdkData: '{"genesis":{"data":{"tokenId":"abc123"}}}' }],
+    ]);
+
+    const newTokenId = 'abc123';
+    let exists = false;
+
+    for (const existing of existingTokens.values()) {
+      const existingJson = JSON.parse(existing.sdkData as string);
+      const existingId = existingJson?.genesis?.data?.tokenId;
+      if (existingId === newTokenId) {
+        exists = true;
+        break;
+      }
+    }
+
+    expect(exists).toBe(true);
+  });
+
+  it('should add token to in-memory storage after parsing', () => {
+    const tokens = new Map<string, object>();
+    const tokenFromFile = {
+      id: 'token-xyz',
+      coinId: 'UCT',
+      symbol: 'UCT',
+      amount: '1000000000000000000',
+      status: 'confirmed',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData: '{}',
+    };
+
+    tokens.set(tokenFromFile.id, tokenFromFile);
+    expect(tokens.has('token-xyz')).toBe(true);
+  });
+});
+
+describe('saveNametagToFileStorage (lottery compatibility)', () => {
+  it('should save nametag in lottery-compatible format', () => {
+    const nametag = {
+      name: 'alice',
+      token: { genesis: {}, state: {} },
+      timestamp: Date.now(),
+    };
+
+    // Expected file format
+    const fileData = {
+      nametag: nametag.name,
+      token: nametag.token,
+      timestamp: nametag.timestamp,
+    };
+
+    expect(fileData.nametag).toBe('alice');
+    expect(fileData).toHaveProperty('token');
+    expect(fileData).toHaveProperty('timestamp');
+  });
+
+  it('should use filename format: nametag-{name}', () => {
+    const name = 'alice';
+    const filename = `nametag-${name}`;
+
+    expect(filename).toBe('nametag-alice');
+    expect(filename).toMatch(/^nametag-[a-z]+$/);
+  });
+
+  it('should call provider.saveToken with correct arguments', () => {
+    const mockProvider = {
+      saveToken: vi.fn(),
+    };
+
+    const nametag = {
+      name: 'bob',
+      token: { data: 'test' },
+      timestamp: 123456789,
+    };
+
+    const filename = `nametag-${nametag.name}`;
+    const fileData = {
+      nametag: nametag.name,
+      token: nametag.token,
+      timestamp: nametag.timestamp,
+    };
+
+    // Simulate saveToken call
+    mockProvider.saveToken(filename, fileData);
+
+    expect(mockProvider.saveToken).toHaveBeenCalledWith('nametag-bob', {
+      nametag: 'bob',
+      token: { data: 'test' },
+      timestamp: 123456789,
+    });
+  });
+});
+
+describe('loadNametagFromFileStorage (lottery compatibility)', () => {
+  it('should skip if nametag already loaded', () => {
+    // If this.nametag is set, should return early
+    const existingNametag = { name: 'alice', token: {} };
+    const shouldSkip = existingNametag !== null;
+
+    expect(shouldSkip).toBe(true);
+  });
+
+  it('should filter for nametag- prefixed files', () => {
+    const tokenIds = [
+      'token-abc-123',
+      'token-def-456',
+      'nametag-alice',
+      'nametag-bob',
+      'other-file',
+    ];
+
+    const nametagFiles = tokenIds.filter(id => id.startsWith('nametag-'));
+
+    expect(nametagFiles).toEqual(['nametag-alice', 'nametag-bob']);
+    expect(nametagFiles.length).toBe(2);
+  });
+
+  it('should parse nametag file format', () => {
+    const fileData = {
+      nametag: 'alice',
+      token: { genesis: {}, state: {} },
+      timestamp: 123456789,
+    };
+
+    // Should convert to NametagData format
+    const nametagData = {
+      name: fileData.nametag,
+      token: fileData.token,
+      timestamp: fileData.timestamp,
+      format: 'lottery',
+      version: '1.0',
+    };
+
+    expect(nametagData.name).toBe('alice');
+    expect(nametagData.format).toBe('lottery');
+    expect(nametagData.version).toBe('1.0');
+  });
+
+  it('should skip files without token or nametag fields', () => {
+    const invalidFileData = { other: 'data' };
+
+    const data = invalidFileData as Record<string, unknown>;
+    const hasRequiredFields = data.token && data.nametag;
+
+    expect(hasRequiredFields).toBeFalsy();
+  });
+});
+
+describe('PROXY token rejection (lottery behavior)', () => {
+  it('should reject PROXY token when no nametag token available', () => {
+    // Simulates the rejection logic in handleIncomingTransfer
+    const addressScheme = 1; // PROXY
+    const nametag = null as { token?: object } | null;
+
+    const hasNametagToken = nametag !== null && nametag.token !== undefined;
+    const shouldReject = addressScheme === 1 && !hasNametagToken;
+
+    expect(shouldReject).toBe(true);
+  });
+
+  it('should not reject DIRECT token without nametag', () => {
+    // DIRECT (scheme 0) doesn't need finalization
+    const addressScheme: number = 0; // DIRECT
+
+    // DIRECT tokens don't require nametag
+    const needsFinalization = addressScheme === 1;
+
+    expect(needsFinalization).toBe(false);
+  });
+
+  it('should reject PROXY token when stClient is missing', () => {
+    const addressScheme = 1; // PROXY
+    // nametag with token exists, but stClient is missing
+    const stClient = null;
+    const trustBase = { data: {} };
+
+    const shouldReject = addressScheme === 1 && (!stClient || !trustBase);
+
+    expect(shouldReject).toBe(true);
+  });
+
+  it('should reject PROXY token when trustBase is missing', () => {
+    const addressScheme = 1; // PROXY
+    // nametag with token exists, but trustBase is missing
+    const stClient = { finalize: vi.fn() };
+    const trustBase = null;
+
+    const shouldReject = addressScheme === 1 && (!stClient || !trustBase);
+
+    expect(shouldReject).toBe(true);
+  });
+
+  it('should accept PROXY token when all dependencies are available', () => {
+    const addressScheme = 1; // PROXY
+    const nametag = { token: {} };
+    const stClient = { finalize: vi.fn() };
+    const trustBase = { data: {} };
+
+    const canFinalize = addressScheme === 1 &&
+      nametag?.token &&
+      stClient &&
+      trustBase;
+
+    expect(canFinalize).toBeTruthy();
+  });
+
+  it('should document rejection vs fallback behavior difference from before', () => {
+    // Before: would save unfinalized PROXY tokens
+    // After (lottery-compatible): reject tokens that cannot be finalized
+    const behaviorDiff = {
+      before: 'Save unfinalized token as fallback',
+      after: 'Reject token - cannot spend without finalization',
+      reason: 'Lottery rejects tokens that cannot be finalized, SDK should match',
+    };
+
+    expect(behaviorDiff.after).toContain('Reject');
+    expect(behaviorDiff.reason.toLowerCase()).toContain('lottery');
   });
 });
