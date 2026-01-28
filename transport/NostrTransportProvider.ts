@@ -721,10 +721,10 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   private async handleDirectMessage(event: NostrEvent): Promise<void> {
-    if (!this.identity) return;
+    if (!this.identity || !this.keyManager) return;
 
-    // Skip our own messages
-    if (event.pubkey === this.identity.publicKey) return;
+    // Skip our own messages (compare with 32-byte Nostr pubkey)
+    if (event.pubkey === this.keyManager.getPublicKeyHex()) return;
 
     // Decrypt content
     const content = await this.decryptContent(event.content, event.pubkey);
@@ -1027,9 +1027,11 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   private subscribeToEvents(): void {
-    if (!this.identity) return;
+    if (!this.identity || !this.keyManager) return;
 
     const subId = 'main';
+    // Use 32-byte Nostr pubkey (x-coordinate only), not 33-byte compressed key
+    const nostrPubkey = this.keyManager.getPublicKeyHex();
     const filter: NostrFilter = {
       kinds: [
         EVENT_KINDS.DIRECT_MESSAGE,
@@ -1037,7 +1039,7 @@ export class NostrTransportProvider implements TransportProvider {
         EVENT_KINDS.PAYMENT_REQUEST,
         EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
       ],
-      '#p': [this.identity.publicKey],
+      '#p': [nostrPubkey],
       since: Math.floor(Date.now() / 1000) - 86400, // Last 24h
     };
 
