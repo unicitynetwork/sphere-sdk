@@ -45,6 +45,11 @@ export class FileStorageProvider implements StorageProvider {
   }
 
   async connect(): Promise<void> {
+    // Already connected - skip reconnection
+    if (this.status === 'connected') {
+      return;
+    }
+
     // Ensure directory exists
     if (!fs.existsSync(this.dataDir)) {
       fs.mkdirSync(this.dataDir, { recursive: true });

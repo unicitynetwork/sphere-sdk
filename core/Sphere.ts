@@ -320,6 +320,11 @@ export class Sphere {
    */
   static async exists(storage: StorageProvider): Promise<boolean> {
     try {
+      // Ensure storage is connected before checking
+      if (!storage.isConnected()) {
+        await storage.connect();
+      }
+
       const exists = await storage.get(STORAGE_KEYS.WALLET_EXISTS);
       if (exists === 'true') {
         // Double check - verify we have actual data
