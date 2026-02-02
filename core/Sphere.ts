@@ -325,13 +325,14 @@ export class Sphere {
         await storage.connect();
       }
 
-      const exists = await storage.get(STORAGE_KEYS.WALLET_EXISTS);
-      if (exists === 'true') {
-        // Double check - verify we have actual data
-        const mnemonic = await storage.get(STORAGE_KEYS.MNEMONIC);
-        const masterKey = await storage.get(STORAGE_KEYS.MASTER_KEY);
-        return !!(mnemonic || masterKey);
-      }
+      // Check for mnemonic or master_key directly
+      // These are saved with 'default' address before identity is set
+      const mnemonic = await storage.get(STORAGE_KEYS.MNEMONIC);
+      if (mnemonic) return true;
+
+      const masterKey = await storage.get(STORAGE_KEYS.MASTER_KEY);
+      if (masterKey) return true;
+
       return false;
     } catch {
       return false;
@@ -482,18 +483,6 @@ export class Sphere {
 
     // Sync nametag with Nostr (re-register if missing)
     await sphere.syncNametagWithNostr();
-
-    // Mint nametag token if nametag exists but token is missing
-    // Required for receiving tokens via @nametag (PROXY address finalization)
-    if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
-      console.log(`[Sphere] Minting missing nametag token for @${sphere._identity.nametag}...`);
-      const result = await sphere.mintNametag(sphere._identity.nametag);
-      if (!result.success) {
-        console.warn(`[Sphere] Failed to mint nametag token: ${result.error}`);
-      } else {
-        console.log(`[Sphere] Nametag token minted successfully`);
-      }
-    }
 
     sphere._initialized = true;
     Sphere.instance = sphere;
@@ -1952,11 +1941,11 @@ export class Sphere {
   // ===========================================================================
 
   private async loadIdentityFromStorage(): Promise<void> {
+    // Load keys that are saved with 'default' address (before identity is set)
     const encryptedMnemonic = await this._storage.get(STORAGE_KEYS.MNEMONIC);
     const encryptedMasterKey = await this._storage.get(STORAGE_KEYS.MASTER_KEY);
     const chainCode = await this._storage.get(STORAGE_KEYS.CHAIN_CODE);
     const derivationPath = await this._storage.get(STORAGE_KEYS.DERIVATION_PATH);
-    const savedNametag = await this._storage.get(STORAGE_KEYS.NAMETAG);
     const savedBasePath = await this._storage.get(STORAGE_KEYS.BASE_PATH);
     const savedDerivationMode = await this._storage.get(STORAGE_KEYS.DERIVATION_MODE);
     const savedSource = await this._storage.get(STORAGE_KEYS.WALLET_SOURCE);
@@ -1967,9 +1956,6 @@ export class Sphere {
     this._derivationMode = (savedDerivationMode as DerivationMode) ?? 'bip32';
     this._source = (savedSource as WalletSource) ?? 'unknown';
     this._currentAddressIndex = savedAddressIndex ? parseInt(savedAddressIndex, 10) : 0;
-
-    // Load address nametags
-    await this.loadAddressNametags();
 
     if (encryptedMnemonic) {
       const mnemonic = this.decrypt(encryptedMnemonic);
@@ -1997,6 +1983,15 @@ export class Sphere {
       throw new Error('No wallet data found in storage');
     }
 
+    // Now that identity is restored, set it on storage so subsequent reads use correct address
+    if (this._identity) {
+      this._storage.setIdentity(this._identity);
+    }
+
+    // Load address-scoped data (saved with actual address, not 'default')
+    await this.loadAddressNametags();
+    const savedNametag = await this._storage.get(STORAGE_KEYS.NAMETAG);
+
     // If we have a saved address index > 0 and master key, switch to that address
     if (this._currentAddressIndex > 0 && this._masterKey) {
       // Re-derive identity for the saved address index
@@ -2013,6 +2008,8 @@ export class Sphere {
         ipnsName: '12D3KooW' + ipnsHash,
         nametag,
       };
+      // Update storage identity for correct address
+      this._storage.setIdentity(this._identity);
       console.log(`[Sphere] Restored to address ${this._currentAddressIndex}:`, this._identity.address);
     } else {
       // Restore saved nametag for address 0 (legacy support)
