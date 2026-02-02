@@ -106,16 +106,16 @@ async function encryptNametag(nametag: string, privateKeyHex: string): Promise<s
 
   const cryptoKey = await crypto.subtle.importKey(
     'raw',
-    key,
+    new Uint8Array(key).buffer as ArrayBuffer,
     { name: 'AES-GCM' },
     false,
     ['encrypt']
   );
 
   const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
+    { name: 'AES-GCM', iv: new Uint8Array(iv).buffer as ArrayBuffer },
     cryptoKey,
-    data
+    new Uint8Array(data).buffer as ArrayBuffer
   );
 
   // Combine IV + ciphertext (includes auth tag)
@@ -142,16 +142,16 @@ async function decryptNametag(encryptedBase64: string, privateKeyHex: string): P
 
     const cryptoKey = await crypto.subtle.importKey(
       'raw',
-      key,
+      new Uint8Array(key).buffer as ArrayBuffer,
       { name: 'AES-GCM' },
       false,
       ['decrypt']
     );
 
     const decrypted = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv },
+      { name: 'AES-GCM', iv: new Uint8Array(iv).buffer as ArrayBuffer },
       cryptoKey,
-      ciphertext
+      new Uint8Array(ciphertext).buffer as ArrayBuffer
     );
 
     const decoder = new TextDecoder();
