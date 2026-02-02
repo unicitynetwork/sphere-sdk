@@ -48,6 +48,19 @@ export interface TransportProvider extends BaseProvider {
   resolveNametag?(nametag: string): Promise<string | null>;
 
   /**
+   * Resolve nametag to full address information
+   * Returns pubkey (32-byte Nostr), publicKey (33-byte compressed), l1Address, l3Address
+   */
+  resolveNametagInfo?(nametag: string): Promise<NametagInfo | null>;
+
+  /**
+   * Recover nametag for current identity by decrypting stored encrypted nametag
+   * Used after wallet import to recover associated nametag
+   * @returns Decrypted nametag or null if none found
+   */
+  recoverNametag?(): Promise<string | null>;
+
+  /**
    * Register a nametag for this identity
    * @returns true if successful, false if already taken
    */
@@ -295,3 +308,26 @@ export type TransportEventCallback = (event: TransportEvent) => void;
 export type TransportProviderFactory<TConfig, TProvider extends TransportProvider> = (
   config?: TConfig
 ) => TProvider;
+
+// =============================================================================
+// Nametag Info Types
+// =============================================================================
+
+/**
+ * Full nametag address information
+ * Used for resolving nametag to all address formats
+ */
+export interface NametagInfo {
+  /** Nametag name (without @) */
+  nametag: string;
+  /** 32-byte Nostr pubkey (x-only, for messaging) */
+  pubkey: string;
+  /** 33-byte compressed public key (for L3 operations) */
+  publicKey: string;
+  /** L1 address (alpha1...) */
+  l1Address: string;
+  /** L3 proxy address derived from nametag token (DIRECT:...) */
+  l3Address: string;
+  /** Event timestamp */
+  timestamp: number;
+}

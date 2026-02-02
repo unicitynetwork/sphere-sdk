@@ -291,6 +291,7 @@ export type SphereEventType =
   | 'sync:error'
   | 'connection:changed'
   | 'nametag:registered'
+  | 'nametag:recovered'
   | 'identity:changed';
 
 export interface SphereEventMap {
@@ -310,6 +311,7 @@ export interface SphereEventMap {
   'sync:error': { source: string; error: string };
   'connection:changed': { provider: string; connected: boolean };
   'nametag:registered': { nametag: string; addressIndex: number };
+  'nametag:recovered': { nametag: string };
   'identity:changed': { address: string; predicateAddress?: string; publicKey: string; nametag?: string; addressIndex: number };
 }
 

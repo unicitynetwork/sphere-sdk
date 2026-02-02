@@ -536,13 +536,18 @@ export class Sphere {
     await sphere.initializeProviders();
     await sphere.initializeModules();
 
+    // Try to recover nametag from Nostr (if no nametag provided and wallet previously had one)
+    if (!options.nametag) {
+      await sphere.recoverNametagFromNostr();
+    }
+
     // Mark wallet as created only after successful initialization
     await sphere.finalizeWalletCreation();
 
     sphere._initialized = true;
     Sphere.instance = sphere;
 
-    // Register nametag if provided
+    // Register nametag if provided (this overrides any recovered nametag)
     if (options.nametag) {
       await sphere.registerNametag(options.nametag);
     }
@@ -1829,6 +1834,55 @@ export class Sphere {
     } catch (error) {
       // Don't fail wallet load on nametag sync errors
       console.warn(`[Sphere] Nametag sync failed:`, error);
+    }
+  }
+
+  /**
+   * Recover nametag from Nostr after wallet import
+   * Searches for encrypted nametag events authored by this wallet's pubkey
+   * and decrypts them to restore the nametag association
+   */
+  private async recoverNametagFromNostr(): Promise<void> {
+    // Skip if already has a nametag
+    if (this._identity?.nametag) {
+      return;
+    }
+
+    // Check if transport supports nametag recovery
+    if (!this._transport.recoverNametag) {
+      return;
+    }
+
+    try {
+      console.log('[Sphere] Attempting to recover nametag from Nostr...');
+      const recoveredNametag = await this._transport.recoverNametag();
+
+      if (recoveredNametag) {
+        console.log(`[Sphere] Recovered nametag: @${recoveredNametag}`);
+
+        // Update identity with recovered nametag
+        if (this._identity) {
+          (this._identity as MutableFullIdentity).nametag = recoveredNametag;
+        }
+
+        // Store nametag locally
+        this._addressNametags.set(this._currentAddressIndex, recoveredNametag);
+        await this._storage.set(STORAGE_KEYS.NAMETAG, JSON.stringify({
+          [this._currentAddressIndex]: recoveredNametag,
+        }));
+
+        // Re-register to ensure event has latest format with all fields
+        if (this._transport.registerNametag) {
+          await this._transport.registerNametag(recoveredNametag, this._identity!.publicKey);
+        }
+
+        this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
+      } else {
+        console.log('[Sphere] No nametag found on Nostr for this wallet');
+      }
+    } catch (error) {
+      // Don't fail wallet import on nametag recovery errors
+      console.warn('[Sphere] Nametag recovery failed:', error);
     }
   }
 

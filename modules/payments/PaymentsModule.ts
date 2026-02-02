@@ -548,12 +548,13 @@ export class PaymentsModule {
   initialize(deps: PaymentsModuleDependencies): void {
     this.deps = deps;
 
-    // Initialize L1 sub-module with chain code and addresses (if enabled)
+    // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
     if (this.l1) {
       this.l1.initialize({
         identity: deps.identity,
         chainCode: deps.chainCode,
         addresses: deps.l1Addresses,
+        transport: deps.transport,
       });
     }
 
@@ -2203,7 +2204,28 @@ export class PaymentsModule {
   // Private: Transfer Operations
   // ===========================================================================
 
+  /**
+   * Detect if a string is an L3 address (not a nametag)
+   * Returns true for: hex pubkeys (64+ chars), PROXY:, DIRECT: prefixed addresses
+   */
+  private isL3Address(value: string): boolean {
+    // PROXY: or DIRECT: prefixed addresses
+    if (value.startsWith('PROXY:') || value.startsWith('DIRECT:')) {
+      return true;
+    }
+    // Hex pubkey (64+ hex chars)
+    if (value.length >= 64 && /^[0-9a-fA-F]+$/.test(value)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Resolve recipient to Nostr pubkey for messaging
+   * Supports: nametag (with or without @), hex pubkey
+   */
   private async resolveRecipient(recipient: string): Promise<string> {
+    // Explicit nametag with @
     if (recipient.startsWith('@')) {
       const nametag = recipient.slice(1);
       const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
@@ -2212,7 +2234,26 @@ export class PaymentsModule {
       }
       return pubkey;
     }
-    return recipient;
+
+    // If it looks like an L3 address, return as-is (it's a pubkey)
+    if (this.isL3Address(recipient)) {
+      return recipient;
+    }
+
+    // Smart detection: try as nametag first
+    if (this.deps?.transport.resolveNametag) {
+      const pubkey = await this.deps.transport.resolveNametag(recipient);
+      if (pubkey) {
+        this.log(`Resolved "${recipient}" as nametag to pubkey`);
+        return pubkey;
+      }
+    }
+
+    // If not found as nametag and doesn't look like an address, throw error
+    throw new Error(
+      `Recipient "${recipient}" is not a valid nametag or address. ` +
+      `Use @nametag for explicit nametag or a valid hex pubkey/PROXY:/DIRECT: address.`
+    );
   }
 
   /**
@@ -2258,22 +2299,53 @@ export class PaymentsModule {
   }
 
   /**
-   * Resolve recipient to IAddress
+   * Resolve recipient to IAddress for L3 transfers
+   * Supports: nametag (with or without @), PROXY:, DIRECT:, hex pubkey
    */
   private async resolveRecipientAddress(recipient: string): Promise<IAddress> {
-    // If it's a nametag, resolve via TokenId
+    // Explicit nametag with @
     if (recipient.startsWith('@')) {
       const nametag = recipient.slice(1);
       const tokenId = await TokenId.fromNameTag(nametag);
       return ProxyAddress.fromTokenId(tokenId);
     }
 
-    // If it's a pubkey, create proxy address from it
-    const pubkeyBytes = new Uint8Array(
-      recipient.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+    // PROXY: or DIRECT: prefixed - parse as address directly
+    if (recipient.startsWith('PROXY:') || recipient.startsWith('DIRECT:')) {
+      // Extract the hex part after prefix
+      const hexPart = recipient.split(':')[1];
+      const bytes = new Uint8Array(
+        hexPart.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+      );
+      const tokenId = new TokenId(bytes.slice(0, 32));
+      return ProxyAddress.fromTokenId(tokenId);
+    }
+
+    // If it looks like a hex pubkey (64+ chars), use it directly
+    if (recipient.length >= 64 && /^[0-9a-fA-F]+$/.test(recipient)) {
+      const pubkeyBytes = new Uint8Array(
+        recipient.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+      );
+      const tokenId = new TokenId(pubkeyBytes.slice(0, 32));
+      return ProxyAddress.fromTokenId(tokenId);
+    }
+
+    // Smart detection: try as nametag
+    if (this.deps?.transport.resolveNametag) {
+      const pubkey = await this.deps.transport.resolveNametag(recipient);
+      if (pubkey) {
+        // Found as nametag - use nametag-based address
+        this.log(`Resolved "${recipient}" as nametag for L3 address`);
+        const tokenId = await TokenId.fromNameTag(recipient);
+        return ProxyAddress.fromTokenId(tokenId);
+      }
+    }
+
+    // Not found as nametag and doesn't look like an address
+    throw new Error(
+      `Recipient "${recipient}" is not a valid nametag or L3 address. ` +
+      `Use @nametag for explicit nametag or a valid hex pubkey/PROXY:/DIRECT: address.`
     );
-    const tokenId = new TokenId(pubkeyBytes.slice(0, 32));
-    return ProxyAddress.fromTokenId(tokenId);
   }
 
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
