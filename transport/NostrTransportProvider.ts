@@ -328,6 +328,11 @@ export class NostrTransportProvider implements TransportProvider {
   async sendMessage(recipientPubkey: string, content: string): Promise<string> {
     this.ensureReady();
 
+    // NIP-17 requires 32-byte x-only pubkey; strip 02/03 prefix if present
+    const nostrRecipient = recipientPubkey.length === 66 && (recipientPubkey.startsWith('02') || recipientPubkey.startsWith('03'))
+      ? recipientPubkey.slice(2)
+      : recipientPubkey;
+
     // Wrap content with sender nametag for Sphere app compatibility
     const senderNametag = this.identity?.nametag;
     const wrappedContent = senderNametag
@@ -335,7 +340,7 @@ export class NostrTransportProvider implements TransportProvider {
       : content;
 
     // Create NIP-17 gift-wrapped message (kind 1059)
-    const giftWrap = NIP17.createGiftWrap(this.keyManager!, recipientPubkey, wrappedContent);
+    const giftWrap = NIP17.createGiftWrap(this.keyManager!, nostrRecipient, wrappedContent);
 
     await this.publishEvent(giftWrap);
 
