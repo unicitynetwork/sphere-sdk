@@ -63,10 +63,25 @@ export default defineConfig([
       'elliptic',
     ],
   },
-  // Browser implementation (keep @unicitylabs external - browser uses bundler)
-  // Note: dts disabled due to @libp2p version conflicts - types come from helia peer deps
+  // Browser implementation (without IPFS - no helia dependency)
   {
     entry: { 'impl/browser/index': 'impl/browser/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: false,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'browser',
+    target: 'es2022',
+    external: [
+      /^@noble\//,
+      /^@unicitylabs\//,
+    ],
+  },
+  // Browser IPFS implementation (requires helia)
+  // Separate entry point so users can opt-in to IPFS functionality
+  {
+    entry: { 'impl/browser/ipfs': 'impl/browser/ipfs.ts' },
     format: ['esm', 'cjs'],
     dts: false,
     clean: false,

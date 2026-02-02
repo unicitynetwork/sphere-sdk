@@ -21,6 +21,10 @@
       "import": "./dist/impl/browser/index.js",
       "require": "./dist/impl/browser/index.cjs"
     },
+    "./impl/browser/ipfs": {
+      "import": "./dist/impl/browser/ipfs.js",
+      "require": "./dist/impl/browser/ipfs.cjs"
+    },
     "./impl/nodejs": {
       "import": {
         "types": "./dist/impl/nodejs/index.d.ts",
@@ -99,6 +103,10 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
+    "@libp2p/bootstrap": "^12.0.11",
+    "@libp2p/crypto": "^5.1.13",
+    "@libp2p/interface": "^3.1.0",
+    "@libp2p/peer-id": "^6.0.4",
     "@types/crypto-js": "^4.2.2",
     "@types/elliptic": "^6.4.18",
     "@types/node": "^22.0.0",
@@ -107,6 +115,7 @@
     "@typescript-eslint/parser": "^8.54.0",
     "eslint": "^9.39.2",
     "fake-indexeddb": "^6.2.5",
+    "multiformats": "^13.4.2",
     "tsup": "^8.5.1",
     "typescript": "~5.6.0",
     "typescript-eslint": "^8.54.0",

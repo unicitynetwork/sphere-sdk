@@ -23,16 +23,48 @@ import {
   DEFAULT_IPFS_BOOTSTRAP_PEERS,
 } from '../../../constants';
 
-// Helia and IPFS imports
-import { createHelia, type Helia } from 'helia';
-import { json, type JSON as HeliaJSON } from '@helia/json';
-import { bootstrap } from '@libp2p/bootstrap';
-import { generateKeyPairFromSeed } from '@libp2p/crypto/keys';
-import { peerIdFromPrivateKey } from '@libp2p/peer-id';
+// Helia and IPFS types (runtime imports are dynamic)
+import type { Helia } from 'helia';
+import type { JSON as HeliaJSON } from '@helia/json';
 import type { PrivateKey } from '@libp2p/interface';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { CID } from 'multiformats/cid';
+
+// Dynamic import cache
+let heliaModule: typeof import('helia') | null = null;
+let heliaJsonModule: typeof import('@helia/json') | null = null;
+let libp2pBootstrapModule: typeof import('@libp2p/bootstrap') | null = null;
+let libp2pCryptoModule: typeof import('@libp2p/crypto/keys') | null = null;
+let libp2pPeerIdModule: typeof import('@libp2p/peer-id') | null = null;
+let multiformatsCidModule: typeof import('multiformats/cid') | null = null;
+
+async function loadHeliaModules() {
+  if (!heliaModule) {
+    [
+      heliaModule,
+      heliaJsonModule,
+      libp2pBootstrapModule,
+      libp2pCryptoModule,
+      libp2pPeerIdModule,
+      multiformatsCidModule,
+    ] = await Promise.all([
+      import('helia'),
+      import('@helia/json'),
+      import('@libp2p/bootstrap'),
+      import('@libp2p/crypto/keys'),
+      import('@libp2p/peer-id'),
+      import('multiformats/cid'),
+    ]);
+  }
+  return {
+    createHelia: heliaModule!.createHelia,
+    json: heliaJsonModule!.json,
+    bootstrap: libp2pBootstrapModule!.bootstrap,
+    generateKeyPairFromSeed: libp2pCryptoModule!.generateKeyPairFromSeed,
+    peerIdFromPrivateKey: libp2pPeerIdModule!.peerIdFromPrivateKey,
+    CID: multiformatsCidModule!.CID,
+  };
+}
 
 /** HKDF info for IPNS key derivation */
 const HKDF_INFO = new TextEncoder().encode('ipfs-storage-key');
@@ -133,6 +165,8 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     try {
       this.log('Initializing Helia with bootstrap peers...');
 
+      const { createHelia, json, bootstrap } = await loadHeliaModules();
+
       this.helia = await createHelia({
         libp2p: {
           peerDiscovery: [
@@ -195,6 +229,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
 
     // Derive IPNS key pair from wallet private key using HKDF
     try {
+      const { generateKeyPairFromSeed, peerIdFromPrivateKey } = await loadHeliaModules();
       const walletSecret = this.hexToBytes(identity.privateKey);
       const derivedKey = hkdf(sha256, walletSecret, undefined, HKDF_INFO, 32);
 
@@ -607,6 +642,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       throw new Error('Helia not initialized');
     }
 
+    const { CID } = await loadHeliaModules();
     const cid = CID.parse(cidString);
     const data = await this.heliaJson.get(cid);
     this.log('Fetched via Helia, CID:', cidString);
