@@ -54,7 +54,7 @@ import type { TransportProvider } from '../transport';
 import type { OracleProvider } from '../oracle';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
-import { STORAGE_KEYS, DEFAULT_DERIVATION_PATH, DEFAULT_BASE_PATH, LIMITS, DEFAULT_ENCRYPTION_KEY, type NetworkType } from '../constants';
+import { STORAGE_KEYS, DEFAULT_BASE_PATH, LIMITS, DEFAULT_ENCRYPTION_KEY, type NetworkType } from '../constants';
 import {
   generateMnemonic as generateBip39Mnemonic,
   validateMnemonic as validateBip39Mnemonic,
@@ -62,8 +62,8 @@ import {
   deriveKeyAtPath,
   deriveAddressInfo,
   getPublicKey,
-  hash160,
   sha256,
+  publicKeyToAddress,
   type MasterKey,
   type AddressInfo,
 } from './crypto';
@@ -449,9 +449,12 @@ export class Sphere {
     sphere._initialized = true;
     Sphere.instance = sphere;
 
-    // Register nametag if provided (includes on-chain token minting)
+    // Register nametag if provided, otherwise try to recover from Nostr
     if (options.nametag) {
       await sphere.registerNametag(options.nametag);
+    } else {
+      // Try to recover nametag from Nostr (for wallet import scenarios)
+      await sphere.recoverNametagFromNostr();
     }
 
     return sphere;
@@ -536,7 +539,7 @@ export class Sphere {
     await sphere.initializeProviders();
     await sphere.initializeModules();
 
-    // Try to recover nametag from Nostr (if no nametag provided and wallet previously had one)
+    // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
     if (!options.nametag) {
       await sphere.recoverNametagFromNostr();
     }
@@ -1526,10 +1529,10 @@ export class Sphere {
       isChange
     );
 
-    // Convert hash160 to proper address format
+    // Convert to proper bech32 address format
     return {
       ...info,
-      address: 'alpha1' + info.address.slice(0, 38),
+      address: publicKeyToAddress(info.publicKey, 'alpha'),
     };
   }
 
@@ -1562,12 +1565,11 @@ export class Sphere {
     );
 
     const publicKey = getPublicKey(derived.privateKey);
-    const addressHash = hash160(publicKey);
 
     return {
       privateKey: derived.privateKey,
       publicKey,
-      address: 'alpha1' + addressHash.slice(0, 38),
+      address: publicKeyToAddress(publicKey, 'alpha'),
       path,
       index,
     };
@@ -1675,6 +1677,29 @@ export class Sphere {
    */
   hasNametag(): boolean {
     return !!this._identity?.nametag;
+  }
+
+  /**
+   * Get the PROXY address for the current nametag
+   * PROXY addresses are derived from the nametag hash and require
+   * the nametag token to claim funds sent to them
+   * @returns PROXY address string or undefined if no nametag
+   */
+  getProxyAddress(): string | undefined {
+    const nametag = this._identity?.nametag;
+    if (!nametag) return undefined;
+
+    // Hash nametag using same algorithm as nostr-js-sdk hashNametag:
+    // 1. Normalize: lowercase, remove @unicity suffix
+    // 2. Add salt prefix: 'unicity:nametag:'
+    // 3. SHA256 hash
+    const NAMETAG_SALT = 'unicity:nametag:';
+    let normalized = nametag.trim().toLowerCase();
+    if (normalized.endsWith('@unicity')) {
+      normalized = normalized.slice(0, -8);
+    }
+    const hashedNametag = sha256(NAMETAG_SALT + normalized, 'utf8');
+    return `PROXY:${hashedNametag}`;
   }
 
   /**
@@ -1854,11 +1879,9 @@ export class Sphere {
     }
 
     try {
-      console.log('[Sphere] Attempting to recover nametag from Nostr...');
       const recoveredNametag = await this._transport.recoverNametag();
 
       if (recoveredNametag) {
-        console.log(`[Sphere] Recovered nametag: @${recoveredNametag}`);
 
         // Update identity with recovered nametag
         if (this._identity) {
@@ -1867,9 +1890,7 @@ export class Sphere {
 
         // Store nametag locally
         this._addressNametags.set(this._currentAddressIndex, recoveredNametag);
-        await this._storage.set(STORAGE_KEYS.NAMETAG, JSON.stringify({
-          [this._currentAddressIndex]: recoveredNametag,
-        }));
+        await this._storage.set(STORAGE_KEYS.NAMETAG, recoveredNametag);
 
         // Re-register to ensure event has latest format with all fields
         if (this._transport.registerNametag) {
@@ -1877,12 +1898,9 @@ export class Sphere {
         }
 
         this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
-      } else {
-        console.log('[Sphere] No nametag found on Nostr for this wallet');
       }
-    } catch (error) {
+    } catch {
       // Don't fail wallet import on nametag recovery errors
-      console.warn('[Sphere] Nametag recovery failed:', error);
     }
   }
 
@@ -2068,18 +2086,26 @@ export class Sphere {
     } else {
       // Restore saved nametag for address 0 (legacy support)
       if (savedNametag && this._identity) {
-        this._identity.nametag = savedNametag;
+        // Handle both plain string and legacy JSON format {"0":"nametag"}
+        let nametag = savedNametag;
+        if (savedNametag.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(savedNametag);
+            nametag = parsed['0'] || parsed[0] || Object.values(parsed)[0] as string;
+          } catch {
+            // Keep original value if parsing fails
+          }
+        }
+        this._identity.nametag = nametag;
         // Also add to address nametags map if not already there
         if (!this._addressNametags.has(0)) {
-          this._addressNametags.set(0, savedNametag);
+          this._addressNametags.set(0, nametag);
         }
-        console.log('[Sphere] Restored nametag:', savedNametag);
       } else if (this._identity) {
         // Check if we have a nametag in the map for address 0
         const nametag = this._addressNametags.get(0);
         if (nametag) {
           this._identity.nametag = nametag;
-          console.log('[Sphere] Restored nametag from map:', nametag);
         }
       }
     }
@@ -2089,23 +2115,25 @@ export class Sphere {
     mnemonic: string,
     derivationPath?: string
   ): Promise<void> {
-    const path = derivationPath ?? DEFAULT_DERIVATION_PATH;
+    // Use base path (e.g., m/44'/0'/0') and append chain/index
+    const basePath = derivationPath ?? DEFAULT_BASE_PATH;
+    const fullPath = `${basePath}/0/0`;
 
     // Generate master key from mnemonic using BIP39/BIP32
     const masterKey = identityFromMnemonicSync(mnemonic);
 
-    // Derive key at path (e.g., m/44'/0'/0'/0/0)
+    // Derive key at full path (e.g., m/44'/0'/0'/0/0)
     const derivedKey = deriveKeyAtPath(
       masterKey.privateKey,
       masterKey.chainCode,
-      `${path}/0/0`
+      fullPath
     );
 
     // Get public key from derived private key
     const publicKey = getPublicKey(derivedKey.privateKey);
 
-    // Generate address hash (platform implementations will do bech32 encoding)
-    const addressHash = hash160(publicKey);
+    // Generate proper bech32 address
+    const address = publicKeyToAddress(publicKey, 'alpha');
 
     // Generate IPNS name from public key hash
     const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
@@ -2116,15 +2144,13 @@ export class Sphere {
     this._identity = {
       privateKey: derivedKey.privateKey,
       publicKey,
-      address: 'alpha1' + addressHash.slice(0, 38),
+      address,
       predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
 
     // Store master key info for future derivations
     this._masterKey = masterKey;
-
-    console.log('[Sphere] Identity initialized from mnemonic, path:', path);
   }
 
   private async initializeIdentityFromMasterKey(
@@ -2132,13 +2158,15 @@ export class Sphere {
     chainCode?: string,
     derivationPath?: string
   ): Promise<void> {
-    const path = derivationPath ?? DEFAULT_DERIVATION_PATH;
+    // Use base path (e.g., m/44'/0'/0') and append chain/index
+    const basePath = derivationPath ?? DEFAULT_BASE_PATH;
+    const fullPath = `${basePath}/0/0`;
 
     let privateKey: string;
 
     if (chainCode) {
       // Full BIP32 derivation with chain code
-      const derivedKey = deriveKeyAtPath(masterKey, chainCode, `${path}/0/0`);
+      const derivedKey = deriveKeyAtPath(masterKey, chainCode, fullPath);
       privateKey = derivedKey.privateKey;
 
       this._masterKey = {
@@ -2152,7 +2180,7 @@ export class Sphere {
     }
 
     const publicKey = getPublicKey(privateKey);
-    const addressHash = hash160(publicKey);
+    const address = publicKeyToAddress(publicKey, 'alpha');
     const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
 
     // Derive L3 predicate address (DIRECT://...)
@@ -2161,12 +2189,10 @@ export class Sphere {
     this._identity = {
       privateKey,
       publicKey,
-      address: 'alpha1' + addressHash.slice(0, 38),
+      address,
       predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
-
-    console.log('[Sphere] Identity initialized from master key, path:', path, 'chainCode:', !!chainCode);
   }
 
   // ===========================================================================
