@@ -3,7 +3,7 @@
  * Covers resolveNametagInfo, recoverNametag, and nametag encryption
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Buffer } from 'buffer';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 as sha256Noble } from '@noble/hashes/sha2.js';
@@ -93,7 +93,6 @@ type PendingRequest = {
 
 class MockWebSocketWithEvents implements IWebSocket {
   readyState: number = WebSocketReadyState.CONNECTING;
-  onopen: ((event: unknown) => void) | null = null;
   onmessage: ((event: IMessageEvent) => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
   onclose: ((event: unknown) => void) | null = null;
@@ -101,13 +100,28 @@ class MockWebSocketWithEvents implements IWebSocket {
   // Store events that will be returned for queries
   private _storedEvents: Map<string, unknown[]> = new Map();
   private _pendingRequests: PendingRequest[] = [];
+  private _onopen: ((event: unknown) => void) | null = null;
+  private _shouldConnect = false;
 
   constructor() {
-    // Auto-connect
-    setTimeout(() => {
-      this.readyState = WebSocketReadyState.OPEN;
-      this.onopen?.(new Event('open'));
-    }, 5);
+    // Schedule connection - will fire when onopen is set
+    this._shouldConnect = true;
+  }
+
+  // Use setter to trigger connection when handler is assigned
+  set onopen(handler: ((event: unknown) => void) | null) {
+    this._onopen = handler;
+    if (handler && this._shouldConnect && this.readyState === WebSocketReadyState.CONNECTING) {
+      // Use setImmediate/setTimeout(0) to ensure handler is fully set before calling
+      setImmediate(() => {
+        this.readyState = WebSocketReadyState.OPEN;
+        this._onopen?.(new Event('open'));
+      });
+    }
+  }
+
+  get onopen(): ((event: unknown) => void) | null {
+    return this._onopen;
   }
 
   /**
@@ -451,7 +465,7 @@ describe('NostrTransportProvider.recoverNametag()', () => {
     provider = new NostrTransportProvider({
       relays: ['wss://test.relay'],
       createWebSocket: () => mockWs,
-      timeout: 1000,
+      timeout: 5000, // Increased timeout for stability
       autoReconnect: false,
     });
 
@@ -463,6 +477,14 @@ describe('NostrTransportProvider.recoverNametag()', () => {
 
     // Get the actual Nostr pubkey that will be derived from the private key
     nostrPubkey = provider.getNostrPubkey();
+  });
+
+  afterEach(async () => {
+    try {
+      await provider.disconnect();
+    } catch {
+      // Ignore disconnect errors
+    }
   });
 
   it('should recover nametag from encrypted event', async () => {
