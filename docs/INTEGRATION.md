@@ -112,7 +112,7 @@ await sphere.wallet.import(
 ```typescript
 try {
   await sphere.wallet.load('password123');
-  console.log('Wallet loaded:', sphere.identity.address);
+  console.log('Wallet loaded:', sphere.identity.l1Address);
 } catch (error) {
   console.error('Wrong password or wallet not found');
 }
@@ -123,10 +123,10 @@ try {
 ```typescript
 const identity = sphere.identity;
 
-console.log('Address:', identity.address);
-console.log('Public Key:', identity.publicKey);
-console.log('Nametag:', identity.nametag);  // e.g., '@alice'
-console.log('Nostr Pubkey:', identity.nostrPublicKey);
+console.log('L1 Address:', identity.l1Address);       // alpha1...
+console.log('Chain Pubkey:', identity.chainPubkey);   // 33-byte compressed secp256k1
+console.log('Direct Address:', identity.directAddress); // DIRECT://... (L3)
+console.log('Nametag:', identity.nametag);            // e.g., 'alice'
 ```
 
 ### Clear Wallet
@@ -553,7 +553,11 @@ sphere.on('sync:error', ({ source, error }) => { });
 
 // Connection events
 sphere.on('connection:changed', ({ provider, connected }) => { });
-sphere.on('nametag:registered', ({ nametag }) => { });
+sphere.on('nametag:registered', ({ nametag, addressIndex }) => { });
+sphere.on('nametag:recovered', ({ nametag }) => { });
+
+// Identity events
+sphere.on('identity:changed', ({ l1Address, directAddress, chainPubkey, nametag, addressIndex }) => { });
 ```
 
 ### Unsubscribe
@@ -658,6 +662,34 @@ When loading an existing wallet, the SDK automatically syncs the nametag with No
 // 2. If not registered or owned by this pubkey, re-publishes it
 // 3. Logs warning if owned by different pubkey
 ```
+
+### Nametag Recovery on Import
+
+When importing a wallet without specifying a nametag, the SDK automatically attempts to recover it from Nostr:
+
+```typescript
+// Import wallet - nametag will be recovered if found on Nostr
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'your twelve words...',
+  // No nametag specified
+});
+
+// Listen for recovery
+sphere.on('nametag:recovered', ({ nametag }) => {
+  console.log('Recovered nametag:', nametag);
+});
+
+// Or check after init
+if (sphere.identity?.nametag) {
+  console.log('Nametag recovered:', sphere.identity.nametag);
+}
+```
+
+The recovery process:
+1. Derives transport pubkey from wallet keys
+2. Queries Nostr for nametag events owned by this pubkey
+3. If found, sets the nametag locally and emits `nametag:recovered` event
 
 ---
 
