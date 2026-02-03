@@ -22,6 +22,15 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 npm install @unicitylabs/sphere-sdk
 ```
 
+## Quick Start Guides
+
+Choose your platform:
+
+| Platform | Guide | Required | Optional |
+|----------|-------|----------|----------|
+| **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | `helia` (IPFS sync) |
+| **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | - |
+
 ## Quick Start
 
 ```typescript

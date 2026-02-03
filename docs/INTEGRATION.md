@@ -1,5 +1,11 @@
 # Sphere SDK Integration Guide
 
+> **Quick Start**: For a fast setup, see the platform-specific guides:
+> - [Browser Quick Start](./QUICKSTART-BROWSER.md) - Web applications
+> - [Node.js Quick Start](./QUICKSTART-NODEJS.md) - Server-side / CLI
+>
+> This document covers advanced integration patterns and custom provider implementations.
+
 ## Table of Contents
 
 1. [Setup](#setup)
@@ -16,6 +22,28 @@
 ---
 
 ## Setup
+
+### Recommended: Factory Functions
+
+The easiest way to set up providers is using the factory functions:
+
+```typescript
+// Browser
+import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+const providers = createBrowserProviders({ network: 'testnet' });
+
+// Node.js
+import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet',
+  tokensDir: './tokens',
+});
+```
+
+### Manual Setup (Advanced)
+
+For fine-grained control, create providers manually:
 
 ### Browser Environment
 

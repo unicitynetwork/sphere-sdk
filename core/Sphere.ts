@@ -87,6 +87,7 @@ import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/Signi
 import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
 import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
+import { hashNametag } from '@unicitylabs/nostr-js-sdk';
 import type {
   LegacyFileType,
   DecryptionProgressCallback,
@@ -1688,18 +1689,7 @@ export class Sphere {
   getProxyAddress(): string | undefined {
     const nametag = this._identity?.nametag;
     if (!nametag) return undefined;
-
-    // Hash nametag using same algorithm as nostr-js-sdk hashNametag:
-    // 1. Normalize: lowercase, remove @unicity suffix
-    // 2. Add salt prefix: 'unicity:nametag:'
-    // 3. SHA256 hash
-    const NAMETAG_SALT = 'unicity:nametag:';
-    let normalized = nametag.trim().toLowerCase();
-    if (normalized.endsWith('@unicity')) {
-      normalized = normalized.slice(0, -8);
-    }
-    const hashedNametag = sha256(NAMETAG_SALT + normalized, 'utf8');
-    return `PROXY:${hashedNametag}`;
+    return `PROXY:${hashNametag(nametag)}`;
   }
 
   /**

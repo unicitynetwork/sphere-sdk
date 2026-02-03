@@ -87,7 +87,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       const data: TxfStorageDataBase = {
         _meta: {
           version: 1,
-          address: this.identity?.address ?? '',
+          address: this.identity?.l1Address ?? '',
           formatVersion: '2.0',
           updatedAt: Date.now(),
         },
