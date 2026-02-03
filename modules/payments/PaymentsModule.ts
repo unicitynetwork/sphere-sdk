@@ -597,11 +597,14 @@ export class PaymentsModule {
       }
     }
 
-    // Legacy: Load from file storage (lottery compatibility)
+    // Legacy: Load tokens from file storage (lottery compatibility)
     if (this.tokens.size === 0) {
       await this.loadTokensFromFileStorage();
-      await this.loadNametagFromFileStorage();
     }
+
+    // Load nametag from file storage (nametag-{name}.json)
+    // This is the primary source for nametag data now
+    await this.loadNametagFromFileStorage();
 
     // Load transaction history
     const historyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
@@ -2608,6 +2611,8 @@ export class PaymentsModule {
   private async createStorageData(): Promise<TxfStorageDataBase> {
     const tokens = Array.from(this.tokens.values());
 
+    // Note: nametag is NOT passed here - it's saved separately via saveNametagToFileStorage()
+    // as nametag-{name}.json to avoid duplication in storage
     return await buildTxfStorageData(
       tokens,
       {
@@ -2616,7 +2621,6 @@ export class PaymentsModule {
         ipnsName: this.deps!.identity.ipnsName ?? '',
       },
       {
-        nametag: this.nametag || undefined,
         tombstones: this.tombstones,
         archivedTokens: this.archivedTokens,
         forkedTokens: this.forkedTokens,
