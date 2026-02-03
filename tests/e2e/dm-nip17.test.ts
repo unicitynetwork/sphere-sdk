@@ -11,12 +11,15 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { Sphere } from '../../core/Sphere';
 import { createNodeProviders } from '../../impl/nodejs';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DirectMessage } from '../../types';
 
 const rand = () => Math.random().toString(36).slice(2, 8);
+
+const TRUSTBASE_URL = 'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
+const DEFAULT_API_KEY = 'sk_06365a9c44654841a366068bcfc68986';
 
 function makeTempDirs(label: string) {
   const base = join(tmpdir(), `sphere-e2e-${label}-${Date.now()}-${rand()}`);
@@ -25,6 +28,18 @@ function makeTempDirs(label: string) {
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(tokensDir, { recursive: true });
   return { base, dataDir, tokensDir };
+}
+
+async function ensureTrustbase(dataDir: string): Promise<void> {
+  const trustbasePath = join(dataDir, 'trustbase.json');
+  if (existsSync(trustbasePath)) return;
+
+  const res = await fetch(TRUSTBASE_URL);
+  if (!res.ok) {
+    throw new Error(`Failed to download trustbase: ${res.status}`);
+  }
+  const data = await res.text();
+  writeFileSync(trustbasePath, data);
 }
 
 function waitForDM(sphere: Sphere, timeoutMs = 15000): Promise<DirectMessage> {
@@ -39,7 +54,17 @@ function waitForDM(sphere: Sphere, timeoutMs = 15000): Promise<DirectMessage> {
 
 async function createSphere(label: string, nametag?: string) {
   const dirs = makeTempDirs(label);
-  const providers = createNodeProviders({ network: 'testnet', dataDir: dirs.dataDir, tokensDir: dirs.tokensDir });
+  await ensureTrustbase(dirs.dataDir);
+
+  const providers = createNodeProviders({
+    network: 'testnet',
+    dataDir: dirs.dataDir,
+    tokensDir: dirs.tokensDir,
+    oracle: {
+      trustBasePath: join(dirs.dataDir, 'trustbase.json'),
+      apiKey: DEFAULT_API_KEY,
+    },
+  });
   const result = await Sphere.init({ ...providers, autoGenerate: true, ...(nametag ? { nametag } : {}) });
   return { sphere: result.sphere, dirs };
 }
@@ -107,4 +132,45 @@ describe('NIP-17 DM end-to-end', () => {
     expect(msg.senderNametag).toBe(aliceTag);
     expect(msg.isRead).toBe(false);
   }, 45000);
+
+  it('completes bidirectional DM round-trip', async () => {
+    const aliceTag = `e2e-alice-${rand()}`;
+    const bobTag = `e2e-bob-${rand()}`;
+
+    const { sphere: alice, dirs: aliceDirs } = await createSphere('alice', aliceTag);
+    const { sphere: bob, dirs: bobDirs } = await createSphere('bob', bobTag);
+    spheres.push(alice, bob);
+    cleanupDirs.push(aliceDirs.base, bobDirs.base);
+
+    expect(alice.identity!.nametag).toBe(aliceTag);
+    expect(bob.identity!.nametag).toBe(bobTag);
+
+    // Wait for relay subscriptions to establish
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // First: Alice -> Bob
+    const bobDmPromise = waitForDM(bob);
+    await new Promise((r) => setTimeout(r, 3000));
+
+    const msg1 = `Round-trip A->B ${Date.now()}`;
+    await alice.communications.sendDM(`@${bobTag}`, msg1);
+
+    const received1 = await bobDmPromise;
+    expect(received1.content).toBe(msg1);
+    expect(received1.senderNametag).toBe(aliceTag);
+
+    // Wait for state to settle before second exchange
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // Second: Bob -> Alice
+    const aliceDmPromise = waitForDM(alice);
+    await new Promise((r) => setTimeout(r, 3000));
+
+    const msg2 = `Round-trip B->A ${Date.now()}`;
+    await bob.communications.sendDM(`@${aliceTag}`, msg2);
+
+    const received2 = await aliceDmPromise;
+    expect(received2.content).toBe(msg2);
+    expect(received2.senderNametag).toBe(bobTag);
+  }, 90000);
 });
