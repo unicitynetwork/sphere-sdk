@@ -2754,8 +2754,89 @@ export class PaymentsModule {
           return;
         }
 
-        const sourceToken = await SdkToken.fromJSON(sourceTokenInput);
-        const transferTx = await TransferTransaction.fromJSON(transferTxInput);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let sourceToken: SdkToken<any>;
+        let transferTx: TransferTransaction;
+
+        try {
+          sourceToken = await SdkToken.fromJSON(sourceTokenInput);
+        } catch (err) {
+          console.error('[Payments] Failed to parse sourceToken:', err);
+          return;
+        }
+
+        // Try multiple parsing strategies for transferTx
+        // Format 1: TransferTransaction - has { data, inclusionProof }
+        // Format 2: TransferCommitment - has { authenticator, requestId, transactionData }
+        try {
+          // Detect format based on structure
+          const hasInclusionProof = transferTxInput.inclusionProof !== undefined;
+          const hasData = transferTxInput.data !== undefined;
+          const hasTransactionData = transferTxInput.transactionData !== undefined;
+          const hasAuthenticator = transferTxInput.authenticator !== undefined;
+
+          if (hasData && hasInclusionProof) {
+            // Full transaction format - parse directly
+            this.log('Parsing as TransferTransaction (with proof)...');
+            transferTx = await TransferTransaction.fromJSON(transferTxInput);
+          } else if (hasTransactionData && hasAuthenticator) {
+            // Commitment format (signed but not yet submitted) - submit and wait for proof
+            this.log('Parsing as TransferCommitment (signed, no proof yet), will submit and wait...');
+            const commitment = await TransferCommitment.fromJSON(transferTxInput);
+
+            // Submit commitment and wait for proof
+            const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+            if (!stClient) {
+              console.error('[Payments] Cannot submit commitment - no state transition client');
+              return;
+            }
+
+            // Submit the commitment
+            const response = await stClient.submitTransferCommitment(commitment);
+            if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
+              console.error('[Payments] Transfer commitment submission failed:', response.status);
+              return;
+            }
+            this.log(`Transfer commitment submitted: ${response.status}`);
+
+            // Wait for inclusion proof
+            if (!this.deps!.oracle.waitForProofSdk) {
+              console.error('[Payments] Cannot wait for proof - no waitForProofSdk');
+              return;
+            }
+            const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
+
+            // Convert to transaction
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            transferTx = commitment.toTransaction(inclusionProof as any);
+            this.log('Transfer commitment converted to transaction with proof');
+          } else {
+            // Unknown format - log details and try parsing approaches
+            console.warn('[Payments] Unknown transferTx format, attempting parsing...');
+            console.warn('[Payments] transferTx keys:', Object.keys(transferTxInput));
+
+            // Try TransferTransaction first, then TransferCommitment
+            try {
+              transferTx = await TransferTransaction.fromJSON(transferTxInput);
+            } catch {
+              // Try commitment format as fallback
+              const commitment = await TransferCommitment.fromJSON(transferTxInput);
+              const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+              if (!stClient || !this.deps!.oracle.waitForProofSdk) {
+                throw new Error('Cannot submit commitment - missing oracle methods');
+              }
+              await stClient.submitTransferCommitment(commitment);
+              const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              transferTx = commitment.toTransaction(inclusionProof as any);
+            }
+          }
+        } catch (err) {
+          console.error('[Payments] Failed to parse transferTx:', err);
+          console.error('[Payments] transferTxInput keys:', Object.keys(transferTxInput));
+          console.error('[Payments] transferTxInput structure (truncated):', JSON.stringify(transferTxInput, null, 2).slice(0, 1000));
+          return;
+        }
 
         // Check if this is a PROXY address transfer (needs finalization)
         const recipientAddress = transferTx.data.recipient;
