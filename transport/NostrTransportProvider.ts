@@ -6,17 +6,25 @@
  * - Real secp256k1 event signing
  * - NIP-04 encryption/decryption
  * - Event ID calculation
+ * - NostrClient for reliable connection management (ping, reconnect, NIP-42)
  *
  * WebSocket is injected via factory for cross-platform support
  */
 
 import { Buffer } from 'buffer';
+import { hkdf } from '@noble/hashes/hkdf.js';
+import { sha256 as sha256Noble } from '@noble/hashes/sha2.js';
 import {
   NostrKeyManager,
   NIP04,
+  NIP17,
   Event as NostrEventClass,
+  EventKinds,
   hashNametag,
+  NostrClient,
+  Filter,
 } from '@unicitylabs/nostr-js-sdk';
+import { getPublicKey, publicKeyToAddress } from '../core/crypto';
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
   TransportProvider,
@@ -35,9 +43,10 @@ import type {
   PaymentRequestResponsePayload,
   TransportEvent,
   TransportEventCallback,
+  NametagInfo,
 } from './transport-provider';
-import type { IWebSocket, IMessageEvent, WebSocketFactory, UUIDGenerator } from './websocket';
-import { WebSocketReadyState, defaultUUIDGenerator } from './websocket';
+import type { WebSocketFactory, UUIDGenerator } from './websocket';
+import { defaultUUIDGenerator } from './websocket';
 import {
   DEFAULT_NOSTR_RELAYS,
   NOSTR_EVENT_KINDS,
@@ -71,6 +80,93 @@ export interface NostrTransportProviderConfig {
 const EVENT_KINDS = NOSTR_EVENT_KINDS;
 
 // =============================================================================
+// Nametag Encryption Utilities
+// =============================================================================
+
+/**
+ * Derive encryption key from private key using HKDF
+ * @param privateKeyHex - 32-byte private key as hex
+ * @returns 32-byte derived key as Uint8Array
+ */
+function deriveNametagEncryptionKey(privateKeyHex: string): Uint8Array {
+  const privateKeyBytes = Buffer.from(privateKeyHex, 'hex');
+  // Use HKDF with SHA-256, salt derived from constant, info = "nametag-encryption"
+  const saltInput = new TextEncoder().encode('sphere-nametag-salt');
+  const salt = sha256Noble(saltInput);
+  const info = new TextEncoder().encode('nametag-encryption');
+  return hkdf(sha256Noble, privateKeyBytes, salt, info, 32);
+}
+
+/**
+ * Encrypt nametag with AES-GCM using derived key
+ * @param nametag - Plain text nametag
+ * @param privateKeyHex - Private key for key derivation
+ * @returns Base64 encoded encrypted data (iv + ciphertext + tag)
+ */
+async function encryptNametag(nametag: string, privateKeyHex: string): Promise<string> {
+  const key = deriveNametagEncryptionKey(privateKeyHex);
+  const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV for AES-GCM
+  const encoder = new TextEncoder();
+  const data = encoder.encode(nametag);
+
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    new Uint8Array(key).buffer as ArrayBuffer,
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt']
+  );
+
+  const encrypted = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(iv).buffer as ArrayBuffer },
+    cryptoKey,
+    new Uint8Array(data).buffer as ArrayBuffer
+  );
+
+  // Combine IV + ciphertext (includes auth tag)
+  const combined = new Uint8Array(iv.length + encrypted.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(encrypted), iv.length);
+
+  return Buffer.from(combined).toString('base64');
+}
+
+/**
+ * Decrypt nametag with AES-GCM using derived key
+ * @param encryptedBase64 - Base64 encoded encrypted data (iv + ciphertext + tag)
+ * @param privateKeyHex - Private key for key derivation
+ * @returns Decrypted nametag or null if decryption fails
+ */
+async function decryptNametag(encryptedBase64: string, privateKeyHex: string): Promise<string | null> {
+  try {
+    const key = deriveNametagEncryptionKey(privateKeyHex);
+    const combined = Buffer.from(encryptedBase64, 'base64');
+
+    const iv = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      new Uint8Array(key).buffer as ArrayBuffer,
+      { name: 'AES-GCM' },
+      false,
+      ['decrypt']
+    );
+
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: new Uint8Array(iv).buffer as ArrayBuffer },
+      cryptoKey,
+      new Uint8Array(ciphertext).buffer as ArrayBuffer
+    );
+
+    const decoder = new TextDecoder();
+    return decoder.decode(decrypted);
+  } catch {
+    return null;
+  }
+}
+
+// =============================================================================
 // Implementation
 // =============================================================================
 
@@ -88,9 +184,10 @@ export class NostrTransportProvider implements TransportProvider {
   private keyManager: NostrKeyManager | null = null;
   private status: ProviderStatus = 'disconnected';
 
-  // WebSocket connections to relays
-  private connections: Map<string, IWebSocket> = new Map();
-  private reconnectAttempts: Map<string, number> = new Map();
+  // NostrClient from nostr-js-sdk handles all WebSocket management,
+  // keepalive pings, reconnection, and NIP-42 authentication
+  private nostrClient: NostrClient | null = null;
+  private mainSubscriptionId: string | null = null;
 
   // Event handlers
   private messageHandlers: Set<MessageHandler> = new Set();
@@ -99,9 +196,6 @@ export class NostrTransportProvider implements TransportProvider {
   private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
   private broadcastHandlers: Map<string, Set<BroadcastHandler>> = new Map();
   private eventCallbacks: Set<TransportEventCallback> = new Set();
-
-  // Subscriptions
-  private subscriptions: Map<string, string[]> = new Map(); // subId -> relays
 
   constructor(config: NostrTransportProviderConfig) {
     this.config = {
@@ -126,21 +220,55 @@ export class NostrTransportProvider implements TransportProvider {
     this.status = 'connecting';
 
     try {
-      // Connect to all relays in parallel
-      const connectPromises = this.config.relays.map((relay) =>
-        this.connectToRelay(relay)
-      );
+      // Ensure keyManager exists for NostrClient
+      if (!this.keyManager) {
+        // Create a temporary key manager - will be replaced when setIdentity is called
+        const tempKey = Buffer.alloc(32);
+        crypto.getRandomValues(tempKey);
+        this.keyManager = NostrKeyManager.fromPrivateKey(tempKey);
+      }
 
-      await Promise.allSettled(connectPromises);
+      // Create NostrClient with robust connection handling:
+      // - autoReconnect: automatic reconnection with exponential backoff
+      // - pingIntervalMs: keepalive pings to detect stale connections
+      // - NIP-42 AUTH handling built-in
+      this.nostrClient = new NostrClient(this.keyManager, {
+        autoReconnect: this.config.autoReconnect,
+        reconnectIntervalMs: this.config.reconnectDelay,
+        maxReconnectIntervalMs: this.config.reconnectDelay * 16, // exponential backoff cap
+        pingIntervalMs: 15000, // 15 second keepalive pings (more aggressive to prevent drops)
+      });
+
+      // Add connection event listener for logging
+      this.nostrClient.addConnectionListener({
+        onConnect: (url) => {
+          this.log('NostrClient connected to relay:', url);
+          this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+        },
+        onDisconnect: (url, reason) => {
+          this.log('NostrClient disconnected from relay:', url, 'reason:', reason);
+        },
+        onReconnecting: (url, attempt) => {
+          this.log('NostrClient reconnecting to relay:', url, 'attempt:', attempt);
+          this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
+        },
+        onReconnected: (url) => {
+          this.log('NostrClient reconnected to relay:', url);
+          this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+        },
+      });
+
+      // Connect to all relays
+      await this.nostrClient.connect(...this.config.relays);
 
       // Need at least one successful connection
-      if (this.connections.size === 0) {
+      if (!this.nostrClient.isConnected()) {
         throw new Error('Failed to connect to any relay');
       }
 
       this.status = 'connected';
       this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
-      this.log('Connected to', this.connections.size, 'relays');
+      this.log('Connected to', this.nostrClient.getConnectedRelays().size, 'relays');
 
       // Set up subscriptions
       if (this.identity) {
@@ -153,19 +281,20 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
-    for (const [url, ws] of this.connections) {
-      ws.close();
-      this.connections.delete(url);
+    if (this.nostrClient) {
+      this.nostrClient.disconnect();
+      this.nostrClient = null;
     }
-
-    this.subscriptions.clear();
+    this.mainSubscriptionId = null;
+    this.walletSubscriptionId = null;
+    this.chatSubscriptionId = null;
     this.status = 'disconnected';
     this.emitEvent({ type: 'transport:disconnected', timestamp: Date.now() });
     this.log('Disconnected from all relays');
   }
 
   isConnected(): boolean {
-    return this.status === 'connected' && this.connections.size > 0;
+    return this.status === 'connected' && this.nostrClient?.isConnected() === true;
   }
 
   getStatus(): ProviderStatus {
@@ -187,7 +316,8 @@ export class NostrTransportProvider implements TransportProvider {
    * Get list of currently connected relay URLs
    */
   getConnectedRelays(): string[] {
-    return Array.from(this.connections.keys());
+    if (!this.nostrClient) return [];
+    return Array.from(this.nostrClient.getConnectedRelays());
   }
 
   /**
@@ -205,9 +335,9 @@ export class NostrTransportProvider implements TransportProvider {
     this.config.relays.push(relayUrl);
 
     // Connect if provider is connected
-    if (this.status === 'connected') {
+    if (this.status === 'connected' && this.nostrClient) {
       try {
-        await this.connectToRelay(relayUrl);
+        await this.nostrClient.connect(relayUrl);
         this.log('Added and connected to relay:', relayUrl);
         this.emitEvent({
           type: 'transport:relay_added',
@@ -237,6 +367,8 @@ export class NostrTransportProvider implements TransportProvider {
   /**
    * Remove a relay dynamically
    * Will disconnect from the relay if connected
+   * NOTE: NostrClient doesn't support removing individual relays at runtime.
+   * We remove from config so it won't be used on next connect().
    */
   async removeRelay(relayUrl: string): Promise<boolean> {
     const index = this.config.relays.indexOf(relayUrl);
@@ -247,15 +379,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     // Remove from config
     this.config.relays.splice(index, 1);
-
-    // Disconnect if connected
-    const ws = this.connections.get(relayUrl);
-    if (ws) {
-      ws.close();
-      this.connections.delete(relayUrl);
-      this.reconnectAttempts.delete(relayUrl);
-      this.log('Removed and disconnected from relay:', relayUrl);
-    }
+    this.log('Removed relay from config:', relayUrl);
 
     this.emitEvent({
       type: 'transport:relay_removed',
@@ -264,7 +388,7 @@ export class NostrTransportProvider implements TransportProvider {
     });
 
     // Check if we still have connections
-    if (this.connections.size === 0 && this.status === 'connected') {
+    if (this.nostrClient && !this.nostrClient.isConnected() && this.status === 'connected') {
       this.status = 'error';
       this.emitEvent({
         type: 'transport:error',
@@ -287,8 +411,8 @@ export class NostrTransportProvider implements TransportProvider {
    * Check if a relay is currently connected
    */
   isRelayConnected(relayUrl: string): boolean {
-    const ws = this.connections.get(relayUrl);
-    return ws !== undefined && ws.readyState === WebSocketReadyState.OPEN;
+    if (!this.nostrClient) return false;
+    return this.nostrClient.getConnectedRelays().has(relayUrl);
   }
 
   // ===========================================================================
@@ -306,8 +430,45 @@ export class NostrTransportProvider implements TransportProvider {
     const nostrPubkey = this.keyManager.getPublicKeyHex();
     this.log('Identity set, Nostr pubkey:', nostrPubkey.slice(0, 16) + '...');
 
-    // Re-subscribe if already connected
-    if (this.isConnected()) {
+    // If we already have a NostrClient with a temp key, we need to reconnect with the real key
+    // NostrClient doesn't support changing key at runtime
+    if (this.nostrClient && this.status === 'connected') {
+      this.log('Identity changed while connected - recreating NostrClient');
+      const oldClient = this.nostrClient;
+
+      // Create new client with real identity
+      this.nostrClient = new NostrClient(this.keyManager, {
+        autoReconnect: this.config.autoReconnect,
+        reconnectIntervalMs: this.config.reconnectDelay,
+        maxReconnectIntervalMs: this.config.reconnectDelay * 16,
+        pingIntervalMs: 15000, // 15 second keepalive pings
+      });
+
+      // Add connection event listener
+      this.nostrClient.addConnectionListener({
+        onConnect: (url) => {
+          this.log('NostrClient connected to relay:', url);
+        },
+        onDisconnect: (url, reason) => {
+          this.log('NostrClient disconnected from relay:', url, 'reason:', reason);
+        },
+        onReconnecting: (url, attempt) => {
+          this.log('NostrClient reconnecting to relay:', url, 'attempt:', attempt);
+        },
+        onReconnected: (url) => {
+          this.log('NostrClient reconnected to relay:', url);
+        },
+      });
+
+      // Connect with new identity and set up subscriptions
+      this.nostrClient.connect(...this.config.relays).then(() => {
+        this.subscribeToEvents();
+        oldClient.disconnect();
+      }).catch((err) => {
+        this.log('Failed to reconnect with new identity:', err);
+      });
+    } else if (this.isConnected()) {
+      // Already connected with right key, just subscribe
       this.subscribeToEvents();
     }
   }
@@ -326,14 +487,21 @@ export class NostrTransportProvider implements TransportProvider {
   async sendMessage(recipientPubkey: string, content: string): Promise<string> {
     this.ensureReady();
 
-    // Create NIP-04 encrypted DM event
-    const event = await this.createEncryptedEvent(
-      EVENT_KINDS.DIRECT_MESSAGE,
-      content,
-      [['p', recipientPubkey]]
-    );
+    // NIP-17 requires 32-byte x-only pubkey; strip 02/03 prefix if present
+    const nostrRecipient = recipientPubkey.length === 66 && (recipientPubkey.startsWith('02') || recipientPubkey.startsWith('03'))
+      ? recipientPubkey.slice(2)
+      : recipientPubkey;
 
-    await this.publishEvent(event);
+    // Wrap content with sender nametag for Sphere app compatibility
+    const senderNametag = this.identity?.nametag;
+    const wrappedContent = senderNametag
+      ? JSON.stringify({ senderNametag, text: content })
+      : content;
+
+    // Create NIP-17 gift-wrapped message (kind 1059)
+    const giftWrap = NIP17.createGiftWrap(this.keyManager!, nostrRecipient, wrappedContent);
+
+    await this.publishEvent(giftWrap);
 
     this.emitEvent({
       type: 'message:sent',
@@ -341,7 +509,7 @@ export class NostrTransportProvider implements TransportProvider {
       data: { recipient: recipientPubkey },
     });
 
-    return event.id;
+    return giftWrap.id;
   }
 
   onMessage(handler: MessageHandler): () => void {
@@ -517,6 +685,151 @@ export class NostrTransportProvider implements TransportProvider {
     return null;
   }
 
+  async resolveNametagInfo(nametag: string): Promise<NametagInfo | null> {
+    this.ensureReady();
+
+    // Query for nametag binding events using hashed nametag (privacy-preserving)
+    const hashedNametag = hashNametag(nametag);
+
+    // First try '#t' tag (nostr-js-sdk format)
+    let events = await this.queryEvents({
+      kinds: [EVENT_KINDS.NAMETAG_BINDING],
+      '#t': [hashedNametag],
+      limit: 1,
+    });
+
+    // Fallback to '#d' tag (legacy format)
+    if (events.length === 0) {
+      events = await this.queryEvents({
+        kinds: [EVENT_KINDS.NAMETAG_BINDING],
+        '#d': [hashedNametag],
+        limit: 1,
+      });
+    }
+
+    if (events.length === 0) return null;
+
+    const bindingEvent = events[0];
+
+    try {
+      const content = JSON.parse(bindingEvent.content);
+
+      // Check if event has extended fields
+      if (content.public_key && content.l1_address) {
+        // Full info available
+        // Compute L3 address from nametag token ID (PROXY:nametagTokenIdHex)
+        const l3Address = `PROXY:${hashedNametag}`;
+
+        return {
+          nametag,
+          transportPubkey: bindingEvent.pubkey,
+          chainPubkey: content.public_key,
+          l1Address: content.l1_address,
+          directAddress: content.direct_address || '',
+          proxyAddress: l3Address,
+          timestamp: bindingEvent.created_at * 1000,
+        };
+      }
+
+      // Legacy event - only has Nostr pubkey
+      // Cannot derive l1_address or l3_address without 33-byte pubkey
+      this.log('Legacy nametag event without extended fields:', nametag);
+
+      // Try to get info from tags as fallback
+      const pubkeyTag = bindingEvent.tags.find((t: string[]) => t[0] === 'pubkey');
+      const l1Tag = bindingEvent.tags.find((t: string[]) => t[0] === 'l1');
+
+      if (pubkeyTag?.[1] && l1Tag?.[1]) {
+        const l3Address = `PROXY:${hashedNametag}`;
+        return {
+          nametag,
+          transportPubkey: bindingEvent.pubkey,
+          chainPubkey: pubkeyTag[1],
+          l1Address: l1Tag[1],
+          directAddress: '',
+          proxyAddress: l3Address,
+          timestamp: bindingEvent.created_at * 1000,
+        };
+      }
+
+      // Return partial info with empty addresses for legacy events
+      return {
+        nametag,
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: '', // Cannot derive from 32-byte Nostr pubkey
+        l1Address: '', // Cannot derive without 33-byte pubkey
+        directAddress: '',
+        proxyAddress: `PROXY:${hashedNametag}`,
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    } catch {
+      // If content is not JSON, try legacy format
+      return {
+        nametag,
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: '',
+        l1Address: '',
+        directAddress: '',
+        proxyAddress: `PROXY:${hashedNametag}`,
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    }
+  }
+
+  /**
+   * Recover nametag for the current identity by searching for encrypted nametag events
+   * Used after wallet import to recover associated nametag
+   * @returns Decrypted nametag or null if none found
+   */
+  async recoverNametag(): Promise<string | null> {
+    this.ensureReady();
+
+    if (!this.identity || !this.keyManager) {
+      throw new Error('Identity not set');
+    }
+
+    const nostrPubkey = this.getNostrPubkey();
+    this.log('Searching for nametag events for pubkey:', nostrPubkey.slice(0, 16) + '...');
+
+    // Query for nametag binding events authored by this pubkey
+    const events = await this.queryEvents({
+      kinds: [EVENT_KINDS.NAMETAG_BINDING],
+      authors: [nostrPubkey],
+      limit: 10, // Get recent events in case of updates
+    });
+
+    if (events.length === 0) {
+      this.log('No nametag events found for this pubkey');
+      return null;
+    }
+
+    // Sort by timestamp descending to get most recent
+    events.sort((a, b) => b.created_at - a.created_at);
+
+    // Try to decrypt nametag from events
+    for (const event of events) {
+      try {
+        const content = JSON.parse(event.content);
+        if (content.encrypted_nametag) {
+          const decrypted = await decryptNametag(
+            content.encrypted_nametag,
+            this.identity.privateKey
+          );
+          if (decrypted) {
+            this.log('Recovered nametag:', decrypted);
+            return decrypted;
+          }
+        }
+      } catch {
+        // Try next event
+        continue;
+      }
+    }
+
+    this.log('Could not decrypt nametag from any event');
+    return null;
+  }
+
   async publishNametag(nametag: string, address: string): Promise<void> {
     this.ensureReady();
 
@@ -531,8 +844,12 @@ export class NostrTransportProvider implements TransportProvider {
     this.log('Published nametag binding:', nametag);
   }
 
-  async registerNametag(nametag: string, _publicKey: string): Promise<boolean> {
+  async registerNametag(nametag: string, _publicKey: string, directAddress: string = ''): Promise<boolean> {
     this.ensureReady();
+
+    if (!this.identity) {
+      throw new Error('Identity not set');
+    }
 
     // Always use 32-byte Nostr-format pubkey from keyManager (not the 33-byte compressed key)
     const nostrPubkey = this.getNostrPubkey();
@@ -551,26 +868,45 @@ export class NostrTransportProvider implements TransportProvider {
     // This is a parameterized replaceable event (kind 30078), so publishing with same 'd' tag
     // will replace any old event. This ensures the event has ['t', hash] tag for nostr-js-sdk.
 
-    // Publish nametag binding matching nostr-js-sdk format
-    // Use Nostr pubkey (32 bytes) for all fields
+    // Derive extended address info for full nametag support:
+    // - encrypted_nametag: AES-GCM encrypted nametag for recovery
+    // - public_key: 33-byte compressed public key for L3 operations
+    // - l1_address: L1 address (alpha1...) for L1 transfers
+    const privateKeyHex = this.identity.privateKey;
+    const compressedPubkey = getPublicKey(privateKeyHex, true); // 33-byte compressed
+    const l1Address = publicKeyToAddress(compressedPubkey, 'alpha'); // alpha1...
+    const encryptedNametag = await encryptNametag(nametag, privateKeyHex);
+
+    // Publish nametag binding with extended info
     const hashedNametag = hashNametag(nametag);
     const content = JSON.stringify({
       nametag_hash: hashedNametag,
       address: nostrPubkey,
       verified: Date.now(),
+      // Extended fields for nametag recovery and address lookup
+      encrypted_nametag: encryptedNametag,
+      public_key: compressedPubkey,
+      l1_address: l1Address,
+      direct_address: directAddress,
     });
 
     const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, [
       ['d', hashedNametag],
       ['nametag', hashedNametag],
       ['t', hashedNametag],
-['address', nostrPubkey],
+      ['address', nostrPubkey],
+      // Extended tags for indexing
+      ['pubkey', compressedPubkey],
+      ['l1', l1Address],
     ]);
 
     await this.publishEvent(event);
-    this.log('Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
+    this.log('Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...', 'l1:', l1Address.slice(0, 12) + '...');
     return true;
   }
+
+  // Track broadcast subscriptions
+  private broadcastSubscriptions: Map<string, string> = new Map(); // key -> subId
 
   subscribeToBroadcast(tags: string[], handler: BroadcastHandler): () => void {
     const key = tags.sort().join(':');
@@ -579,7 +915,7 @@ export class NostrTransportProvider implements TransportProvider {
       this.broadcastHandlers.set(key, new Set());
 
       // Subscribe to relay
-      if (this.isConnected()) {
+      if (this.isConnected() && this.nostrClient) {
         this.subscribeToTags(tags);
       }
     }
@@ -590,6 +926,12 @@ export class NostrTransportProvider implements TransportProvider {
       this.broadcastHandlers.get(key)?.delete(handler);
       if (this.broadcastHandlers.get(key)?.size === 0) {
         this.broadcastHandlers.delete(key);
+        // Unsubscribe from relay
+        const subId = this.broadcastSubscriptions.get(key);
+        if (subId && this.nostrClient) {
+          this.nostrClient.unsubscribe(subId);
+          this.broadcastSubscriptions.delete(key);
+        }
       }
     };
   }
@@ -614,97 +956,19 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   // ===========================================================================
-  // Private: Connection Management
-  // ===========================================================================
-
-  private async connectToRelay(url: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const ws = this.config.createWebSocket(url);
-
-      const timeout = setTimeout(() => {
-        ws.close();
-        reject(new Error(`Connection timeout: ${url}`));
-      }, this.config.timeout);
-
-      ws.onopen = () => {
-        clearTimeout(timeout);
-        this.connections.set(url, ws);
-        this.reconnectAttempts.set(url, 0);
-        this.log('Connected to relay:', url);
-        resolve();
-      };
-
-      ws.onerror = (error) => {
-        clearTimeout(timeout);
-        this.log('Relay error:', url, error);
-        reject(error);
-      };
-
-      ws.onclose = () => {
-        this.connections.delete(url);
-        if (this.config.autoReconnect && this.status === 'connected') {
-          this.scheduleReconnect(url);
-        }
-      };
-
-      ws.onmessage = (event: IMessageEvent) => {
-        this.handleRelayMessage(url, event.data);
-      };
-    });
-  }
-
-  private scheduleReconnect(url: string): void {
-    const attempts = this.reconnectAttempts.get(url) ?? 0;
-    if (attempts >= this.config.maxReconnectAttempts) {
-      this.log('Max reconnect attempts reached for:', url);
-      return;
-    }
-
-    this.reconnectAttempts.set(url, attempts + 1);
-    const delay = this.config.reconnectDelay * Math.pow(2, attempts);
-
-    this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
-
-    setTimeout(() => {
-      this.connectToRelay(url).catch(() => {
-        // Will retry again if still below max attempts
-      });
-    }, delay);
-  }
-
-  // ===========================================================================
   // Private: Message Handling
   // ===========================================================================
 
-  private handleRelayMessage(relay: string, data: string): void {
-    try {
-      const message = JSON.parse(data);
-      const [type, ...args] = message;
-
-      switch (type) {
-        case 'EVENT':
-          this.handleEvent(args[1]);
-          break;
-        case 'EOSE':
-          // End of stored events
-          break;
-        case 'OK':
-          // Event accepted
-          break;
-        case 'NOTICE':
-          this.log('Relay notice:', relay, args[0]);
-          break;
-      }
-    } catch (error) {
-      this.log('Failed to parse relay message:', error);
-    }
-  }
-
   private async handleEvent(event: NostrEvent): Promise<void> {
+    this.log('Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
     try {
       switch (event.kind) {
         case EVENT_KINDS.DIRECT_MESSAGE:
           await this.handleDirectMessage(event);
+          break;
+        case EventKinds.GIFT_WRAP:
+          this.log('Handling gift wrap (NIP-17 DM)');
+          await this.handleGiftWrap(event);
           break;
         case EVENT_KINDS.TOKEN_TRANSFER:
           await this.handleTokenTransfer(event);
@@ -725,30 +989,67 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   private async handleDirectMessage(event: NostrEvent): Promise<void> {
-    if (!this.identity || !this.keyManager) return;
+    // NIP-04 (kind 4) is deprecated for DMs - only used for legacy token transfers
+    // DMs should come through NIP-17 (kind 1059 gift wrap) via handleGiftWrap
+    // This handler is kept for backwards compatibility but does NOT dispatch to messageHandlers
+    this.log('Ignoring NIP-04 kind 4 event (DMs use NIP-17):', event.id?.slice(0, 12));
+  }
 
-    // Skip our own messages (compare with 32-byte Nostr pubkey)
-    if (event.pubkey === this.keyManager.getPublicKeyHex()) return;
+  private async handleGiftWrap(event: NostrEvent): Promise<void> {
+    if (!this.identity || !this.keyManager) {
+      this.log('handleGiftWrap: no identity/keyManager');
+      return;
+    }
 
-    // Decrypt content
-    const content = await this.decryptContent(event.content, event.pubkey);
-
-    const message: IncomingMessage = {
-      id: event.id,
-      senderPubkey: event.pubkey,
-      content,
-      timestamp: event.created_at * 1000,
-      encrypted: true,
-    };
-
-    this.emitEvent({ type: 'message:received', timestamp: Date.now() });
-
-    for (const handler of this.messageHandlers) {
-      try {
-        handler(message);
-      } catch (error) {
-        this.log('Message handler error:', error);
+    try {
+      const pm = NIP17.unwrap(event as any, this.keyManager);
+      this.log('Gift wrap unwrapped, sender:', pm.senderPubkey?.slice(0, 16), 'kind:', pm.kind);
+      if (pm.senderPubkey === this.keyManager.getPublicKeyHex()) {
+        this.log('Skipping own message');
+        return;
       }
+      if (pm.kind !== EventKinds.CHAT_MESSAGE) {
+        this.log('Skipping non-chat message, kind:', pm.kind);
+        return;
+      }
+
+      // Sphere app wraps DM content as JSON: {senderNametag, text}
+      let content = pm.content;
+      let senderNametag: string | undefined;
+      try {
+        const parsed = JSON.parse(content);
+        if (typeof parsed === 'object' && parsed.text !== undefined) {
+          content = parsed.text;
+          senderNametag = parsed.senderNametag || undefined;
+        }
+      } catch {
+        // Plain text — use as-is
+      }
+
+      this.log('DM received from:', senderNametag || pm.senderPubkey?.slice(0, 16), 'content:', content?.slice(0, 50));
+
+      const message: IncomingMessage = {
+        id: pm.eventId,
+        senderTransportPubkey: pm.senderPubkey,
+        senderNametag,
+        content,
+        timestamp: pm.timestamp * 1000,
+        encrypted: true,
+      };
+
+      this.emitEvent({ type: 'message:received', timestamp: Date.now() });
+
+      this.log('Dispatching to', this.messageHandlers.size, 'handlers');
+      for (const handler of this.messageHandlers) {
+        try {
+          handler(message);
+        } catch (error) {
+          this.log('Message handler error:', error);
+        }
+      }
+    } catch (err) {
+      // Expected for gift wraps meant for other recipients
+      this.log('Gift wrap decrypt failed (expected if not for us):', (err as Error)?.message?.slice(0, 50));
     }
   }
 
@@ -761,7 +1062,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     const transfer: IncomingTokenTransfer = {
       id: event.id,
-      senderPubkey: event.pubkey,
+      senderTransportPubkey: event.pubkey,
       payload,
       timestamp: event.created_at * 1000,
     };
@@ -794,7 +1095,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       const request: IncomingPaymentRequest = {
         id: event.id,
-        senderPubkey: event.pubkey,
+        senderTransportPubkey: event.pubkey,
         request: {
           requestId: requestData.requestId,
           amount: requestData.amount,
@@ -835,7 +1136,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       const response: IncomingPaymentRequestResponse = {
         id: event.id,
-        responderPubkey: event.pubkey,
+        responderTransportPubkey: event.pubkey,
         response: {
           requestId: responseData.requestId,
           responseType: responseData.responseType,
@@ -866,7 +1167,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     const broadcast: IncomingBroadcast = {
       id: event.id,
-      authorPubkey: event.pubkey,
+      authorTransportPubkey: event.pubkey,
       content: event.content,
       tags,
       timestamp: event.created_at * 1000,
@@ -945,137 +1246,174 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   private async publishEvent(event: NostrEvent): Promise<void> {
-    const message = JSON.stringify(['EVENT', event]);
+    if (!this.nostrClient) {
+      throw new Error('NostrClient not initialized');
+    }
 
-    const publishPromises = Array.from(this.connections.values()).map((ws) => {
-      return new Promise<void>((resolve, reject) => {
-        if (ws.readyState !== WebSocketReadyState.OPEN) {
-          reject(new Error('WebSocket not open'));
-          return;
-        }
-
-        ws.send(message);
-        resolve();
-      });
-    });
-
-    await Promise.any(publishPromises);
+    // Convert to nostr-js-sdk Event and publish
+    const sdkEvent = NostrEventClass.fromJSON(event);
+    await this.nostrClient.publishEvent(sdkEvent);
   }
 
-  private async queryEvents(filter: NostrFilter): Promise<NostrEvent[]> {
-    if (this.connections.size === 0) {
+  private async queryEvents(filterObj: NostrFilter): Promise<NostrEvent[]> {
+    if (!this.nostrClient || !this.nostrClient.isConnected()) {
       throw new Error('No connected relays');
     }
 
-    // Query all relays in parallel and return first non-empty result
-    const queryPromises = Array.from(this.connections.values()).map(ws =>
-      this.queryEventsFromRelay(ws, filter)
-    );
-
-    // Wait for first relay that returns events, or all to complete
-    const results = await Promise.allSettled(queryPromises);
-
-    // Find first successful result with events
-    for (const result of results) {
-      if (result.status === 'fulfilled' && result.value.length > 0) {
-        return result.value;
-      }
-    }
-
-    // No events found on any relay
-    return [];
-  }
-
-  private async queryEventsFromRelay(ws: IWebSocket, filter: NostrFilter): Promise<NostrEvent[]> {
-    const subId = this.config.generateUUID().slice(0, 8);
     const events: NostrEvent[] = [];
+    const filter = new Filter(filterObj);
 
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
-        this.unsubscribeFromRelay(ws, subId);
+        if (subId) {
+          this.nostrClient?.unsubscribe(subId);
+        }
         resolve(events);
       }, 5000);
 
-      const originalHandler = ws.onmessage;
-      ws.onmessage = (event: IMessageEvent) => {
-        const message = JSON.parse(event.data);
-        const [type, sid, data] = message;
-
-        if (sid !== subId) {
-          originalHandler?.call(ws, event);
-          return;
-        }
-
-        if (type === 'EVENT') {
-          events.push(data);
-        } else if (type === 'EOSE') {
+      const subId = this.nostrClient!.subscribe(filter, {
+        onEvent: (event) => {
+          events.push({
+            id: event.id,
+            kind: event.kind,
+            content: event.content,
+            tags: event.tags,
+            pubkey: event.pubkey,
+            created_at: event.created_at,
+            sig: event.sig,
+          });
+        },
+        onEndOfStoredEvents: () => {
           clearTimeout(timeout);
-          ws.onmessage = originalHandler;
-          this.unsubscribeFromRelay(ws, subId);
+          this.nostrClient?.unsubscribe(subId);
           resolve(events);
-        }
-      };
-
-      ws.send(JSON.stringify(['REQ', subId, filter]));
+        },
+      });
     });
-  }
-
-  private unsubscribeFromRelay(ws: IWebSocket, subId: string): void {
-    if (ws.readyState === WebSocketReadyState.OPEN) {
-      ws.send(JSON.stringify(['CLOSE', subId]));
-    }
   }
 
   // ===========================================================================
   // Private: Subscriptions
   // ===========================================================================
 
+  // Track subscription IDs for cleanup
+  private walletSubscriptionId: string | null = null;
+  private chatSubscriptionId: string | null = null;
+
   private subscribeToEvents(): void {
-    if (!this.identity || !this.keyManager) return;
-
-    const subId = 'main';
-    // Use 32-byte Nostr pubkey (x-coordinate only), not 33-byte compressed key
-    const nostrPubkey = this.keyManager.getPublicKeyHex();
-    const filter: NostrFilter = {
-      kinds: [
-        EVENT_KINDS.DIRECT_MESSAGE,
-        EVENT_KINDS.TOKEN_TRANSFER,
-        EVENT_KINDS.PAYMENT_REQUEST,
-        EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
-      ],
-      '#p': [nostrPubkey],
-      since: Math.floor(Date.now() / 1000) - 86400, // Last 24h
-    };
-
-    const message = JSON.stringify(['REQ', subId, filter]);
-
-    for (const ws of this.connections.values()) {
-      if (ws.readyState === WebSocketReadyState.OPEN) {
-        ws.send(message);
-      }
+    this.log('subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
+    if (!this.identity || !this.keyManager || !this.nostrClient) {
+      this.log('subscribeToEvents: skipped - no identity, keyManager, or nostrClient');
+      return;
     }
 
-    this.subscriptions.set(subId, Array.from(this.connections.keys()));
-    this.log('Subscribed to events');
+    // Unsubscribe from previous subscriptions if any
+    if (this.walletSubscriptionId) {
+      this.nostrClient.unsubscribe(this.walletSubscriptionId);
+      this.walletSubscriptionId = null;
+    }
+    if (this.chatSubscriptionId) {
+      this.nostrClient.unsubscribe(this.chatSubscriptionId);
+      this.chatSubscriptionId = null;
+    }
+    if (this.mainSubscriptionId) {
+      this.nostrClient.unsubscribe(this.mainSubscriptionId);
+      this.mainSubscriptionId = null;
+    }
+
+    // Use 32-byte Nostr pubkey (x-coordinate only), not 33-byte compressed key
+    const nostrPubkey = this.keyManager.getPublicKeyHex();
+    this.log('Subscribing with Nostr pubkey:', nostrPubkey);
+
+    // Subscribe to wallet events (token transfers, payment requests) with since filter
+    // Matches Sphere app's approach
+    const walletFilter = new Filter();
+    walletFilter.kinds = [
+      EVENT_KINDS.DIRECT_MESSAGE,
+      EVENT_KINDS.TOKEN_TRANSFER,
+      EVENT_KINDS.PAYMENT_REQUEST,
+      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
+    ];
+    walletFilter['#p'] = [nostrPubkey];
+    walletFilter.since = Math.floor(Date.now() / 1000) - 86400; // Last 24h
+
+    this.walletSubscriptionId = this.nostrClient.subscribe(walletFilter, {
+      onEvent: (event) => {
+        this.log('Received wallet event kind:', event.kind, 'id:', event.id?.slice(0, 12));
+        this.handleEvent({
+          id: event.id,
+          kind: event.kind,
+          content: event.content,
+          tags: event.tags,
+          pubkey: event.pubkey,
+          created_at: event.created_at,
+          sig: event.sig,
+        });
+      },
+      onEndOfStoredEvents: () => {
+        this.log('Wallet subscription ready (EOSE)');
+      },
+      onError: (_subId, error) => {
+        this.log('Wallet subscription error:', error);
+      },
+    });
+    this.log('Wallet subscription created, subId:', this.walletSubscriptionId);
+
+    // Subscribe to chat events (NIP-17 gift wrap) WITHOUT since filter
+    // This matches Sphere app's approach - chat messages rely on deduplication
+    const chatFilter = new Filter();
+    chatFilter.kinds = [EventKinds.GIFT_WRAP];
+    chatFilter['#p'] = [nostrPubkey];
+    // NO since filter for chat - we want real-time messages
+
+    this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
+      onEvent: (event) => {
+        this.log('Received chat event kind:', event.kind, 'id:', event.id?.slice(0, 12));
+        this.handleEvent({
+          id: event.id,
+          kind: event.kind,
+          content: event.content,
+          tags: event.tags,
+          pubkey: event.pubkey,
+          created_at: event.created_at,
+          sig: event.sig,
+        });
+      },
+      onEndOfStoredEvents: () => {
+        this.log('Chat subscription ready (EOSE)');
+      },
+      onError: (_subId, error) => {
+        this.log('Chat subscription error:', error);
+      },
+    });
+    this.log('Chat subscription created, subId:', this.chatSubscriptionId);
   }
 
   private subscribeToTags(tags: string[]): void {
-    const subId = `tags:${tags.join(':')}`;
-    const filter: NostrFilter = {
+    if (!this.nostrClient) return;
+
+    const key = tags.sort().join(':');
+    const filter = new Filter({
       kinds: [EVENT_KINDS.BROADCAST],
       '#t': tags,
       since: Math.floor(Date.now() / 1000) - 3600, // Last hour
-    };
+    });
 
-    const message = JSON.stringify(['REQ', subId, filter]);
+    const subId = this.nostrClient.subscribe(filter, {
+      onEvent: (event) => {
+        this.handleBroadcast({
+          id: event.id,
+          kind: event.kind,
+          content: event.content,
+          tags: event.tags,
+          pubkey: event.pubkey,
+          created_at: event.created_at,
+          sig: event.sig,
+        });
+      },
+    });
 
-    for (const ws of this.connections.values()) {
-      if (ws.readyState === WebSocketReadyState.OPEN) {
-        ws.send(message);
-      }
-    }
-
-    this.subscriptions.set(subId, Array.from(this.connections.keys()));
+    this.broadcastSubscriptions.set(key, subId);
   }
 
   // ===========================================================================

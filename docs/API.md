@@ -436,6 +436,8 @@ interface L1SendResult {
 
 #### `sendDM(recipient: string, content: string): Promise<DirectMessage>`
 
+Send a direct message using NIP-17 gift wrapping (kind 1059). The recipient can be a `@nametag` or a hex public key. Content is wrapped in the Sphere messaging format (`{senderNametag, text}`) for compatibility with the Sphere app.
+
 ```typescript
 interface DirectMessage {
   id: string;
@@ -464,6 +466,8 @@ interface DirectMessage {
 
 #### `onDirectMessage(handler: (msg: DirectMessage) => void): () => void`
 
+Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped messages (kind 1059, used by Sphere app) and NIP-04 encrypted DMs (kind 4, legacy). For NIP-17 messages, the sender's nametag is extracted from the Sphere messaging format if present.
+
 #### `onBroadcast(handler: (msg: BroadcastMessage) => void): () => void`
 
 ---
@@ -472,17 +476,23 @@ interface DirectMessage {
 
 ### FullIdentity
 
-**Single Identity Model**: L1 and L3 share the same secp256k1 key pair. The same `privateKey`/`publicKey` is used for:
-- L1 blockchain transactions (via `address`)
-- L3 token ownership and transfers (via `publicKey`)
-- Nostr P2P messaging (same key, different encoding)
+**Single Identity Model**: L1 and L3 share the same secp256k1 key pair. The same `privateKey`/`chainPubkey` is used for:
+- L1 blockchain transactions (via `l1Address`)
+- L3 token ownership and transfers (via `chainPubkey` and `directAddress`)
+- Nostr P2P messaging (derived transport key)
 
 ```typescript
 interface Identity {
-  publicKey: string;         // secp256k1 compressed public key (hex)
-  address: string;           // L1 bech32 address = alpha1... (hash160 of publicKey)
-  ipnsName?: string;         // IPNS identifier for storage
-  nametag?: string;          // Registered @name alias
+  /** 33-byte compressed secp256k1 public key (for L3 chain) */
+  chainPubkey: string;
+  /** L1 bech32 address = alpha1... (hash160 of chainPubkey) */
+  l1Address: string;
+  /** L3 DIRECT address (DIRECT://...) */
+  directAddress?: string;
+  /** IPNS identifier for storage */
+  ipnsName?: string;
+  /** Registered @name alias */
+  nametag?: string;
 }
 
 interface FullIdentity extends Identity {
@@ -494,13 +504,15 @@ interface FullIdentity extends Identity {
 
 ```typescript
 interface AddressInfo {
-  privateKey: string;  // secp256k1 private key (hex)
-  publicKey: string;   // Compressed public key (hex)
-  address: string;     // L1 address (alpha1...)
-  path: string;        // Full BIP32 path
-  index: number;       // Address index
+  privateKey: string;   // secp256k1 private key (hex)
+  publicKey: string;    // 33-byte compressed public key (hex)
+  address: string;      // L1 address (alpha1...)
+  path: string;         // Full BIP32 path
+  index: number;        // Address index
 }
 ```
+
+Note: `AddressInfo.publicKey` is the same format as `Identity.chainPubkey` (33-byte compressed secp256k1).
 
 ### ProviderStatus
 
@@ -530,7 +542,26 @@ type SphereEventType =
   | 'sync:completed'
   | 'sync:error'
   | 'connection:changed'
-  | 'nametag:registered';
+  | 'nametag:registered'
+  | 'nametag:recovered'   // New: emitted when nametag is recovered from Nostr
+  | 'identity:changed';   // Emitted when switching addresses
+```
+
+### SphereEventMap
+
+```typescript
+interface SphereEventMap {
+  // ... other events ...
+  'nametag:registered': { nametag: string; addressIndex: number };
+  'nametag:recovered': { nametag: string };
+  'identity:changed': {
+    l1Address: string;
+    directAddress?: string;
+    chainPubkey: string;
+    nametag?: string;
+    addressIndex: number;
+  };
+}
 ```
 
 ---
