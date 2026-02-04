@@ -2777,45 +2777,31 @@ export class PaymentsModule {
 
           if (hasData && hasInclusionProof) {
             // Full transaction format - parse directly
-            this.log('Parsing as TransferTransaction (with proof)...');
             transferTx = await TransferTransaction.fromJSON(transferTxInput);
           } else if (hasTransactionData && hasAuthenticator) {
-            // Commitment format (signed but not yet submitted) - submit and wait for proof
-            this.log('Parsing as TransferCommitment (signed, no proof yet), will submit and wait...');
+            // Commitment format - submit and wait for proof
             const commitment = await TransferCommitment.fromJSON(transferTxInput);
-
-            // Submit commitment and wait for proof
             const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
             if (!stClient) {
-              console.error('[Payments] Cannot submit commitment - no state transition client');
+              console.error('[Payments] Cannot process commitment - no state transition client');
               return;
             }
 
-            // Submit the commitment
             const response = await stClient.submitTransferCommitment(commitment);
             if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
               console.error('[Payments] Transfer commitment submission failed:', response.status);
               return;
             }
-            this.log(`Transfer commitment submitted: ${response.status}`);
 
-            // Wait for inclusion proof
             if (!this.deps!.oracle.waitForProofSdk) {
-              console.error('[Payments] Cannot wait for proof - no waitForProofSdk');
+              console.error('[Payments] Cannot wait for proof - missing oracle method');
               return;
             }
             const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
-
-            // Convert to transaction
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             transferTx = commitment.toTransaction(inclusionProof as any);
-            this.log('Transfer commitment converted to transaction with proof');
           } else {
-            // Unknown format - log details and try parsing approaches
-            console.warn('[Payments] Unknown transferTx format, attempting parsing...');
-            console.warn('[Payments] transferTx keys:', Object.keys(transferTxInput));
-
-            // Try TransferTransaction first, then TransferCommitment
+            // Unknown format - try parsing approaches
             try {
               transferTx = await TransferTransaction.fromJSON(transferTxInput);
             } catch {
@@ -2833,8 +2819,6 @@ export class PaymentsModule {
           }
         } catch (err) {
           console.error('[Payments] Failed to parse transferTx:', err);
-          console.error('[Payments] transferTxInput keys:', Object.keys(transferTxInput));
-          console.error('[Payments] transferTxInput structure (truncated):', JSON.stringify(transferTxInput, null, 2).slice(0, 1000));
           return;
         }
 
