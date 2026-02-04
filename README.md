@@ -168,10 +168,10 @@ const { sphere } = await Sphere.init({
 });
 
 // 2. Request tokens from faucet using nametag
-const response = await fetch('https://faucet.testnet.unicity.network/api/claim', {
+const response = await fetch('https://faucet.unicity.network/api/v1/faucet/request', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ nametag: '@myname' }),
+  body: JSON.stringify({ unicityId: 'myname', coin: 'unicity', amount: 100 }),
 });
 ```
 
