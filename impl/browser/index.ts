@@ -3,6 +3,13 @@
  * All platform-dependent code lives here
  */
 
+// Polyfill Buffer for browser environment
+// Many crypto libraries depend on Node.js Buffer API
+import { Buffer } from 'buffer';
+if (typeof globalThis.Buffer === 'undefined') {
+  globalThis.Buffer = Buffer;
+}
+
 export * from './storage';
 export * from './transport';
 export * from './oracle';

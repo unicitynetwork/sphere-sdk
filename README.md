@@ -109,8 +109,8 @@ if (created && generatedMnemonic) {
   console.log('Save this mnemonic:', generatedMnemonic);
 }
 
-// Get identity
-console.log('Address:', sphere.identity?.l1Address);
+// Get identity (L3 DIRECT address is primary)
+console.log('Address:', sphere.identity?.directAddress);
 
 // Check balance
 const balance = await sphere.payments.getBalance();
@@ -155,6 +155,28 @@ const providers = createBrowserProviders({
 });
 ```
 
+## Testnet Faucet
+
+To get test tokens on testnet, you **must first register a nametag**:
+
+```typescript
+// 1. Create wallet and register nametag
+const { sphere } = await Sphere.init({
+  ...createBrowserProviders({ network: 'testnet' }),
+  autoGenerate: true,
+  nametag: 'myname',  // Register @myname
+});
+
+// 2. Request tokens from faucet using nametag
+const response = await fetch('https://faucet.testnet.unicity.network/api/claim', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ nametag: '@myname' }),
+});
+```
+
+> **Note:** The faucet requires a registered nametag. Requests without a valid nametag will fail.
+
 ## Multi-Address Support
 
 The SDK supports HD (Hierarchical Deterministic) wallets with multiple addresses:
@@ -187,20 +209,22 @@ console.log(addr2.address, addr2.publicKey);
 
 ### Identity Properties
 
+**Important:** L3 (DIRECT address) is the primary address for the Unicity network. L1 address is only used for ALPHA blockchain operations.
+
 ```typescript
 interface Identity {
   chainPubkey: string;         // 33-byte compressed secp256k1 public key (for L3 chain)
-  l1Address: string;           // L1 address (alpha1...)
-  directAddress?: string;      // L3 DIRECT address (DIRECT://...)
+  directAddress?: string;      // L3 DIRECT address (DIRECT://...) - PRIMARY ADDRESS
+  l1Address: string;           // L1 address (alpha1...) - for ALPHA blockchain only
   ipnsName?: string;           // IPNS name for token sync
   nametag?: string;            // Registered nametag (@username)
 }
 
-// Access identity
-console.log(sphere.identity?.l1Address);        // alpha1qw3e...
-console.log(sphere.identity?.directAddress);    // DIRECT://0000be36...
+// Access identity - use directAddress as primary
+console.log(sphere.identity?.directAddress);    // DIRECT://0000be36... (PRIMARY)
+console.log(sphere.identity?.nametag);          // alice (human-readable)
+console.log(sphere.identity?.l1Address);        // alpha1qw3e... (L1 only)
 console.log(sphere.identity?.chainPubkey);      // 02abc123... (33-byte compressed)
-console.log(sphere.identity?.nametag);          // alice
 ```
 
 ### Address Change Event
@@ -1056,6 +1080,8 @@ function getRelayStatuses() {
 ## Nametags
 
 Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments.
+
+> **Important:** Nametags are required to use the testnet faucet. Register a nametag before requesting test tokens.
 
 > **Note:** Nametag minting requires an aggregator API key for proof verification. Configure it via the `oracle.apiKey` option when creating providers. Contact Unicity to obtain an API key.
 
