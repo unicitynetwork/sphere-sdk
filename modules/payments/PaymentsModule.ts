@@ -59,6 +59,7 @@ import {
   buildTxfStorageData,
   parseTxfStorageData,
 } from '../../serialization/txf-serializer';
+import { TokenRegistry } from '../../registry';
 
 // SDK imports for token parsing and transfers
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
@@ -97,8 +98,28 @@ interface ParsedTokenInfo {
   coinId: string;
   symbol: string;
   name: string;
+  decimals: number;
+  iconUrl?: string;
   amount: string;
   tokenId?: string;
+}
+
+/**
+ * Enrich token info with data from TokenRegistry
+ */
+function enrichWithRegistry(info: ParsedTokenInfo): ParsedTokenInfo {
+  const registry = TokenRegistry.getInstance();
+  const def = registry.getDefinition(info.coinId);
+  if (def) {
+    return {
+      ...info,
+      symbol: def.symbol || info.symbol,
+      name: def.name.charAt(0).toUpperCase() + def.name.slice(1),
+      decimals: def.decimals ?? 0,
+      iconUrl: registry.getIconUrl(info.coinId) ?? undefined,
+    };
+  }
+  return info;
 }
 
 /**
@@ -109,6 +130,7 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
     coinId: 'ALPHA',
     symbol: 'ALPHA',
     name: 'Alpha Token',
+    decimals: 0,
     amount: '0',
   };
 
@@ -142,13 +164,14 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
           // Extract hex string from CoinId object
           if (coinIdObj instanceof CoinId) {
             const coinIdHex = coinIdObj.toJSON() as string;
-            return {
+            return enrichWithRegistry({
               coinId: coinIdHex,
               symbol: coinIdHex.slice(0, 8),
               name: `Token ${coinIdHex.slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount ?? '0'),
               tokenId: defaultInfo.tokenId,
-            };
+            });
           } else if (coinIdObj && typeof coinIdObj === 'object' && 'bytes' in coinIdObj) {
             // CoinId stored as object with bytes
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -158,13 +181,14 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
               : Array.isArray(bytes)
                 ? Buffer.from(bytes).toString('hex')
                 : String(bytes);
-            return {
+            return enrichWithRegistry({
               coinId: coinIdHex,
               symbol: coinIdHex.slice(0, 8),
               name: `Token ${coinIdHex.slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount ?? '0'),
               tokenId: defaultInfo.tokenId,
-            };
+            });
           }
         }
       }
@@ -183,13 +207,14 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
             if (Array.isArray(firstEntry) && firstEntry.length === 2) {
               const [coinIdHex, amount] = firstEntry;
               const coinIdStr = typeof coinIdHex === 'string' ? coinIdHex : String(coinIdHex);
-              return {
+              return enrichWithRegistry({
                 coinId: coinIdStr,
                 symbol: coinIdStr.slice(0, 8),
                 name: `Token ${coinIdStr.slice(0, 8)}`,
+                decimals: 0,
                 amount: String(amount),
                 tokenId: defaultInfo.tokenId,
-              };
+              });
             }
           }
         }
@@ -209,25 +234,27 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
           const firstEntry = coinData[0];
           if (Array.isArray(firstEntry) && firstEntry.length === 2) {
             const [coinIdHex, amount] = firstEntry;
-            return {
+            return enrichWithRegistry({
               coinId: String(coinIdHex),
               symbol: String(coinIdHex).slice(0, 8),
               name: `Token ${String(coinIdHex).slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount),
               tokenId: genesis.tokenId,
-            };
+            });
           }
         } else if (typeof coinData === 'object') {
           const coinEntries = Object.entries(coinData);
           if (coinEntries.length > 0) {
             const [coinId, amount] = coinEntries[0] as [string, unknown];
-            return {
+            return enrichWithRegistry({
               coinId,
               symbol: coinId.slice(0, 8),
               name: `Token ${coinId.slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount),
               tokenId: genesis.tokenId,
-            };
+            });
           }
         }
       }
@@ -244,25 +271,27 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
         const firstEntry = coinData[0];
         if (Array.isArray(firstEntry) && firstEntry.length === 2) {
           const [coinIdHex, amount] = firstEntry;
-          return {
+          return enrichWithRegistry({
             coinId: String(coinIdHex),
             symbol: String(coinIdHex).slice(0, 8),
             name: `Token ${String(coinIdHex).slice(0, 8)}`,
+            decimals: 0,
             amount: String(amount),
             tokenId: defaultInfo.tokenId,
-          };
+          });
         }
       } else if (typeof coinData === 'object') {
         const coinEntries = Object.entries(coinData);
         if (coinEntries.length > 0) {
           const [coinId, amount] = coinEntries[0] as [string, unknown];
-          return {
+          return enrichWithRegistry({
             coinId,
             symbol: coinId.slice(0, 8),
             name: `Token ${coinId.slice(0, 8)}`,
+            decimals: 0,
             amount: String(amount),
             tokenId: defaultInfo.tokenId,
-          };
+          });
         }
       }
     }
@@ -750,6 +779,8 @@ export class PaymentsModule {
           coinId: request.coinId,
           symbol: this.getCoinSymbol(request.coinId),
           name: this.getCoinName(request.coinId),
+          decimals: this.getCoinDecimals(request.coinId),
+          iconUrl: this.getCoinIconUrl(request.coinId),
           amount: splitPlan.remainderAmount!.toString(),
           status: 'confirmed',
           createdAt: Date.now(),
@@ -854,22 +885,28 @@ export class PaymentsModule {
    * Get coin symbol from coinId
    */
   private getCoinSymbol(coinId: string): string {
-    // Common coin mappings
-    const symbols: Record<string, string> = {
-      'UCT': 'UCT',
-      // Add more as needed
-    };
-    return symbols[coinId] || coinId.slice(0, 6).toUpperCase();
+    return TokenRegistry.getInstance().getSymbol(coinId);
   }
 
   /**
    * Get coin name from coinId
    */
   private getCoinName(coinId: string): string {
-    const names: Record<string, string> = {
-      'UCT': 'Unicity Token',
-    };
-    return names[coinId] || coinId;
+    return TokenRegistry.getInstance().getName(coinId);
+  }
+
+  /**
+   * Get coin decimals from coinId
+   */
+  private getCoinDecimals(coinId: string): number {
+    return TokenRegistry.getInstance().getDecimals(coinId);
+  }
+
+  /**
+   * Get coin icon URL from coinId
+   */
+  private getCoinIconUrl(coinId: string): string | undefined {
+    return TokenRegistry.getInstance().getIconUrl(coinId) ?? undefined;
   }
 
   // ===========================================================================
@@ -1479,6 +1516,8 @@ export class PaymentsModule {
               coinId: tokenInfo.coinId,
               symbol: tokenInfo.symbol,
               name: tokenInfo.name,
+              decimals: tokenInfo.decimals,
+              iconUrl: tokenInfo.iconUrl,
               amount: tokenInfo.amount,
               status: 'confirmed',
               createdAt: (data.receivedAt as number) || Date.now(),
@@ -2506,6 +2545,8 @@ export class PaymentsModule {
         coinId: tokenInfo.coinId,
         symbol: tokenInfo.symbol,
         name: tokenInfo.name,
+        decimals: tokenInfo.decimals,
+        iconUrl: tokenInfo.iconUrl,
         amount: tokenInfo.amount,
         status: 'confirmed',
         createdAt: Date.now(),
