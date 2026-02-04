@@ -17,6 +17,7 @@ import { getPublicKey } from './core/crypto';
 import { generateAddressFromMasterKey } from './l1/address';
 import { Sphere } from './core/Sphere';
 import { createNodeProviders } from './impl/nodejs';
+import { TokenRegistry } from './registry/TokenRegistry';
 import type { NetworkType } from './constants';
 
 const args = process.argv.slice(2);
@@ -308,7 +309,15 @@ async function main() {
           console.log('No tokens found.');
         } else {
           for (const bal of balances) {
-            console.log(`${bal.symbol}: ${toHumanReadable(bal.totalAmount)} (${bal.tokenCount} tokens)`);
+            const decimals = bal.decimals ?? 8;
+            const amountBigInt = BigInt(bal.totalAmount);
+            const divisor = BigInt(10 ** decimals);
+            const wholePart = amountBigInt / divisor;
+            const fracPart = amountBigInt % divisor;
+            const formatted = fracPart > 0
+              ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
+              : wholePart.toString();
+            console.log(`${bal.symbol}: ${formatted} (${bal.tokenCount} tokens)`);
           }
         }
         console.log('─'.repeat(50));
@@ -320,6 +329,7 @@ async function main() {
       case 'tokens': {
         const sphere = await getSphere();
         const tokens = sphere.payments.getTokens();
+        const registry = TokenRegistry.getInstance();
 
         console.log('\nTokens:');
         console.log('─'.repeat(50));
@@ -328,9 +338,19 @@ async function main() {
           console.log('No tokens found.');
         } else {
           for (const token of tokens) {
-            console.log(`ID: ${token.id}`);
-            console.log(`  Coin: ${token.coinId || 'UCT'}`);
-            console.log(`  Amount: ${toHumanReadable(token.amount?.toString() || '0')}`);
+            const def = registry.getDefinition(token.coinId);
+            const symbol = def?.symbol || token.symbol || 'UNK';
+            const decimals = def?.decimals ?? token.decimals ?? 8;
+            const amountBigInt = BigInt(token.amount || '0');
+            const divisor = BigInt(10 ** decimals);
+            const wholePart = amountBigInt / divisor;
+            const fracPart = amountBigInt % divisor;
+            const formatted = fracPart > 0
+              ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
+              : wholePart.toString();
+            console.log(`ID: ${token.id.slice(0, 16)}...`);
+            console.log(`  Coin: ${symbol} (${token.coinId.slice(0, 8)}...)`);
+            console.log(`  Amount: ${formatted} ${symbol}`);
             console.log(`  Status: ${token.status || 'active'}`);
             console.log('');
           }

@@ -1622,6 +1622,7 @@ export class PaymentsModule {
    */
   getBalance(coinId?: string): TokenBalance[] {
     const balances = new Map<string, TokenBalance>();
+    const registry = TokenRegistry.getInstance();
 
     for (const token of this.tokens.values()) {
       if (token.status !== 'confirmed') continue;
@@ -1636,13 +1637,15 @@ export class PaymentsModule {
         ).toString();
         (existing as { tokenCount: number }).tokenCount++;
       } else {
+        // Look up token metadata from registry (more reliable than stored values)
+        const def = registry.getDefinition(token.coinId);
         balances.set(key, {
           coinId: token.coinId,
-          symbol: token.symbol,
-          name: token.name,
+          symbol: def?.symbol || token.symbol,
+          name: def?.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : token.name,
           totalAmount: token.amount,
           tokenCount: 1,
-          decimals: 8,
+          decimals: def?.decimals ?? token.decimals ?? 8,
         });
       }
     }
