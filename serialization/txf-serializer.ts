@@ -221,6 +221,7 @@ export function txfToToken(tokenId: string, txf: TxfToken): Token {
     coinId,
     symbol: isNft ? 'NFT' : 'UCT',
     name: isNft ? 'NFT' : 'Token',
+    decimals: isNft ? 0 : 8,
     amount: totalAmount.toString(),
     status: determineTokenStatus(txf),
     createdAt: now,

@@ -436,6 +436,8 @@ interface L1SendResult {
 
 #### `sendDM(recipient: string, content: string): Promise<DirectMessage>`
 
+Send a direct message using NIP-17 gift wrapping (kind 1059). The recipient can be a `@nametag` or a hex public key. Content is wrapped in the Sphere messaging format (`{senderNametag, text}`) for compatibility with the Sphere app.
+
 ```typescript
 interface DirectMessage {
   id: string;
@@ -463,6 +465,8 @@ interface DirectMessage {
 #### `getBroadcasts(limit?: number): BroadcastMessage[]`
 
 #### `onDirectMessage(handler: (msg: DirectMessage) => void): () => void`
+
+Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped messages (kind 1059, used by Sphere app) and NIP-04 encrypted DMs (kind 4, legacy). For NIP-17 messages, the sender's nametag is extracted from the Sphere messaging format if present.
 
 #### `onBroadcast(handler: (msg: BroadcastMessage) => void): () => void`
 

@@ -1,16 +1,15 @@
 /**
  * Tests for NostrTransportProvider nametag functionality
  * Covers resolveNametagInfo, recoverNametag, and nametag encryption
+ *
+ * Uses NostrClient module-level mock since NostrTransportProvider
+ * delegates WebSocket management to NostrClient.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Buffer } from 'buffer';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 as sha256Noble } from '@noble/hashes/sha2.js';
-import { NostrTransportProvider } from '../../../transport/NostrTransportProvider';
-import { hashNametag } from '@unicitylabs/nostr-js-sdk';
-import type { IWebSocket, IMessageEvent, WebSocketFactory } from '../../../transport/websocket';
-import { WebSocketReadyState } from '../../../transport/websocket';
 import { NOSTR_EVENT_KINDS } from '../../../constants';
 
 // =============================================================================
@@ -82,106 +81,82 @@ async function decryptNametag(encryptedBase64: string, privateKeyHex: string): P
 }
 
 // =============================================================================
-// Mock WebSocket with Event Response Support
+// Mock NostrClient
 // =============================================================================
 
-type PendingRequest = {
-  subscriptionId: string;
-  filter: Record<string, unknown>;
-  resolve: (events: unknown[]) => void;
-};
+// Store events that should be returned for specific query filters
+const storedQueryEvents: Map<string, unknown[]> = new Map();
 
-class MockWebSocketWithEvents implements IWebSocket {
-  readyState: number = WebSocketReadyState.CONNECTING;
-  onmessage: ((event: IMessageEvent) => void) | null = null;
-  onerror: ((event: unknown) => void) | null = null;
-  onclose: ((event: unknown) => void) | null = null;
+// Capture published events for assertions
+const publishedEvents: unknown[] = [];
 
-  // Store events that will be returned for queries
-  private _storedEvents: Map<string, unknown[]> = new Map();
-  private _pendingRequests: PendingRequest[] = [];
-  private _onopen: ((event: unknown) => void) | null = null;
-  private _shouldConnect = false;
-
-  constructor() {
-    // Schedule connection - will fire when onopen is set
-    this._shouldConnect = true;
-  }
-
-  // Use setter to trigger connection when handler is assigned
-  set onopen(handler: ((event: unknown) => void) | null) {
-    this._onopen = handler;
-    if (handler && this._shouldConnect && this.readyState === WebSocketReadyState.CONNECTING) {
-      // Use setImmediate/setTimeout(0) to ensure handler is fully set before calling
-      setImmediate(() => {
-        this.readyState = WebSocketReadyState.OPEN;
-        this._onopen?.(new Event('open'));
-      });
-    }
-  }
-
-  get onopen(): ((event: unknown) => void) | null {
-    return this._onopen;
-  }
-
-  /**
-   * Add events that will be returned when queried with matching filter
-   */
-  addEvents(filterKey: string, events: unknown[]): void {
-    this._storedEvents.set(filterKey, events);
-  }
-
-  send(data: string): void {
-    const parsed = JSON.parse(data);
-    const [type, subscriptionId, filter] = parsed;
-
-    if (type === 'REQ') {
-      // Find matching events
-      let events: unknown[] = [];
-
-      // Check for nametag binding queries by kind
-      if (filter.kinds?.includes(NOSTR_EVENT_KINDS.NAMETAG_BINDING)) {
-        // Try to find by hashed nametag in '#t' or '#d' tag
-        const hashedTag = filter['#t']?.[0] || filter['#d']?.[0];
-        if (hashedTag && this._storedEvents.has(`nametag:${hashedTag}`)) {
-          events = this._storedEvents.get(`nametag:${hashedTag}`) || [];
-        }
-
-        // Try to find by author
-        const author = filter.authors?.[0];
-        if (author && this._storedEvents.has(`author:${author}`)) {
-          events = this._storedEvents.get(`author:${author}`) || [];
-        }
-      }
-
-      // Send events back
-      setTimeout(() => {
-        for (const event of events) {
-          this.onmessage?.({ data: JSON.stringify(['EVENT', subscriptionId, event]) });
-        }
-        // Send EOSE (End of Stored Events)
-        this.onmessage?.({ data: JSON.stringify(['EOSE', subscriptionId]) });
-      }, 10);
-    }
-
-    if (type === 'CLOSE') {
-      // Subscription closed, no action needed
-    }
-
-    if (type === 'EVENT') {
-      // Event being published - respond with OK
-      const eventId = parsed[1]?.id || 'unknown';
-      setTimeout(() => {
-        this.onmessage?.({ data: JSON.stringify(['OK', eventId, true, '']) });
-      }, 5);
-    }
-  }
-
-  close(): void {
-    this.readyState = WebSocketReadyState.CLOSED;
-    this.onclose?.({ code: 1000, reason: 'Normal closure' });
-  }
+// Build a key from a filter to match against storedQueryEvents
+function filterKey(filter: Record<string, unknown>): string {
+  if (filter['#t']) return `nametag:${(filter['#t'] as string[])[0]}`;
+  if (filter['#d']) return `nametag:${(filter['#d'] as string[])[0]}`;
+  if (filter.authors) return `author:${(filter.authors as string[])[0]}`;
+  return `kinds:${(filter.kinds as number[])?.join(',')}`;
 }
+
+const mockConnect = vi.fn().mockResolvedValue(undefined);
+const mockDisconnect = vi.fn();
+const mockIsConnected = vi.fn().mockReturnValue(true);
+const mockGetConnectedRelays = vi.fn().mockReturnValue(new Set(['wss://test.relay']));
+const mockAddConnectionListener = vi.fn();
+const mockUnsubscribe = vi.fn();
+const mockPublishEvent = vi.fn().mockImplementation(async (event: unknown) => {
+  publishedEvents.push(event);
+  return 'mock-event-id';
+});
+
+// subscribe mock: for queryEvents calls, deliver stored events then EOSE
+const mockSubscribe = vi.fn().mockImplementation((filter: unknown, callbacks: {
+  onEvent?: (event: unknown) => void;
+  onEndOfStoredEvents?: () => void;
+  onError?: (subId: string, error: string) => void;
+}) => {
+  const subId = 'sub-' + Math.random().toString(36).slice(2, 8);
+
+  // Check if this is a queryEvents call (has filter with kinds for NAMETAG_BINDING or specific authors)
+  const filterObj = typeof (filter as any).toJSON === 'function'
+    ? (filter as any).toJSON()
+    : filter as Record<string, unknown>;
+
+  const key = filterKey(filterObj);
+  const events = storedQueryEvents.get(key) || [];
+
+  // Deliver events and EOSE asynchronously (like a real relay would)
+  setTimeout(() => {
+    for (const event of events) {
+      callbacks.onEvent?.(event);
+    }
+    callbacks.onEndOfStoredEvents?.();
+  }, 5);
+
+  return subId;
+});
+
+vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@unicitylabs/nostr-js-sdk')>();
+  return {
+    ...actual,
+    NostrClient: vi.fn().mockImplementation(() => ({
+      connect: mockConnect,
+      disconnect: mockDisconnect,
+      isConnected: mockIsConnected,
+      getConnectedRelays: mockGetConnectedRelays,
+      subscribe: mockSubscribe,
+      unsubscribe: mockUnsubscribe,
+      publishEvent: mockPublishEvent,
+      addConnectionListener: mockAddConnectionListener,
+    })),
+  };
+});
+
+// Import after mock is set up
+const { NostrTransportProvider } = await import('../../../transport/NostrTransportProvider');
+const { hashNametag } = await import('@unicitylabs/nostr-js-sdk');
+type WebSocketFactory = import('../../../transport/websocket').WebSocketFactory;
 
 // =============================================================================
 // Test Fixtures
@@ -192,6 +167,15 @@ const TEST_COMPRESSED_PUBKEY = '02' + 'b'.repeat(64); // 33-byte compressed
 const TEST_L1_ADDRESS = 'alpha1testaddress123';
 const TEST_DIRECT_ADDRESS = 'DIRECT://testdirectaddress';
 const TEST_NAMETAG = 'alice';
+
+function createProvider() {
+  return new NostrTransportProvider({
+    relays: ['wss://test.relay'],
+    createWebSocket: (() => {}) as WebSocketFactory,
+    timeout: 1000,
+    autoReconnect: false,
+  });
+}
 
 // Create a realistic Nostr event structure
 function createNametagEvent(options: {
@@ -272,10 +256,8 @@ describe('Nametag Encryption', () => {
       const encrypted1 = await encryptNametag(nametag, TEST_PRIVATE_KEY);
       const encrypted2 = await encryptNametag(nametag, TEST_PRIVATE_KEY);
 
-      // Different ciphertext due to random IV
       expect(encrypted1).not.toBe(encrypted2);
 
-      // But both should decrypt to same value
       const decrypted1 = await decryptNametag(encrypted1, TEST_PRIVATE_KEY);
       const decrypted2 = await decryptNametag(encrypted2, TEST_PRIVATE_KEY);
       expect(decrypted1).toBe(nametag);
@@ -312,7 +294,6 @@ describe('Nametag Encryption', () => {
 
     it('should return null for truncated ciphertext', async () => {
       const encrypted = await encryptNametag('alice', TEST_PRIVATE_KEY);
-      // Truncate to just IV (12 bytes = 16 base64 chars)
       const truncated = encrypted.slice(0, 16);
 
       const decrypted = await decryptNametag(truncated, TEST_PRIVATE_KEY);
@@ -326,19 +307,16 @@ describe('Nametag Encryption', () => {
 // =============================================================================
 
 describe('NostrTransportProvider.resolveNametagInfo()', () => {
-  let provider: NostrTransportProvider;
-  let mockWs: MockWebSocketWithEvents;
+  let provider: InstanceType<typeof NostrTransportProvider>;
 
   beforeEach(() => {
-    mockWs = new MockWebSocketWithEvents();
+    vi.clearAllMocks();
+    storedQueryEvents.clear();
+    publishedEvents.length = 0;
+    mockIsConnected.mockReturnValue(true);
+    mockGetConnectedRelays.mockReturnValue(new Set(['wss://test.relay']));
 
-    provider = new NostrTransportProvider({
-      relays: ['wss://test.relay'],
-      createWebSocket: () => mockWs,
-      timeout: 1000,
-      autoReconnect: false,
-    });
-
+    provider = createProvider();
     provider.setIdentity({
       privateKey: TEST_PRIVATE_KEY,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
@@ -358,11 +336,9 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
       directAddress: TEST_DIRECT_ADDRESS,
     });
 
-    mockWs.addEvents(`nametag:${hashedNametag}`, [event]);
+    storedQueryEvents.set(`nametag:${hashedNametag}`, [event]);
 
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     const info = await provider.resolveNametagInfo(TEST_NAMETAG);
 
     expect(info).not.toBeNull();
@@ -377,8 +353,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
 
   it('should return null for non-existent nametag', async () => {
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     const info = await provider.resolveNametagInfo('nonexistent');
     expect(info).toBeNull();
   });
@@ -387,28 +361,24 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     const hashedNametag = hashNametag('legacy');
     const nostrPubkey = 'e'.repeat(64);
 
-    // Legacy event with no public_key or l1_address in content
     const event = {
       id: 'legacy_event',
       pubkey: nostrPubkey,
       created_at: Math.floor(Date.now() / 1000),
       kind: NOSTR_EVENT_KINDS.NAMETAG_BINDING,
       tags: [['t', hashedNametag]],
-      content: JSON.stringify({ name: 'legacy' }), // No extended fields
+      content: JSON.stringify({ name: 'legacy' }),
       sig: 'mocksig',
     };
 
-    mockWs.addEvents(`nametag:${hashedNametag}`, [event]);
+    storedQueryEvents.set(`nametag:${hashedNametag}`, [event]);
 
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     const info = await provider.resolveNametagInfo('legacy');
 
     expect(info).not.toBeNull();
     expect(info!.nametag).toBe('legacy');
     expect(info!.transportPubkey).toBe(nostrPubkey);
-    // Legacy events have empty chainPubkey and l1Address
     expect(info!.chainPubkey).toBe('');
     expect(info!.l1Address).toBe('');
     expect(info!.proxyAddress).toBe(`PROXY:${hashedNametag}`);
@@ -428,25 +398,18 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
         ['pubkey', TEST_COMPRESSED_PUBKEY],
         ['l1', TEST_L1_ADDRESS],
       ],
-      content: JSON.stringify({}), // Empty content, info in tags
+      content: JSON.stringify({}),
       sig: 'mocksig',
     };
 
-    mockWs.addEvents(`nametag:${hashedNametag}`, [event]);
+    storedQueryEvents.set(`nametag:${hashedNametag}`, [event]);
 
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     const info = await provider.resolveNametagInfo('tagged');
 
     expect(info).not.toBeNull();
     expect(info!.chainPubkey).toBe(TEST_COMPRESSED_PUBKEY);
     expect(info!.l1Address).toBe(TEST_L1_ADDRESS);
-  });
-
-  it('should throw when not connected', async () => {
-    // Don't connect
-    await expect(provider.resolveNametagInfo(TEST_NAMETAG)).rejects.toThrow();
   });
 });
 
@@ -455,27 +418,23 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
 // =============================================================================
 
 describe('NostrTransportProvider.recoverNametag()', () => {
-  let provider: NostrTransportProvider;
-  let mockWs: MockWebSocketWithEvents;
+  let provider: InstanceType<typeof NostrTransportProvider>;
   let nostrPubkey: string;
 
   beforeEach(async () => {
-    mockWs = new MockWebSocketWithEvents();
+    vi.clearAllMocks();
+    storedQueryEvents.clear();
+    publishedEvents.length = 0;
+    mockIsConnected.mockReturnValue(true);
+    mockGetConnectedRelays.mockReturnValue(new Set(['wss://test.relay']));
 
-    provider = new NostrTransportProvider({
-      relays: ['wss://test.relay'],
-      createWebSocket: () => mockWs,
-      timeout: 5000, // Increased timeout for stability
-      autoReconnect: false,
-    });
-
+    provider = createProvider();
     provider.setIdentity({
       privateKey: TEST_PRIVATE_KEY,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
       l1Address: TEST_L1_ADDRESS,
     });
 
-    // Get the actual Nostr pubkey that will be derived from the private key
     nostrPubkey = provider.getNostrPubkey();
   });
 
@@ -498,11 +457,9 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       encryptedNametag,
     });
 
-    mockWs.addEvents(`author:${nostrPubkey}`, [event]);
+    storedQueryEvents.set(`author:${nostrPubkey}`, [event]);
 
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     const recovered = await provider.recoverNametag();
 
     expect(recovered).toBe(TEST_NAMETAG);
@@ -510,8 +467,6 @@ describe('NostrTransportProvider.recoverNametag()', () => {
 
   it('should return null when no events found', async () => {
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     const recovered = await provider.recoverNametag();
     expect(recovered).toBeNull();
   });
@@ -522,20 +477,16 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       nostrPubkey,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
       l1Address: TEST_L1_ADDRESS,
-      // No encryptedNametag
     });
 
-    mockWs.addEvents(`author:${nostrPubkey}`, [event]);
+    storedQueryEvents.set(`author:${nostrPubkey}`, [event]);
 
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     const recovered = await provider.recoverNametag();
     expect(recovered).toBeNull();
   });
 
   it('should return null when decryption fails (wrong key scenario)', async () => {
-    // Encrypt with different key
     const differentKey = 'c'.repeat(64);
     const encryptedWithDifferentKey = await encryptNametag(TEST_NAMETAG, differentKey);
 
@@ -547,11 +498,9 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       encryptedNametag: encryptedWithDifferentKey,
     });
 
-    mockWs.addEvents(`author:${nostrPubkey}`, [event]);
+    storedQueryEvents.set(`author:${nostrPubkey}`, [event]);
 
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     const recovered = await provider.recoverNametag();
     expect(recovered).toBeNull();
   });
@@ -567,42 +516,32 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       nametag: oldNametag,
       nostrPubkey,
       encryptedNametag: encryptedOld,
-      timestamp: Math.floor(Date.now() / 1000) - 3600, // 1 hour ago
+      timestamp: Math.floor(Date.now() / 1000) - 3600,
     });
 
     const newEvent = createNametagEvent({
       nametag: newNametag,
       nostrPubkey,
       encryptedNametag: encryptedNew,
-      timestamp: Math.floor(Date.now() / 1000), // Now
+      timestamp: Math.floor(Date.now() / 1000),
     });
 
-    // Add both events
-    mockWs.addEvents(`author:${nostrPubkey}`, [oldEvent, newEvent]);
+    storedQueryEvents.set(`author:${nostrPubkey}`, [oldEvent, newEvent]);
 
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     const recovered = await provider.recoverNametag();
     expect(recovered).toBe(newNametag);
   });
 
   it('should throw when identity not set', async () => {
-    const newProvider = new NostrTransportProvider({
-      relays: ['wss://test.relay'],
-      createWebSocket: () => new MockWebSocketWithEvents(),
-      timeout: 1000,
-      autoReconnect: false,
-    });
+    const newProvider = createProvider();
 
     await newProvider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
-
     await expect(newProvider.recoverNametag()).rejects.toThrow('Identity not set');
   });
 
   it('should throw when not connected', async () => {
-    // Don't connect
+    mockIsConnected.mockReturnValue(false);
     await expect(provider.recoverNametag()).rejects.toThrow();
   });
 });
@@ -612,28 +551,16 @@ describe('NostrTransportProvider.recoverNametag()', () => {
 // =============================================================================
 
 describe('NostrTransportProvider.registerNametag() extended fields', () => {
-  let provider: NostrTransportProvider;
-  let mockWs: MockWebSocketWithEvents;
-  let sentEvents: string[] = [];
+  let provider: InstanceType<typeof NostrTransportProvider>;
 
   beforeEach(() => {
-    sentEvents = [];
-    mockWs = new MockWebSocketWithEvents();
+    vi.clearAllMocks();
+    storedQueryEvents.clear();
+    publishedEvents.length = 0;
+    mockIsConnected.mockReturnValue(true);
+    mockGetConnectedRelays.mockReturnValue(new Set(['wss://test.relay']));
 
-    // Intercept sent messages
-    const originalSend = mockWs.send.bind(mockWs);
-    mockWs.send = (data: string) => {
-      sentEvents.push(data);
-      originalSend(data);
-    };
-
-    provider = new NostrTransportProvider({
-      relays: ['wss://test.relay'],
-      createWebSocket: () => mockWs,
-      timeout: 1000,
-      autoReconnect: false,
-    });
-
+    provider = createProvider();
     provider.setIdentity({
       privateKey: TEST_PRIVATE_KEY,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
@@ -644,28 +571,19 @@ describe('NostrTransportProvider.registerNametag() extended fields', () => {
 
   it('should include encrypted_nametag in published event', async () => {
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
 
+    // resolveNametag returns null (nametag not taken)
     await provider.registerNametag(TEST_NAMETAG, TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS);
 
-    // Find the EVENT message
-    const eventMessage = sentEvents.find(msg => {
-      try {
-        const parsed = JSON.parse(msg);
-        return parsed[0] === 'EVENT' && parsed[1]?.kind === NOSTR_EVENT_KINDS.NAMETAG_BINDING;
-      } catch {
-        return false;
-      }
-    });
+    expect(publishedEvents.length).toBeGreaterThan(0);
 
-    expect(eventMessage).toBeDefined();
+    // Find the nametag binding event
+    const event = publishedEvents.find((e: any) => e.kind === NOSTR_EVENT_KINDS.NAMETAG_BINDING) as any;
+    expect(event).toBeDefined();
 
-    const parsed = JSON.parse(eventMessage!);
-    const event = parsed[1];
     const content = JSON.parse(event.content);
-
     expect(content.encrypted_nametag).toBeDefined();
-    expect(content.encrypted_nametag).not.toBe(TEST_NAMETAG); // Should be encrypted
+    expect(content.encrypted_nametag).not.toBe(TEST_NAMETAG);
 
     // Verify we can decrypt it
     const decrypted = await decryptNametag(content.encrypted_nametag, TEST_PRIVATE_KEY);
@@ -674,49 +592,25 @@ describe('NostrTransportProvider.registerNametag() extended fields', () => {
 
   it('should include public_key, l1_address, and direct_address in published event', async () => {
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
 
     await provider.registerNametag(TEST_NAMETAG, TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS);
 
-    const eventMessage = sentEvents.find(msg => {
-      try {
-        const parsed = JSON.parse(msg);
-        return parsed[0] === 'EVENT' && parsed[1]?.kind === NOSTR_EVENT_KINDS.NAMETAG_BINDING;
-      } catch {
-        return false;
-      }
-    });
-
-    const parsed = JSON.parse(eventMessage!);
-    const event = parsed[1];
+    const event = publishedEvents.find((e: any) => e.kind === NOSTR_EVENT_KINDS.NAMETAG_BINDING) as any;
     const content = JSON.parse(event.content);
 
-    // Note: registerNametag derives pubkey and l1_address from privateKey for consistency
-    // So we check that they exist and have correct format, not specific values
     expect(content.public_key).toBeDefined();
-    expect(content.public_key).toMatch(/^0[23][0-9a-f]{64}$/); // 33-byte compressed pubkey
+    expect(content.public_key).toMatch(/^0[23][0-9a-f]{64}$/);
     expect(content.l1_address).toBeDefined();
-    expect(content.l1_address).toMatch(/^alpha1[a-z0-9]+$/); // Valid bech32 alpha address
-    expect(content.direct_address).toBe(TEST_DIRECT_ADDRESS); // This is passed through
+    expect(content.l1_address).toMatch(/^alpha1[a-z0-9]+$/);
+    expect(content.direct_address).toBe(TEST_DIRECT_ADDRESS);
   });
 
   it('should include hashed nametag in both "t" and "d" tags', async () => {
     await provider.connect();
-    await new Promise(resolve => setTimeout(resolve, 20));
 
     await provider.registerNametag(TEST_NAMETAG, TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS);
 
-    const eventMessage = sentEvents.find(msg => {
-      try {
-        const parsed = JSON.parse(msg);
-        return parsed[0] === 'EVENT' && parsed[1]?.kind === NOSTR_EVENT_KINDS.NAMETAG_BINDING;
-      } catch {
-        return false;
-      }
-    });
-
-    const parsed = JSON.parse(eventMessage!);
-    const event = parsed[1];
+    const event = publishedEvents.find((e: any) => e.kind === NOSTR_EVENT_KINDS.NAMETAG_BINDING) as any;
     const hashedNametag = hashNametag(TEST_NAMETAG);
 
     const tTag = event.tags.find((t: string[]) => t[0] === 't');

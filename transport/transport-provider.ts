@@ -164,6 +164,8 @@ export interface IncomingMessage {
   id: string;
   /** Transport-specific pubkey of sender */
   senderTransportPubkey: string;
+  /** Sender's nametag (if known from NIP-17 unwrap) */
+  senderNametag?: string;
   content: string;
   timestamp: number;
   encrypted: boolean;
