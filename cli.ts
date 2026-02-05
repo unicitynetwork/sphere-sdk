@@ -207,6 +207,9 @@ BALANCE & TOKENS:
   balance                           Show L3 token balance
   tokens                            List all tokens with details
   l1-balance                        Show L1 (ALPHA) balance
+  topup [coin] [amount]             Request test tokens from faucet
+                                    Without args: requests all supported coins
+                                    With coin: requests specific coin (bitcoin, ethereum, etc.)
 
 TRANSFERS:
   send <to> <amount> [options]      Send tokens (to: @nametag or address)
@@ -1112,6 +1115,99 @@ async function main() {
         }
         const bytes = base58Decode(str);
         console.log(Buffer.from(bytes).toString('hex'));
+        break;
+      }
+
+      // === FAUCET / TOPUP ===
+      case 'topup':
+      case 'top-up':
+      case 'faucet': {
+        // Get nametag from wallet
+        const sphere = await getSphere();
+        const nametag = sphere.getNametag();
+        if (!nametag) {
+          console.error('Error: No nametag registered. Use "nametag <name>" first.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        // Parse options
+        const coinArg = args[1];  // Optional: specific coin
+        const amountArg = args[2]; // Optional: specific amount
+
+        const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
+
+        // Default amounts for all coins
+        const DEFAULT_COINS: Record<string, number> = {
+          'unicity': 100,
+          'bitcoin': 1,
+          'ethereum': 42,
+          'solana': 1000,
+          'tether': 1000,
+          'usd-coin': 1000,
+          'unicity-usd': 1000,
+        };
+
+        async function requestFaucet(coin: string, amount: number): Promise<{ success: boolean; message?: string }> {
+          try {
+            const response = await fetch(FAUCET_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                unicityId: nametag,  // Without @ prefix - faucet API expects raw nametag
+                coin,
+                amount,
+              }),
+            });
+            const result = await response.json() as { success: boolean; message?: string; error?: string };
+            // API returns 'error' field on failure, normalize to 'message'
+            return {
+              success: result.success,
+              message: result.message || result.error,
+            };
+          } catch (error) {
+            return { success: false, message: error instanceof Error ? error.message : 'Request failed' };
+          }
+        }
+
+        if (coinArg) {
+          // Request specific coin
+          const coin = coinArg.toLowerCase();
+          const amount = amountArg ? parseFloat(amountArg) : (DEFAULT_COINS[coin] || 1);
+
+          console.log(`Requesting ${amount} ${coin} from faucet for @${nametag}...`);
+          const result = await requestFaucet(coin, amount);
+
+          if (result.success) {
+            console.log(`\n✓ Received ${amount} ${coin}`);
+          } else {
+            console.error(`\n✗ Failed: ${result.message || 'Unknown error'}`);
+          }
+        } else {
+          // Request all coins
+          console.log(`Requesting all test tokens for @${nametag}...`);
+          console.log('─'.repeat(50));
+
+          const results = await Promise.all(
+            Object.entries(DEFAULT_COINS).map(async ([coin, amount]) => {
+              const result = await requestFaucet(coin, amount);
+              return { coin, amount, ...result };
+            })
+          );
+
+          for (const result of results) {
+            if (result.success) {
+              console.log(`✓ ${result.coin}: ${result.amount}`);
+            } else {
+              console.log(`✗ ${result.coin}: Failed - ${result.message || 'Unknown error'}`);
+            }
+          }
+
+          console.log('─'.repeat(50));
+          console.log('TopUp complete! Run "balance" to see updated balances.');
+        }
+
+        await closeSphere();
         break;
       }
 
