@@ -53,11 +53,12 @@ export interface IdentityConfig {
 // =============================================================================
 
 export type TokenStatus =
-  | 'pending'
-  | 'confirmed'
-  | 'transferring'
-  | 'spent'
-  | 'invalid';
+  | 'pending'      // Initial creation
+  | 'submitted'    // Commitment sent, waiting for proof (NOSTR-FIRST)
+  | 'confirmed'    // Has inclusion proof
+  | 'transferring' // Being transferred
+  | 'spent'        // Transferred away
+  | 'invalid';     // Validation failed
 
 export interface Token {
   readonly id: string;
@@ -78,7 +79,11 @@ export interface TokenBalance {
   readonly symbol: string;
   readonly name: string;
   readonly totalAmount: string;
+  readonly confirmedAmount: string;     // Amount with inclusion proofs
+  readonly unconfirmedAmount: string;   // Amount pending proof (NOSTR-FIRST)
   readonly tokenCount: number;
+  readonly confirmedTokenCount: number;   // Tokens with proofs
+  readonly unconfirmedTokenCount: number; // Tokens pending proof
   readonly decimals: number;
 }
 

@@ -337,7 +337,22 @@ function extractStateHashFromSdkData(sdkData: string | undefined): string {
   if (!sdkData) return '';
   try {
     const txf = JSON.parse(sdkData) as TxfToken;
-    return getCurrentStateHash(txf) || '';
+    const stateHash = getCurrentStateHash(txf);
+
+    // Try alternative locations if not found in standard place
+    if (!stateHash) {
+      if ((txf as any).state?.hash) {
+        return (txf as any).state.hash;
+      }
+      if ((txf as any).stateHash) {
+        return (txf as any).stateHash;
+      }
+      if ((txf as any).currentStateHash) {
+        return (txf as any).currentStateHash;
+      }
+    }
+
+    return stateHash || '';
   } catch {
     return '';
   }
@@ -492,6 +507,24 @@ export interface PaymentsModuleConfig {
 }
 
 // =============================================================================
+// NOSTR-FIRST Proof Polling Types
+// =============================================================================
+
+/**
+ * Job for background proof polling (NOSTR-FIRST pattern)
+ */
+export interface ProofPollingJob {
+  tokenId: string;
+  requestIdHex: string;
+  commitmentJson: string;
+  startedAt: number;
+  attemptCount: number;
+  lastAttemptAt: number;
+  /** Callback when proof is received */
+  onProofReceived?: (tokenId: string) => void;
+}
+
+// =============================================================================
 // Dependencies Interface
 // =============================================================================
 
@@ -550,6 +583,12 @@ export class PaymentsModule {
   private unsubscribeTransfers: (() => void) | null = null;
   private unsubscribePaymentRequests: (() => void) | null = null;
   private unsubscribePaymentRequestResponses: (() => void) | null = null;
+
+  // NOSTR-FIRST proof polling (background proof verification)
+  private proofPollingJobs: Map<string, ProofPollingJob> = new Map();
+  private proofPollingInterval: ReturnType<typeof setInterval> | null = null;
+  private static readonly PROOF_POLLING_INTERVAL_MS = 2000;  // Poll every 2s
+  private static readonly PROOF_POLLING_MAX_ATTEMPTS = 30;   // Max 30 attempts (~60s)
 
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
@@ -678,6 +717,10 @@ export class PaymentsModule {
     this.unsubscribePaymentRequestResponses = null;
     this.paymentRequestHandlers.clear();
     this.paymentRequestResponseHandlers.clear();
+
+    // Stop proof polling (NOSTR-FIRST)
+    this.stopProofPolling();
+    this.proofPollingJobs.clear();
 
     // Clear pending response resolvers
     for (const [, resolver] of this.pendingResponseResolvers) {
@@ -815,7 +858,10 @@ export class PaymentsModule {
         this.log(`Split transfer completed`);
       }
 
-      // Transfer direct tokens (no split needed)
+      // Transfer direct tokens (no split needed) - standard aggregator-first flow
+      // NOTE: NOSTR-FIRST for direct transfers has receiver-side issues with commitment validation.
+      // The InstantSplit V5 flow is used for splits which provides fast transfers.
+      // For direct (non-split) tokens, we use the proven standard flow.
       for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
         const token = tokenWithAmount.uiToken;
 
@@ -1623,21 +1669,39 @@ export class PaymentsModule {
    * Get balance for coin type
    */
   getBalance(coinId?: string): TokenBalance[] {
-    const balances = new Map<string, TokenBalance>();
+    const balances = new Map<string, {
+      coinId: string;
+      symbol: string;
+      name: string;
+      decimals: number;
+      confirmedAmount: bigint;
+      unconfirmedAmount: bigint;
+      confirmedTokenCount: number;
+      unconfirmedTokenCount: number;
+    }>();
     const registry = TokenRegistry.getInstance();
 
     for (const token of this.tokens.values()) {
-      if (token.status !== 'confirmed') continue;
+      // Skip tokens that are spent, invalid, or in active transfer
+      if (token.status === 'spent' || token.status === 'invalid' || token.status === 'transferring') {
+        continue;
+      }
       if (coinId && token.coinId !== coinId) continue;
 
       const key = token.coinId;
-      const existing = balances.get(key);
+      const amount = BigInt(token.amount);
+      const isConfirmed = token.status === 'confirmed';
+      const isUnconfirmed = token.status === 'submitted' || token.status === 'pending';
 
+      const existing = balances.get(key);
       if (existing) {
-        (existing as { totalAmount: string }).totalAmount = (
-          BigInt(existing.totalAmount) + BigInt(token.amount)
-        ).toString();
-        (existing as { tokenCount: number }).tokenCount++;
+        if (isConfirmed) {
+          existing.confirmedAmount += amount;
+          existing.confirmedTokenCount++;
+        } else if (isUnconfirmed) {
+          existing.unconfirmedAmount += amount;
+          existing.unconfirmedTokenCount++;
+        }
       } else {
         // Look up token metadata from registry (more reliable than stored values)
         const def = registry.getDefinition(token.coinId);
@@ -1645,14 +1709,28 @@ export class PaymentsModule {
           coinId: token.coinId,
           symbol: def?.symbol || token.symbol,
           name: def?.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : token.name,
-          totalAmount: token.amount,
-          tokenCount: 1,
           decimals: def?.decimals ?? token.decimals ?? 8,
+          confirmedAmount: isConfirmed ? amount : 0n,
+          unconfirmedAmount: isUnconfirmed ? amount : 0n,
+          confirmedTokenCount: isConfirmed ? 1 : 0,
+          unconfirmedTokenCount: isUnconfirmed ? 1 : 0,
         });
       }
     }
 
-    return Array.from(balances.values());
+    // Convert to TokenBalance interface
+    return Array.from(balances.values()).map(bal => ({
+      coinId: bal.coinId,
+      symbol: bal.symbol,
+      name: bal.name,
+      decimals: bal.decimals,
+      totalAmount: (bal.confirmedAmount + bal.unconfirmedAmount).toString(),
+      confirmedAmount: bal.confirmedAmount.toString(),
+      unconfirmedAmount: bal.unconfirmedAmount.toString(),
+      tokenCount: bal.confirmedTokenCount + bal.unconfirmedTokenCount,
+      confirmedTokenCount: bal.confirmedTokenCount,
+      unconfirmedTokenCount: bal.unconfirmedTokenCount,
+    }));
   }
 
   /**
@@ -1689,15 +1767,53 @@ export class PaymentsModule {
   async addToken(token: Token, skipHistory: boolean = false): Promise<boolean> {
     this.ensureInitialized();
 
-    // Check for duplicates
-    for (const existing of this.tokens.values()) {
+    // Check for duplicates by genesis tokenId
+    const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
+    const incomingStateHash = extractStateHashFromSdkData(token.sdkData);
+
+    for (const [existingId, existing] of this.tokens) {
       if (isSameToken(existing, token)) {
-        this.log(`Duplicate token detected: ${token.id}`);
+        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
+
+        // CASE 1: Existing token is spent/invalid - allow replacement regardless of state hash
+        // This handles "token sent away and returned" case
+        if (existing.status === 'spent' || existing.status === 'invalid') {
+          this.log(`Replacing spent/invalid token ${existingId.slice(0, 8)}... with incoming token`);
+          this.tokens.delete(existingId);
+          this.tokens.set(token.id, token);
+          break;
+        }
+
+        // CASE 2: Different token IDs (internal .id, not genesis tokenId) - this is new state
+        // The .id property changes with each state transition
+        if (existingId !== token.id) {
+          // If we have state hashes, verify they're different
+          if (incomingStateHash && existingStateHash) {
+            if (incomingStateHash !== existingStateHash) {
+              this.log(`Token ${incomingTokenId?.slice(0, 8)}... state updated, replacing`);
+              this.tokens.delete(existingId);
+              this.tokens.set(token.id, token);
+              break;
+            }
+          } else {
+            // No state hashes available - use .id difference as heuristic
+            // Different .id suggests different state, so allow replacement
+            this.log(`Token ${incomingTokenId?.slice(0, 8)}... .id changed, replacing`);
+            this.tokens.delete(existingId);
+            this.tokens.set(token.id, token);
+            break;
+          }
+        }
+
+        // CASE 3: Same tokenId AND same .id - true duplicate
         return false;
       }
     }
 
-    this.tokens.set(token.id, token);
+    // No duplicate found or replaced spent token - add as new
+    if (!this.tokens.has(token.id)) {
+      this.tokens.set(token.id, token);
+    }
 
     // Archive the token
     await this.archiveToken(token);
@@ -1940,6 +2056,13 @@ export class PaymentsModule {
     return this.tombstones.some(
       t => t.tokenId === tokenId && t.stateHash === stateHash
     );
+  }
+
+  /**
+   * Check if any state of this token is tombstoned (for when state hash unavailable)
+   */
+  isTokenIdTombstoned(tokenId: string): boolean {
+    return this.tombstones.some(t => t.tokenId === tokenId);
   }
 
   /**
@@ -2758,6 +2881,255 @@ export class PaymentsModule {
     );
   }
 
+  /**
+   * Handle NOSTR-FIRST commitment-only transfer (recipient side)
+   * This is called when receiving a transfer with only commitmentData and no proof yet.
+   * We create the token as 'submitted', submit commitment (idempotent), and poll for proof.
+   */
+  private async handleCommitmentOnlyTransfer(
+    transfer: IncomingTokenTransfer,
+    payload: Record<string, unknown>
+  ): Promise<void> {
+    try {
+      const sourceTokenInput = typeof payload.sourceToken === 'string'
+        ? JSON.parse(payload.sourceToken as string)
+        : payload.sourceToken;
+      const commitmentInput = typeof payload.commitmentData === 'string'
+        ? JSON.parse(payload.commitmentData as string)
+        : payload.commitmentData;
+
+      if (!sourceTokenInput || !commitmentInput) {
+        console.warn('[Payments] Invalid NOSTR-FIRST transfer format');
+        return;
+      }
+
+      // Parse source token info
+      const tokenInfo = await parseTokenInfo(sourceTokenInput);
+
+      // Create token with 'submitted' status (unconfirmed until proof received)
+      const token: Token = {
+        id: tokenInfo.tokenId ?? crypto.randomUUID(),
+        coinId: tokenInfo.coinId,
+        symbol: tokenInfo.symbol,
+        name: tokenInfo.name,
+        decimals: tokenInfo.decimals,
+        iconUrl: tokenInfo.iconUrl,
+        amount: tokenInfo.amount,
+        status: 'submitted',  // NOSTR-FIRST: unconfirmed until proof
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        sdkData: typeof sourceTokenInput === 'string'
+          ? sourceTokenInput
+          : JSON.stringify(sourceTokenInput),
+      };
+
+      // NOTE: We intentionally do NOT check tombstones for incoming transfers
+      // A tombstoned token can legitimately come back via transfer (with new state)
+      // Duplicate detection in addToken() handles stale copies
+
+      // Add token as unconfirmed
+      this.tokens.set(token.id, token);
+      await this.save();
+      this.log(`NOSTR-FIRST: Token ${token.id.slice(0, 8)}... added as submitted (unconfirmed)`);
+
+      // Emit event for incoming transfer (even though unconfirmed)
+      const incomingTransfer: IncomingTransfer = {
+        id: transfer.id,
+        senderPubkey: transfer.senderTransportPubkey,
+        tokens: [token],
+        memo: payload.memo as string | undefined,
+        receivedAt: transfer.timestamp,
+      };
+      this.deps!.emitEvent('transfer:incoming', incomingTransfer);
+
+      // Parse commitment and start proof polling
+      try {
+        const commitment = await TransferCommitment.fromJSON(commitmentInput);
+        const requestIdBytes = commitment.requestId;
+        const requestIdHex = requestIdBytes instanceof Uint8Array
+          ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
+          : String(requestIdBytes);
+
+        // Submit commitment to aggregator (idempotent - same as sender)
+        const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+        if (stClient) {
+          const response = await stClient.submitTransferCommitment(commitment);
+          this.log(`NOSTR-FIRST recipient commitment submit: ${response.status}`);
+        }
+
+        // Start polling for proof
+        this.addProofPollingJob({
+          tokenId: token.id,
+          requestIdHex,
+          commitmentJson: JSON.stringify(commitmentInput),
+          startedAt: Date.now(),
+          attemptCount: 0,
+          lastAttemptAt: 0,
+          onProofReceived: async (tokenId) => {
+            // When proof arrives, finalize the token and update status
+            await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput, transfer.senderTransportPubkey);
+          },
+        });
+      } catch (err) {
+        console.error('[Payments] Failed to parse commitment for proof polling:', err);
+        // Token remains as 'submitted' - will eventually time out
+      }
+    } catch (error) {
+      console.error('[Payments] Failed to process NOSTR-FIRST transfer:', error);
+    }
+  }
+
+  /**
+   * Finalize a received token after proof is available
+   */
+  private async finalizeReceivedToken(
+    tokenId: string,
+    sourceTokenInput: unknown,
+    commitmentInput: unknown,
+    senderPubkey: string
+  ): Promise<void> {
+    try {
+      const token = this.tokens.get(tokenId);
+      if (!token) {
+        this.log(`Token ${tokenId} not found for finalization`);
+        return;
+      }
+
+      // Get proof from aggregator
+      const commitment = await TransferCommitment.fromJSON(commitmentInput);
+      if (!this.deps!.oracle.waitForProofSdk) {
+        this.log('Cannot finalize - no waitForProofSdk');
+        token.status = 'confirmed'; // Mark as confirmed anyway
+        token.updatedAt = Date.now();
+        await this.save();
+        return;
+      }
+
+      const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const transferTx = commitment.toTransaction(inclusionProof as any);
+
+      // Parse source token
+      const sourceToken = await SdkToken.fromJSON(sourceTokenInput);
+
+      // Get state transition client
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+
+      if (!stClient || !trustBase) {
+        this.log('Cannot finalize - missing state transition client or trust base');
+        token.status = 'confirmed';
+        token.updatedAt = Date.now();
+        await this.save();
+        return;
+      }
+
+      // Check address scheme for finalization
+      const recipientAddress = transferTx.data.recipient;
+      const addressScheme = recipientAddress.scheme;
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let finalizedSdkToken: SdkToken<any>;
+
+      if (addressScheme === AddressScheme.PROXY) {
+        // PROXY address - finalize with nametag token
+        if (!this.nametag?.token) {
+          console.error('[Payments] Cannot finalize PROXY transfer - no nametag token');
+          token.status = 'invalid';
+          token.updatedAt = Date.now();
+          await this.save();
+          return;
+        }
+
+        const nametagToken = await SdkToken.fromJSON(this.nametag.token);
+        const signingService = await this.createSigningService();
+        const transferSalt = transferTx.data.salt;
+
+        const recipientPredicate = await UnmaskedPredicate.create(
+          sourceToken.id,
+          sourceToken.type,
+          signingService,
+          HashAlgorithm.SHA256,
+          transferSalt
+        );
+
+        const recipientState = new TokenState(recipientPredicate, null);
+
+        finalizedSdkToken = await stClient.finalizeTransaction(
+          trustBase,
+          sourceToken,
+          recipientState,
+          transferTx,
+          [nametagToken]
+        );
+      } else {
+        // DIRECT address - finalize without nametag
+        const signingService = await this.createSigningService();
+        const transferSalt = transferTx.data.salt;
+
+        const recipientPredicate = await UnmaskedPredicate.create(
+          sourceToken.id,
+          sourceToken.type,
+          signingService,
+          HashAlgorithm.SHA256,
+          transferSalt
+        );
+
+        const recipientState = new TokenState(recipientPredicate, null);
+
+        finalizedSdkToken = await stClient.finalizeTransaction(
+          trustBase,
+          sourceToken,
+          recipientState,
+          transferTx,
+          []
+        );
+      }
+
+      // Update token with finalized data (create new token with updated sdkData)
+      const finalizedToken: Token = {
+        ...token,
+        status: 'confirmed',
+        updatedAt: Date.now(),
+        sdkData: JSON.stringify(finalizedSdkToken.toJSON()),
+      };
+      this.tokens.set(tokenId, finalizedToken);
+      await this.save();
+
+      // Also save as individual token file
+      await this.saveTokenToFileStorage(finalizedToken);
+
+      this.log(`NOSTR-FIRST: Token ${tokenId.slice(0, 8)}... finalized and confirmed`);
+
+      // Emit confirmation event
+      this.deps!.emitEvent('transfer:confirmed', {
+        id: crypto.randomUUID(),
+        status: 'completed',
+        tokens: [finalizedToken],
+      });
+
+      // Add to history
+      await this.addToHistory({
+        type: 'RECEIVED',
+        amount: finalizedToken.amount,
+        coinId: finalizedToken.coinId,
+        symbol: finalizedToken.symbol,
+        timestamp: Date.now(),
+        senderPubkey,
+      });
+    } catch (error) {
+      console.error('[Payments] Failed to finalize received token:', error);
+      // Mark as confirmed anyway (user has the token)
+      const token = this.tokens.get(tokenId);
+      if (token && token.status === 'submitted') {
+        token.status = 'confirmed';
+        token.updatedAt = Date.now();
+        await this.save();
+      }
+    }
+  }
+
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
     try {
       // Check payload format - Sphere wallet sends { sourceToken, transferTx }
@@ -2883,16 +3255,21 @@ export class PaymentsModule {
 
         if (addressScheme === AddressScheme.PROXY) {
           // Need to finalize with nametag token
+          console.log('[Payments] PROXY address detected - attempting finalization...');
+          console.log(`[Payments] PROXY nametag: ${this.nametag?.name}, has token: ${!!this.nametag?.token}`);
           if (!this.nametag?.token) {
             console.error('[Payments] Cannot finalize PROXY transfer - no nametag token. Token rejected.');
             return; // Reject token - cannot spend without finalization
           }
           {
             try {
+              console.log('[Payments] Parsing nametag token...');
               const nametagToken = await SdkToken.fromJSON(this.nametag.token);
+              console.log('[Payments] Creating signing service...');
               const signingService = await this.createSigningService();
               const transferSalt = transferTx.data.salt;
 
+              console.log('[Payments] Creating recipient predicate...');
               const recipientPredicate = await UnmaskedPredicate.create(
                 sourceToken.id,
                 sourceToken.type,
@@ -2912,6 +3289,7 @@ export class PaymentsModule {
                 return; // Reject token - cannot spend without finalization
               }
 
+              console.log('[Payments] Calling finalizeTransaction...');
               finalizedSdkToken = await stClient.finalizeTransaction(
                 trustBase,
                 sourceToken,
@@ -2920,9 +3298,9 @@ export class PaymentsModule {
                 [nametagToken]
               );
               tokenData = finalizedSdkToken.toJSON();
-              this.log('Token finalized successfully');
+              console.log('[Payments] PROXY finalization SUCCESSFUL');
             } catch (finalizeError) {
-              console.error('[Payments] Finalization failed:', finalizeError);
+              console.error('[Payments] PROXY finalization FAILED:', finalizeError);
               return; // Reject token - cannot spend without finalization
             }
           }
@@ -3003,13 +3381,9 @@ export class PaymentsModule {
           : JSON.stringify(tokenData),
       };
 
-      // Check if tombstoned
-      const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
-      const stateHash = extractStateHashFromSdkData(token.sdkData);
-      if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) {
-        this.log(`Rejected tombstoned token ${sdkTokenId.slice(0, 8)}...`);
-        return;
-      }
+      // NOTE: We intentionally do NOT check tombstones for incoming transfers
+      // A tombstoned token can legitimately come back via transfer (with new state)
+      // Duplicate detection in addToken() handles stale copies
 
       await this.addToken(token);
 
@@ -3119,17 +3493,208 @@ export class PaymentsModule {
   private loadFromStorageData(data: TxfStorageDataBase): void {
     const parsed = parseTxfStorageData(data);
 
-    // Load tokens
+    // Load tombstones FIRST so we can filter tokens
+    this.tombstones = parsed.tombstones;
+    // Load tokens, filtering out tombstoned ones
+    // NOTE: Only filter by exact (tokenId, stateHash) match to avoid over-blocking
+    // When state hash is unavailable, we can't reliably distinguish old from new
     this.tokens.clear();
     for (const token of parsed.tokens) {
+      const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
+      const stateHash = extractStateHashFromSdkData(token.sdkData);
+
+      // Only filter if we have exact state match
+      if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) {
+        this.log(`Skipping tombstoned token ${sdkTokenId.slice(0, 8)}... during load (exact state match)`);
+        continue;
+      }
+
       this.tokens.set(token.id, token);
     }
 
     // Load other data
-    this.tombstones = parsed.tombstones;
     this.archivedTokens = parsed.archivedTokens;
     this.forkedTokens = parsed.forkedTokens;
     this.nametag = parsed.nametag;
+  }
+
+  // ===========================================================================
+  // Private: NOSTR-FIRST Proof Polling
+  // ===========================================================================
+
+  /**
+   * Submit commitment to aggregator and start background proof polling
+   * (NOSTR-FIRST pattern: fire-and-forget submission)
+   */
+  private async submitAndPollForProof(
+    tokenId: string,
+    commitment: TransferCommitment,
+    requestIdHex: string,
+    onProofReceived?: (tokenId: string) => void
+  ): Promise<void> {
+    try {
+      // Submit to aggregator
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      if (!stClient) {
+        this.log('Cannot submit commitment - no state transition client');
+        return;
+      }
+
+      const response = await stClient.submitTransferCommitment(commitment);
+      if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
+        this.log(`Transfer commitment submission failed: ${response.status}`);
+        // Mark token as invalid since submission failed
+        const token = this.tokens.get(tokenId);
+        if (token) {
+          token.status = 'invalid';
+          token.updatedAt = Date.now();
+          this.tokens.set(tokenId, token);
+          await this.save();
+        }
+        return;
+      }
+
+      // Add to polling queue
+      this.addProofPollingJob({
+        tokenId,
+        requestIdHex,
+        commitmentJson: JSON.stringify(commitment.toJSON()),
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+        onProofReceived,
+      });
+    } catch (error) {
+      this.log('submitAndPollForProof error:', error);
+    }
+  }
+
+  /**
+   * Add a proof polling job to the queue
+   */
+  private addProofPollingJob(job: ProofPollingJob): void {
+    this.proofPollingJobs.set(job.tokenId, job);
+    this.log(`Added proof polling job for token ${job.tokenId.slice(0, 8)}...`);
+    this.startProofPolling();
+  }
+
+  /**
+   * Start the proof polling interval if not already running
+   */
+  private startProofPolling(): void {
+    if (this.proofPollingInterval) return;
+    if (this.proofPollingJobs.size === 0) return;
+
+    this.log('Starting proof polling...');
+    this.proofPollingInterval = setInterval(
+      () => this.processProofPollingQueue(),
+      PaymentsModule.PROOF_POLLING_INTERVAL_MS
+    );
+  }
+
+  /**
+   * Stop the proof polling interval
+   */
+  private stopProofPolling(): void {
+    if (this.proofPollingInterval) {
+      clearInterval(this.proofPollingInterval);
+      this.proofPollingInterval = null;
+      this.log('Stopped proof polling');
+    }
+  }
+
+  /**
+   * Process all pending proof polling jobs
+   */
+  private async processProofPollingQueue(): Promise<void> {
+    if (this.proofPollingJobs.size === 0) {
+      this.stopProofPolling();
+      return;
+    }
+
+    const completedJobs: string[] = [];
+
+    for (const [tokenId, job] of this.proofPollingJobs) {
+      try {
+        job.attemptCount++;
+        job.lastAttemptAt = Date.now();
+
+        // Check for timeout
+        if (job.attemptCount >= PaymentsModule.PROOF_POLLING_MAX_ATTEMPTS) {
+          this.log(`Proof polling timeout for token ${tokenId.slice(0, 8)}...`);
+          // Mark token as invalid due to timeout
+          const token = this.tokens.get(tokenId);
+          if (token && token.status === 'submitted') {
+            token.status = 'invalid';
+            token.updatedAt = Date.now();
+            this.tokens.set(tokenId, token);
+          }
+          completedJobs.push(tokenId);
+          continue;
+        }
+
+        // Try to get proof from aggregator using a short timeout
+        const commitment = await TransferCommitment.fromJSON(JSON.parse(job.commitmentJson));
+
+        // Try to get proof with a quick timeout (non-blocking check)
+        let inclusionProof: unknown = null;
+        try {
+          // Create abort controller for quick timeout
+          const abortController = new AbortController();
+          const timeoutId = setTimeout(() => abortController.abort(), 500);
+
+          if (this.deps!.oracle.waitForProofSdk) {
+            inclusionProof = await Promise.race([
+              this.deps!.oracle.waitForProofSdk(commitment, abortController.signal),
+              new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+            ]);
+          } else {
+            // Fallback: use getProof with request ID hex
+            const proof = await this.deps!.oracle.getProof(job.requestIdHex);
+            if (proof) {
+              inclusionProof = proof;
+            }
+          }
+
+          clearTimeout(timeoutId);
+        } catch (err) {
+          // Proof not ready yet or timed out
+          continue;
+        }
+
+        if (!inclusionProof) {
+          // Proof not ready yet
+          continue;
+        }
+
+        // Proof received! Update token status
+        const token = this.tokens.get(tokenId);
+        if (token) {
+          token.status = 'spent';
+          token.updatedAt = Date.now();
+          this.tokens.set(tokenId, token);
+          await this.save();
+          this.log(`Proof received for token ${tokenId.slice(0, 8)}..., status: spent`);
+        }
+
+        // Call callback if provided
+        job.onProofReceived?.(tokenId);
+        completedJobs.push(tokenId);
+      } catch (error) {
+        // Most errors mean proof is not ready yet, continue polling
+        this.log(`Proof polling attempt ${job.attemptCount} for ${tokenId.slice(0, 8)}...: ${error}`);
+      }
+    }
+
+    // Remove completed jobs
+    for (const tokenId of completedJobs) {
+      this.proofPollingJobs.delete(tokenId);
+    }
+
+    // Stop polling if no more jobs
+    if (this.proofPollingJobs.size === 0) {
+      this.stopProofPolling();
+    }
   }
 
   // ===========================================================================
