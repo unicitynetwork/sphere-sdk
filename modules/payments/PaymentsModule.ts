@@ -3368,8 +3368,8 @@ export class PaymentsModule {
             const trustBase = (this.deps!.oracle as any).getTrustBase?.();
 
             if (!stClient || !trustBase) {
-              this.log('Cannot finalize DIRECT transfer - missing client, using source token');
-              tokenData = sourceTokenInput;
+              console.error('[Payments] Cannot finalize DIRECT transfer - missing client, token rejected.');
+              return; // Reject token - cannot finalize without client
             } else {
               finalizedSdkToken = await stClient.finalizeTransaction(
                 trustBase,
@@ -3382,8 +3382,11 @@ export class PaymentsModule {
               this.log('DIRECT transfer finalized successfully');
             }
           } catch (finalizeError) {
-            this.log('DIRECT finalization failed, using source token:', finalizeError);
-            tokenData = sourceTokenInput;
+            // CRITICAL: If finalization fails, the token is unspendable - reject it
+            console.error('[Payments] DIRECT finalization FAILED - token would be unspendable, rejecting:', finalizeError);
+            console.error('[Payments] This usually means the sender used a different DirectAddress than expected.');
+            console.error('[Payments] Token rejected to prevent unspendable balance.');
+            return; // Reject token - cannot spend without finalization
           }
         }
       } else if (payload.token) {

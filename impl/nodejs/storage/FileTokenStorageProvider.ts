@@ -83,7 +83,14 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     };
 
     try {
-      const files = fs.readdirSync(this.tokensDir).filter(f => f.endsWith('.json') && f !== '_meta.json' && f !== '_tombstones.json');
+      const files = fs.readdirSync(this.tokensDir).filter(f =>
+        f.endsWith('.json') &&
+        f !== '_meta.json' &&
+        f !== '_tombstones.json' &&
+        !f.startsWith('archived_') &&  // Skip archived tokens
+        !f.startsWith('token-') &&     // Skip legacy token format
+        !f.startsWith('nametag-')      // Skip nametag files (not tokens)
+      );
 
       for (const file of files) {
         try {
