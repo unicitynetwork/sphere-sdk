@@ -30,11 +30,25 @@ const command = args[0];
 const DEFAULT_DATA_DIR = './.sphere-cli';
 const DEFAULT_TOKENS_DIR = './.sphere-cli/tokens';
 const CONFIG_FILE = './.sphere-cli/config.json';
+const PROFILES_FILE = './.sphere-cli/profiles.json';
 
 interface CliConfig {
   network: NetworkType;
   dataDir: string;
   tokensDir: string;
+  currentProfile?: string;
+}
+
+interface WalletProfile {
+  name: string;
+  dataDir: string;
+  tokensDir: string;
+  network: NetworkType;
+  createdAt: string;
+}
+
+interface ProfilesStore {
+  profiles: WalletProfile[];
 }
 
 function loadConfig(): CliConfig {
@@ -55,6 +69,66 @@ function loadConfig(): CliConfig {
 function saveConfig(config: CliConfig): void {
   fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+// =============================================================================
+// Wallet Profile Management
+// =============================================================================
+
+function loadProfiles(): ProfilesStore {
+  try {
+    if (fs.existsSync(PROFILES_FILE)) {
+      return JSON.parse(fs.readFileSync(PROFILES_FILE, 'utf8'));
+    }
+  } catch {
+    // Use defaults
+  }
+  return { profiles: [] };
+}
+
+function saveProfiles(store: ProfilesStore): void {
+  fs.mkdirSync(path.dirname(PROFILES_FILE), { recursive: true });
+  fs.writeFileSync(PROFILES_FILE, JSON.stringify(store, null, 2));
+}
+
+function getProfile(name: string): WalletProfile | undefined {
+  const store = loadProfiles();
+  return store.profiles.find(p => p.name === name);
+}
+
+function addProfile(profile: WalletProfile): void {
+  const store = loadProfiles();
+  const existing = store.profiles.findIndex(p => p.name === profile.name);
+  if (existing >= 0) {
+    store.profiles[existing] = profile;
+  } else {
+    store.profiles.push(profile);
+  }
+  saveProfiles(store);
+}
+
+function deleteProfile(name: string): boolean {
+  const store = loadProfiles();
+  const index = store.profiles.findIndex(p => p.name === name);
+  if (index >= 0) {
+    store.profiles.splice(index, 1);
+    saveProfiles(store);
+    return true;
+  }
+  return false;
+}
+
+function switchToProfile(name: string): boolean {
+  const profile = getProfile(name);
+  if (!profile) return false;
+
+  const config = loadConfig();
+  config.dataDir = profile.dataDir;
+  config.tokensDir = profile.tokensDir;
+  config.network = profile.network;
+  config.currentProfile = name;
+  saveConfig(config);
+  return true;
 }
 
 // =============================================================================
@@ -122,6 +196,13 @@ WALLET MANAGEMENT:
   config                            Show current configuration
   config set <key> <value>          Set configuration (network, dataDir, tokensDir)
 
+WALLET PROFILES:
+  wallet list                       List all wallet profiles
+  wallet use <name>                 Switch to a wallet profile
+  wallet create <name> [--network]  Create a new wallet profile
+  wallet delete <name>              Delete a wallet profile
+  wallet current                    Show current wallet profile
+
 BALANCE & TOKENS:
   balance                           Show L3 token balance
   tokens                            List all tokens with details
@@ -136,6 +217,7 @@ NAMETAGS:
   nametag <name>                    Register a nametag (@name)
   nametag-info <name>               Lookup nametag info
   my-nametag                        Show current nametag
+  nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
 
 ENCRYPTION:
   encrypt <data> <password>         Encrypt data with password
@@ -169,6 +251,17 @@ Examples:
   npm run cli -- send @alice 1000000 --coin ETH
   npm run cli -- nametag myname
   npm run cli -- history 10
+
+Wallet Profile Examples:
+  npm run cli -- wallet create alice              Create profile "alice"
+  npm run cli -- init --nametag alice             Initialize wallet in profile
+  npm run cli -- wallet create bob                Create another profile
+  npm run cli -- init --nametag bob               Initialize second wallet
+  npm run cli -- wallet list                      List all profiles
+  npm run cli -- wallet use alice                 Switch to alice
+  npm run cli -- send @bob 0.1 --coin BTC         Send from alice to bob
+  npm run cli -- wallet use bob                   Switch to bob
+  npm run cli -- balance                          Check bob's balance
 `);
 }
 
@@ -258,6 +351,9 @@ async function main() {
 
           console.log('\nWallet Status:');
           console.log('─'.repeat(50));
+          if (config.currentProfile) {
+            console.log(`Profile:       ${config.currentProfile}`);
+          }
           console.log(`Network:       ${config.network}`);
           console.log(`L1 Address:    ${identity.l1Address}`);
           console.log(`Direct Addr:   ${identity.directAddress || '(not set)'}`);
@@ -293,6 +389,184 @@ async function main() {
         } else {
           console.log('\nCurrent Configuration:');
           console.log(JSON.stringify(config, null, 2));
+        }
+        break;
+      }
+
+      // === WALLET PROFILES ===
+      case 'wallet': {
+        const [, subCmd, profileName] = args;
+
+        switch (subCmd) {
+          case 'list': {
+            const store = loadProfiles();
+            const config = loadConfig();
+
+            console.log('\nWallet Profiles:');
+            console.log('─'.repeat(60));
+
+            if (store.profiles.length === 0) {
+              console.log('No profiles found. Create one with: npm run cli -- wallet create <name>');
+            } else {
+              for (const profile of store.profiles) {
+                const isCurrent = config.currentProfile === profile.name;
+                const marker = isCurrent ? '→ ' : '  ';
+                console.log(`${marker}${profile.name}`);
+                console.log(`    Network: ${profile.network}`);
+                console.log(`    DataDir: ${profile.dataDir}`);
+              }
+            }
+            console.log('─'.repeat(60));
+            break;
+          }
+
+          case 'use': {
+            if (!profileName) {
+              console.error('Usage: wallet use <name>');
+              console.error('Example: npm run cli -- wallet use babaika9');
+              process.exit(1);
+            }
+
+            if (switchToProfile(profileName)) {
+              console.log(`✓ Switched to wallet profile: ${profileName}`);
+
+              // Show wallet status
+              try {
+                const sphere = await getSphere();
+                const identity = sphere.identity;
+                if (identity) {
+                  console.log(`  Nametag:  ${identity.nametag || '(not set)'}`);
+                  console.log(`  L1 Addr:  ${identity.l1Address}`);
+                }
+                await closeSphere();
+              } catch {
+                console.log('  (wallet not initialized in this profile)');
+              }
+            } else {
+              console.error(`Profile "${profileName}" not found.`);
+              console.error('Run: npm run cli -- wallet list');
+              process.exit(1);
+            }
+            break;
+          }
+
+          case 'create': {
+            if (!profileName) {
+              console.error('Usage: wallet create <name> [--network testnet|mainnet|dev]');
+              console.error('Example: npm run cli -- wallet create mywalletname');
+              process.exit(1);
+            }
+
+            // Check if profile already exists
+            if (getProfile(profileName)) {
+              console.error(`Profile "${profileName}" already exists.`);
+              console.error('Run: npm run cli -- wallet use ' + profileName);
+              process.exit(1);
+            }
+
+            // Parse optional network
+            const networkIdx = args.indexOf('--network');
+            let network: NetworkType = 'testnet';
+            if (networkIdx !== -1 && args[networkIdx + 1]) {
+              network = args[networkIdx + 1] as NetworkType;
+            }
+
+            const dataDir = `./.sphere-cli-${profileName}`;
+            const tokensDir = `${dataDir}/tokens`;
+
+            // Create the profile
+            const profile: WalletProfile = {
+              name: profileName,
+              dataDir,
+              tokensDir,
+              network,
+              createdAt: new Date().toISOString(),
+            };
+            addProfile(profile);
+
+            // Switch to the new profile
+            switchToProfile(profileName);
+
+            console.log(`✓ Created wallet profile: ${profileName}`);
+            console.log(`  Network:  ${network}`);
+            console.log(`  DataDir:  ${dataDir}`);
+            console.log('');
+            console.log('Now initialize the wallet:');
+            console.log(`  npm run cli -- init --nametag ${profileName}`);
+            break;
+          }
+
+          case 'current': {
+            const config = loadConfig();
+            const currentName = config.currentProfile;
+
+            console.log('\nCurrent Wallet:');
+            console.log('─'.repeat(50));
+
+            if (currentName) {
+              const profile = getProfile(currentName);
+              if (profile) {
+                console.log(`Profile:   ${profile.name}`);
+                console.log(`Network:   ${profile.network}`);
+                console.log(`DataDir:   ${profile.dataDir}`);
+              } else {
+                console.log(`Profile:   ${currentName} (not found in profiles)`);
+              }
+            } else {
+              console.log('Profile:   (default)');
+            }
+
+            console.log(`DataDir:   ${config.dataDir}`);
+            console.log(`Network:   ${config.network}`);
+
+            // Try to get identity
+            try {
+              const sphere = await getSphere();
+              const identity = sphere.identity;
+              if (identity) {
+                console.log(`Nametag:   ${identity.nametag || '(not set)'}`);
+                console.log(`L1 Addr:   ${identity.l1Address}`);
+              }
+              await closeSphere();
+            } catch {
+              console.log('Wallet:    (not initialized)');
+            }
+
+            console.log('─'.repeat(50));
+            break;
+          }
+
+          case 'delete': {
+            if (!profileName) {
+              console.error('Usage: wallet delete <name>');
+              process.exit(1);
+            }
+
+            const config = loadConfig();
+            if (config.currentProfile === profileName) {
+              console.error(`Cannot delete the current profile. Switch to another profile first.`);
+              process.exit(1);
+            }
+
+            if (deleteProfile(profileName)) {
+              console.log(`✓ Deleted profile: ${profileName}`);
+              console.log('Note: Wallet data directory was NOT deleted. Remove manually if needed.');
+            } else {
+              console.error(`Profile "${profileName}" not found.`);
+              process.exit(1);
+            }
+            break;
+          }
+
+          default:
+            console.error('Unknown wallet subcommand:', subCmd);
+            console.log('\nUsage:');
+            console.log('  wallet list              List all profiles');
+            console.log('  wallet use <name>        Switch to profile');
+            console.log('  wallet create <name>     Create new profile');
+            console.log('  wallet current           Show current profile');
+            console.log('  wallet delete <name>     Delete profile');
+            process.exit(1);
         }
         break;
       }
@@ -469,10 +743,14 @@ async function main() {
         if (limited.length === 0) {
           console.log('No transactions found.');
         } else {
+          const registry = TokenRegistry.getInstance();
           for (const tx of limited) {
             const date = new Date(tx.timestamp).toLocaleString();
             const direction = tx.type === 'SENT' ? '→' : '←';
-            const amount = toHumanReadable(tx.amount?.toString() || '0');
+            // Look up decimals from registry, default to 8
+            const coinDef = registry.getDefinition(tx.coinId);
+            const decimals = coinDef?.decimals ?? 8;
+            const amount = toHumanReadable(tx.amount?.toString() || '0', decimals);
             console.log(`${date} ${direction} ${amount} ${tx.symbol}`);
             const counterparty = tx.type === 'SENT' ? tx.recipientNametag : tx.senderPubkey;
             console.log(`  ${tx.type === 'SENT' ? 'To' : 'From'}: ${counterparty || 'unknown'}`);
@@ -546,6 +824,50 @@ async function main() {
         } else {
           console.log('\nNo nametag registered.');
           console.log('Register one with: npm run cli -- nametag <name>');
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'nametag-sync': {
+        // Force re-publish nametag binding with chainPubkey
+        // Useful for legacy nametags that were registered without chainPubkey
+        const sphere = await getSphere();
+        const identity = sphere.identity;
+
+        if (!identity?.nametag) {
+          console.error('\nNo nametag to sync.');
+          console.error('Register one first with: npm run cli -- nametag <name>');
+          process.exit(1);
+        }
+
+        console.log(`\nRe-publishing nametag @${identity.nametag} with chainPubkey...`);
+
+        // Get transport provider and force re-register
+        const transport = (sphere as unknown as { _transport?: { registerNametag?: (n: string, pk: string, da: string) => Promise<boolean> } })._transport;
+        if (!transport?.registerNametag) {
+          console.error('Transport provider does not support nametag registration');
+          process.exit(1);
+        }
+
+        try {
+          const success = await transport.registerNametag(
+            identity.nametag,
+            identity.chainPubkey,
+            identity.directAddress || ''
+          );
+
+          if (success) {
+            console.log(`\n✓ Nametag @${identity.nametag} synced successfully!`);
+            console.log(`  chainPubkey: ${identity.chainPubkey.slice(0, 16)}...`);
+          } else {
+            console.error('\n✗ Nametag sync failed. The nametag may be taken by another pubkey.');
+            process.exit(1);
+          }
+        } catch (err) {
+          console.error('\n✗ Sync failed:', err instanceof Error ? err.message : err);
+          process.exit(1);
         }
 
         await closeSphere();
