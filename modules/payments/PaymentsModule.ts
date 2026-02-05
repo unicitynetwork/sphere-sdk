@@ -318,7 +318,7 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 // =============================================================================
 
 /**
- * Extract token ID from sdkData/jsonData
+ * Extract token ID (genesis tokenId) from sdkData/jsonData
  */
 function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
   if (!sdkData) return null;
@@ -359,25 +359,54 @@ function extractStateHashFromSdkData(sdkData: string | undefined): string {
 }
 
 /**
- * Check if two tokens are the same (by genesis tokenId)
+ * Create composite key from tokenId and stateHash
+ * Format: {tokenId}_{stateHash}
+ * This uniquely identifies a token at a specific state
  */
-function isSameToken(t1: Token, t2: Token): boolean {
-  if (t1.id === t2.id) return true;
+function createTokenStateKey(tokenId: string, stateHash: string): string {
+  return `${tokenId}_${stateHash}`;
+}
 
+/**
+ * Extract composite key (tokenId_stateHash) from token
+ * Returns null if token doesn't have valid tokenId and stateHash
+ */
+function extractTokenStateKey(token: Token): string | null {
+  const tokenId = extractTokenIdFromSdkData(token.sdkData);
+  const stateHash = extractStateHashFromSdkData(token.sdkData);
+  if (!tokenId || !stateHash) return null;
+  return createTokenStateKey(tokenId, stateHash);
+}
+
+/**
+ * Check if two tokens have the same genesis tokenId (same token, possibly different states)
+ */
+function hasSameGenesisTokenId(t1: Token, t2: Token): boolean {
   const id1 = extractTokenIdFromSdkData(t1.sdkData);
   const id2 = extractTokenIdFromSdkData(t2.sdkData);
-
   return !!(id1 && id2 && id1 === id2);
 }
 
 /**
- * Create tombstone from token
+ * Check if two tokens are exactly the same (same tokenId AND same stateHash)
+ */
+function isSameTokenState(t1: Token, t2: Token): boolean {
+  const key1 = extractTokenStateKey(t1);
+  const key2 = extractTokenStateKey(t2);
+  return !!(key1 && key2 && key1 === key2);
+}
+
+/**
+ * Create tombstone from token - requires valid tokenId and stateHash
  */
 function createTombstoneFromToken(token: Token): TombstoneEntry | null {
   const tokenId = extractTokenIdFromSdkData(token.sdkData);
-  if (!tokenId) return null;
-
   const stateHash = extractStateHashFromSdkData(token.sdkData);
+
+  // Both tokenId and stateHash are required for a valid tombstone
+  if (!tokenId || !stateHash) {
+    return null;
+  }
 
   return {
     tokenId,
@@ -1762,60 +1791,74 @@ export class PaymentsModule {
 
   /**
    * Add a token
-   * @returns false if duplicate
+   * Tokens are uniquely identified by (tokenId, stateHash) composite key.
+   * Multiple historic states of the same token can coexist.
+   * @returns false if exact duplicate (same tokenId AND same stateHash)
    */
   async addToken(token: Token, skipHistory: boolean = false): Promise<boolean> {
     this.ensureInitialized();
 
-    // Check for duplicates by genesis tokenId
     const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
     const incomingStateHash = extractStateHashFromSdkData(token.sdkData);
+    const incomingStateKey = incomingTokenId && incomingStateHash
+      ? createTokenStateKey(incomingTokenId, incomingStateHash)
+      : null;
 
-    for (const [existingId, existing] of this.tokens) {
-      if (isSameToken(existing, token)) {
-        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
-
-        // CASE 1: Existing token is spent/invalid - allow replacement regardless of state hash
-        // This handles "token sent away and returned" case
-        if (existing.status === 'spent' || existing.status === 'invalid') {
-          this.log(`Replacing spent/invalid token ${existingId.slice(0, 8)}... with incoming token`);
-          this.tokens.delete(existingId);
-          this.tokens.set(token.id, token);
-          break;
+    // Check for exact duplicate (same tokenId AND same stateHash)
+    if (incomingStateKey) {
+      for (const [existingId, existing] of this.tokens) {
+        if (isSameTokenState(existing, token)) {
+          // Exact duplicate - same tokenId and same stateHash
+          this.log(`Duplicate token state ignored: ${incomingTokenId?.slice(0, 8)}..._${incomingStateHash?.slice(0, 8)}...`);
+          return false;
         }
-
-        // CASE 2: Different token IDs (internal .id, not genesis tokenId) - this is new state
-        // The .id property changes with each state transition
-        if (existingId !== token.id) {
-          // If we have state hashes, verify they're different
-          if (incomingStateHash && existingStateHash) {
-            if (incomingStateHash !== existingStateHash) {
-              this.log(`Token ${incomingTokenId?.slice(0, 8)}... state updated, replacing`);
-              this.tokens.delete(existingId);
-              this.tokens.set(token.id, token);
-              break;
-            }
-          } else {
-            // No state hashes available - use .id difference as heuristic
-            // Different .id suggests different state, so allow replacement
-            this.log(`Token ${incomingTokenId?.slice(0, 8)}... .id changed, replacing`);
-            this.tokens.delete(existingId);
-            this.tokens.set(token.id, token);
-            break;
-          }
-        }
-
-        // CASE 3: Same tokenId AND same .id - true duplicate
-        return false;
       }
     }
 
-    // No duplicate found or replaced spent token - add as new
-    if (!this.tokens.has(token.id)) {
-      this.tokens.set(token.id, token);
+    // Check for older states of the same token (same tokenId, different stateHash)
+    // Replace older states with the new state
+    for (const [existingId, existing] of this.tokens) {
+      if (hasSameGenesisTokenId(existing, token)) {
+        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
+
+        // Skip if same state (already handled above)
+        if (incomingStateHash && existingStateHash && incomingStateHash === existingStateHash) {
+          continue;
+        }
+
+        // CASE 1: Existing token is spent/invalid - allow replacement
+        if (existing.status === 'spent' || existing.status === 'invalid') {
+          this.log(`Replacing spent/invalid token ${incomingTokenId?.slice(0, 8)}...`);
+          this.tokens.delete(existingId);
+          break;
+        }
+
+        // CASE 2: Different stateHash - this is a newer state of the token
+        // Remove old state (it will be archived) and add new state
+        if (incomingStateHash && existingStateHash && incomingStateHash !== existingStateHash) {
+          this.log(`Token ${incomingTokenId?.slice(0, 8)}... state updated: ${existingStateHash.slice(0, 8)}... -> ${incomingStateHash.slice(0, 8)}...`);
+          // Archive old state before removing
+          await this.archiveToken(existing);
+          this.tokens.delete(existingId);
+          break;
+        }
+
+        // CASE 3: No state hashes available - use .id as heuristic
+        if (!incomingStateHash || !existingStateHash) {
+          if (existingId !== token.id) {
+            this.log(`Token ${incomingTokenId?.slice(0, 8)}... .id changed, replacing`);
+            await this.archiveToken(existing);
+            this.tokens.delete(existingId);
+            break;
+          }
+        }
+      }
     }
 
-    // Archive the token
+    // Add the new token state
+    this.tokens.set(token.id, token);
+
+    // Archive the token (for recovery purposes)
     await this.archiveToken(token);
 
     // Add to transaction history
@@ -2008,7 +2051,7 @@ export class PaymentsModule {
     // Archive before removing
     await this.archiveToken(token);
 
-    // Create tombstone
+    // Create tombstone with exact (tokenId, stateHash) - requires both
     const tombstone = createTombstoneFromToken(token);
     if (tombstone) {
       const alreadyTombstoned = this.tombstones.some(
@@ -2016,8 +2059,12 @@ export class PaymentsModule {
       );
       if (!alreadyTombstoned) {
         this.tombstones.push(tombstone);
-        this.log(`Created tombstone for ${tombstone.tokenId.slice(0, 8)}...`);
+        this.log(`Created tombstone for ${tombstone.tokenId.slice(0, 8)}..._${tombstone.stateHash.slice(0, 8)}...`);
       }
+    } else {
+      // No valid tombstone could be created (missing tokenId or stateHash)
+      // Token will still be removed but may be re-synced later
+      this.log(`Warning: Could not create tombstone for token ${tokenId.slice(0, 8)}... (missing tokenId or stateHash)`);
     }
 
     // Remove from active tokens
@@ -2056,13 +2103,6 @@ export class PaymentsModule {
     return this.tombstones.some(
       t => t.tokenId === tokenId && t.stateHash === stateHash
     );
-  }
-
-  /**
-   * Check if any state of this token is tombstoned (for when state hash unavailable)
-   */
-  isTokenIdTombstoned(tokenId: string): boolean {
-    return this.tombstones.some(t => t.tokenId === tokenId);
   }
 
   /**
