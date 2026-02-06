@@ -215,8 +215,16 @@ export class InstantSplitProcessor {
         if (bundle.nametagTokenJson) {
           try {
             const nametagToken = await Token.fromJSON(JSON.parse(bundle.nametagTokenJson));
-            nametagTokens = [nametagToken];
-            console.log('[InstantSplitProcessor] Using nametag token from bundle');
+            // Validate PROXY address matches nametag token
+            const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+            const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
+            if (proxy.address !== recipientAddressStr) {
+              console.warn('[InstantSplitProcessor] Nametag PROXY address mismatch, ignoring bundle token');
+              // Fall through to callback path
+            } else {
+              nametagTokens = [nametagToken];
+              console.log('[InstantSplitProcessor] Using nametag token from bundle (address validated)');
+            }
           } catch (err) {
             console.warn('[InstantSplitProcessor] Failed to parse nametag token from bundle:', err);
           }

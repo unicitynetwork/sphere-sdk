@@ -1208,11 +1208,17 @@ export class PaymentsModule {
         signingService,
         senderPubkey,
         {
-          findNametagToken: async (_proxyAddress: string) => {
-            // Return nametag token if available
+          findNametagToken: async (proxyAddress: string) => {
             if (this.nametag?.token) {
               try {
-                return await SdkToken.fromJSON(this.nametag.token);
+                const nametagToken = await SdkToken.fromJSON(this.nametag.token);
+                const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+                const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
+                if (proxy.address === proxyAddress) {
+                  return nametagToken;
+                }
+                this.log(`Nametag PROXY address mismatch: ${proxy.address} !== ${proxyAddress}`);
+                return null;
               } catch (err) {
                 this.log('Failed to parse nametag token:', err);
                 return null;
@@ -3034,6 +3040,63 @@ export class PaymentsModule {
   }
 
   /**
+   * Shared finalization logic for received transfers.
+   * Handles both PROXY (with nametag token + address validation) and DIRECT schemes.
+   */
+  private async finalizeTransferToken(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sourceToken: SdkToken<any>,
+    transferTx: TransferTransaction,
+    stClient: StateTransitionClient,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    trustBase: any
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): Promise<SdkToken<any>> {
+    const recipientAddress = transferTx.data.recipient;
+    const addressScheme = recipientAddress.scheme;
+    const signingService = await this.createSigningService();
+    const transferSalt = transferTx.data.salt;
+
+    const recipientPredicate = await UnmaskedPredicate.create(
+      sourceToken.id,
+      sourceToken.type,
+      signingService,
+      HashAlgorithm.SHA256,
+      transferSalt
+    );
+    const recipientState = new TokenState(recipientPredicate, null);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let nametagTokens: SdkToken<any>[] = [];
+
+    if (addressScheme === AddressScheme.PROXY) {
+      // PROXY: Validate nametag address match (per reference impl)
+      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+      if (!this.nametag?.token) {
+        throw new Error('Cannot finalize PROXY transfer - no nametag token');
+      }
+      const nametagToken = await SdkToken.fromJSON(this.nametag.token);
+      const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
+      if (proxy.address !== recipientAddress.address) {
+        throw new Error(
+          `PROXY address mismatch: nametag resolves to ${proxy.address} ` +
+          `but transfer targets ${recipientAddress.address}`
+        );
+      }
+      nametagTokens = [nametagToken];
+    }
+    // DIRECT: nametagTokens stays empty []
+
+    return stClient.finalizeTransaction(
+      trustBase,
+      sourceToken,
+      recipientState,
+      transferTx,
+      nametagTokens
+    );
+  }
+
+  /**
    * Finalize a received token after proof is available
    */
   private async finalizeReceivedToken(
@@ -3079,67 +3142,10 @@ export class PaymentsModule {
         return;
       }
 
-      // Check address scheme for finalization
-      const recipientAddress = transferTx.data.recipient;
-      const addressScheme = recipientAddress.scheme;
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let finalizedSdkToken: SdkToken<any>;
-
-      if (addressScheme === AddressScheme.PROXY) {
-        // PROXY address - finalize with nametag token
-        if (!this.nametag?.token) {
-          console.error('[Payments] Cannot finalize PROXY transfer - no nametag token');
-          token.status = 'invalid';
-          token.updatedAt = Date.now();
-          await this.save();
-          return;
-        }
-
-        const nametagToken = await SdkToken.fromJSON(this.nametag.token);
-        const signingService = await this.createSigningService();
-        const transferSalt = transferTx.data.salt;
-
-        const recipientPredicate = await UnmaskedPredicate.create(
-          sourceToken.id,
-          sourceToken.type,
-          signingService,
-          HashAlgorithm.SHA256,
-          transferSalt
-        );
-
-        const recipientState = new TokenState(recipientPredicate, null);
-
-        finalizedSdkToken = await stClient.finalizeTransaction(
-          trustBase,
-          sourceToken,
-          recipientState,
-          transferTx,
-          [nametagToken]
-        );
-      } else {
-        // DIRECT address - finalize without nametag
-        const signingService = await this.createSigningService();
-        const transferSalt = transferTx.data.salt;
-
-        const recipientPredicate = await UnmaskedPredicate.create(
-          sourceToken.id,
-          sourceToken.type,
-          signingService,
-          HashAlgorithm.SHA256,
-          transferSalt
-        );
-
-        const recipientState = new TokenState(recipientPredicate, null);
-
-        finalizedSdkToken = await stClient.finalizeTransaction(
-          trustBase,
-          sourceToken,
-          recipientState,
-          transferTx,
-          []
-        );
-      }
+      // Finalize using shared helper (handles PROXY address validation)
+      const finalizedSdkToken = await this.finalizeTransferToken(
+        sourceToken, transferTx, stClient, trustBase
+      );
 
       // Update token with finalized data (create new token with updated sdkData)
       const finalizedToken: Token = {
@@ -3303,105 +3309,22 @@ export class PaymentsModule {
           return;
         }
 
-        // Check if this is a PROXY address transfer (needs finalization)
-        const recipientAddress = transferTx.data.recipient;
-        const addressScheme = recipientAddress.scheme;
-
-        if (addressScheme === AddressScheme.PROXY) {
-          // Need to finalize with nametag token
-          console.log('[Payments] PROXY address detected - attempting finalization...');
-          console.log(`[Payments] PROXY nametag: ${this.nametag?.name}, has token: ${!!this.nametag?.token}`);
-          if (!this.nametag?.token) {
-            console.error('[Payments] Cannot finalize PROXY transfer - no nametag token. Token rejected.');
-            return; // Reject token - cannot spend without finalization
+        // Finalize using shared helper (handles PROXY address validation)
+        try {
+          const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+          if (!stClient || !trustBase) {
+            console.error('[Payments] Cannot finalize - missing state transition client or trust base. Token rejected.');
+            return;
           }
-          {
-            try {
-              console.log('[Payments] Parsing nametag token...');
-              const nametagToken = await SdkToken.fromJSON(this.nametag.token);
-              console.log('[Payments] Creating signing service...');
-              const signingService = await this.createSigningService();
-              const transferSalt = transferTx.data.salt;
-
-              console.log('[Payments] Creating recipient predicate...');
-              const recipientPredicate = await UnmaskedPredicate.create(
-                sourceToken.id,
-                sourceToken.type,
-                signingService,
-                HashAlgorithm.SHA256,
-                transferSalt
-              );
-
-              const recipientState = new TokenState(recipientPredicate, null);
-
-              const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-
-              if (!stClient || !trustBase) {
-                console.error('[Payments] Cannot finalize - missing state transition client or trust base. Token rejected.');
-                return; // Reject token - cannot spend without finalization
-              }
-
-              console.log('[Payments] Calling finalizeTransaction...');
-              finalizedSdkToken = await stClient.finalizeTransaction(
-                trustBase,
-                sourceToken,
-                recipientState,
-                transferTx,
-                [nametagToken]
-              );
-              tokenData = finalizedSdkToken.toJSON();
-              console.log('[Payments] PROXY finalization SUCCESSFUL');
-            } catch (finalizeError) {
-              console.error('[Payments] PROXY finalization FAILED:', finalizeError);
-              return; // Reject token - cannot spend without finalization
-            }
-          }
-        } else {
-          // Direct address - finalize to generate local state for tracking
-          // The directAddress stored in nametag events is derived using SigningService.createFromSecret,
-          // so finalization will work when recipient uses the same derivation method
-          console.log('[Payments] Finalizing DIRECT address transfer...');
-          try {
-            const signingService = await this.createSigningService();
-            const transferSalt = transferTx.data.salt;
-
-            const recipientPredicate = await UnmaskedPredicate.create(
-              sourceToken.id,
-              sourceToken.type,
-              signingService,
-              HashAlgorithm.SHA256,
-              transferSalt
-            );
-
-            const recipientState = new TokenState(recipientPredicate, null);
-
-            const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-
-            if (!stClient || !trustBase) {
-              console.error('[Payments] Cannot finalize DIRECT transfer - missing client, token rejected.');
-              return; // Reject token - cannot finalize without client
-            } else {
-              finalizedSdkToken = await stClient.finalizeTransaction(
-                trustBase,
-                sourceToken,
-                recipientState,
-                transferTx,
-                []  // No nametag tokens needed for DIRECT
-              );
-              tokenData = finalizedSdkToken.toJSON();
-              this.log('DIRECT transfer finalized successfully');
-            }
-          } catch (finalizeError) {
-            // CRITICAL: If finalization fails, the token is unspendable - reject it
-            console.error('[Payments] DIRECT finalization FAILED - token would be unspendable, rejecting:', finalizeError);
-            console.error('[Payments] This usually means the sender used a different DirectAddress than expected.');
-            console.error('[Payments] Token rejected to prevent unspendable balance.');
-            return; // Reject token - cannot spend without finalization
-          }
+          finalizedSdkToken = await this.finalizeTransferToken(sourceToken, transferTx, stClient, trustBase);
+          tokenData = finalizedSdkToken.toJSON();
+          const addressScheme = transferTx.data.recipient.scheme;
+          this.log(`${addressScheme === AddressScheme.PROXY ? 'PROXY' : 'DIRECT'} finalization successful`);
+        } catch (finalizeError) {
+          console.error(`[Payments] Finalization FAILED - token rejected:`, finalizeError);
+          return;
         }
       } else if (payload.token) {
         // SDK format
