@@ -2732,21 +2732,9 @@ export class PaymentsModule {
    * Detect if a string is an L3 address (not a nametag)
    * Returns true for: hex pubkeys (64+ chars), PROXY:, DIRECT: prefixed addresses
    */
-  private isL3Address(value: string): boolean {
-    // PROXY: or DIRECT: prefixed addresses
-    if (value.startsWith('PROXY:') || value.startsWith('DIRECT:')) {
-      return true;
-    }
-    // Hex pubkey (64+ hex chars)
-    if (value.length >= 64 && /^[0-9a-fA-F]+$/.test(value)) {
-      return true;
-    }
-    return false;
-  }
-
   /**
-   * Resolve recipient to Nostr pubkey for messaging
-   * Supports: nametag (with or without @), hex pubkey
+   * Resolve recipient to Nostr transport pubkey for messaging.
+   * Supports: @nametag, DIRECT://, PROXY://, hex pubkey (64/66 chars), bare nametag.
    */
   private async resolveRecipient(recipient: string): Promise<string> {
     // Explicit nametag with @
@@ -2759,8 +2747,28 @@ export class PaymentsModule {
       return pubkey;
     }
 
-    // If it looks like an L3 address, return as-is (it's a pubkey)
-    if (this.isL3Address(recipient)) {
+    // DIRECT:// or PROXY:// address — reverse lookup to find transport pubkey
+    if (recipient.startsWith('DIRECT:') || recipient.startsWith('PROXY:')) {
+      if (this.deps?.transport.resolveAddressInfo) {
+        const info = await this.deps.transport.resolveAddressInfo(recipient);
+        if (info?.transportPubkey) {
+          this.log(`Resolved address "${recipient.slice(0, 20)}..." to transport pubkey`);
+          return info.transportPubkey;
+        }
+      }
+      throw new Error(
+        `Cannot resolve recipient for address "${recipient.slice(0, 30)}...". ` +
+        `No binding event found. The recipient must register their nametag first, ` +
+        `or use @nametag format instead.`
+      );
+    }
+
+    // Hex pubkey (64+ hex chars) — use as transport pubkey directly
+    if (recipient.length >= 64 && /^[0-9a-fA-F]+$/.test(recipient)) {
+      // 66-char with 02/03 prefix — strip to 32-byte x-only
+      if (recipient.length === 66 && (recipient.startsWith('02') || recipient.startsWith('03'))) {
+        return recipient.slice(2);
+      }
       return recipient;
     }
 

@@ -56,6 +56,14 @@ export interface TransportProvider extends BaseProvider {
   resolveNametagInfo?(nametag: string): Promise<NametagInfo | null>;
 
   /**
+   * Resolve a DIRECT:// or PROXY:// address to full nametag info.
+   * Performs reverse lookup: address → binding event → NametagInfo.
+   * @param address - L3 address (DIRECT://... or PROXY://...)
+   * @returns NametagInfo or null if no binding found for this address
+   */
+  resolveAddressInfo?(address: string): Promise<NametagInfo | null>;
+
+  /**
    * Recover nametag for current identity by decrypting stored encrypted nametag
    * Used after wallet import to recover associated nametag
    * @returns Decrypted nametag or null if none found

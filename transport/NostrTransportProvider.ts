@@ -80,6 +80,21 @@ export interface NostrTransportProviderConfig {
 const EVENT_KINDS = NOSTR_EVENT_KINDS;
 
 // =============================================================================
+// Address Hashing Utility
+// =============================================================================
+
+/**
+ * Hash an address (DIRECT:// or PROXY://) for use as indexed 't' tag value.
+ * Enables reverse lookup: address → binding event → transport pubkey.
+ * @param address - Address string (e.g., DIRECT://... or PROXY://...)
+ * @returns Hex-encoded SHA-256 hash
+ */
+function hashAddressForTag(address: string): string {
+  const bytes = new TextEncoder().encode('unicity:address:' + address);
+  return Buffer.from(sha256Noble(bytes)).toString('hex');
+}
+
+// =============================================================================
 // Nametag Encryption Utilities
 // =============================================================================
 
@@ -779,6 +794,52 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   /**
+   * Resolve a DIRECT:// or PROXY:// address to full nametag info.
+   * Performs reverse lookup: hash(address) → query '#t' tag → parse binding event.
+   * Requires the binding event to have been published with address 't' tags
+   * (via sphere-sdk registerNametag which adds indexed address hashes).
+   */
+  async resolveAddressInfo(address: string): Promise<NametagInfo | null> {
+    this.ensureReady();
+
+    const addressHash = hashAddressForTag(address);
+
+    const events = await this.queryEvents({
+      kinds: [EVENT_KINDS.NAMETAG_BINDING],
+      '#t': [addressHash],
+      limit: 1,
+    });
+
+    if (events.length === 0) return null;
+
+    const bindingEvent = events[0];
+
+    try {
+      const content = JSON.parse(bindingEvent.content);
+
+      return {
+        nametag: '',
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: content.public_key || '',
+        l1Address: content.l1_address || '',
+        directAddress: content.direct_address || '',
+        proxyAddress: content.proxy_address || '',
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    } catch {
+      return {
+        nametag: '',
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: '',
+        l1Address: '',
+        directAddress: '',
+        proxyAddress: '',
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    }
+  }
+
+  /**
    * Recover nametag for the current identity by searching for encrypted nametag events
    * Used after wallet import to recover associated nametag
    * @returns Decrypted nametag or null if none found
@@ -879,6 +940,11 @@ export class NostrTransportProvider implements TransportProvider {
     const l1Address = publicKeyToAddress(compressedPubkey, 'alpha'); // alpha1...
     const encryptedNametag = await encryptNametag(nametag, privateKeyHex);
 
+    // Compute PROXY address for reverse lookup
+    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+    const proxyAddr = await ProxyAddress.fromNameTag(nametag);
+    const proxyAddress = proxyAddr.toString();
+
     // Publish nametag binding with extended info
     const hashedNametag = hashNametag(nametag);
     const content = JSON.stringify({
@@ -890,17 +956,22 @@ export class NostrTransportProvider implements TransportProvider {
       public_key: compressedPubkey,
       l1_address: l1Address,
       direct_address: directAddress,
+      proxy_address: proxyAddress,
     });
 
-    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, [
+    // Build tags with indexed 't' tags for reverse lookup by nametag and address
+    const tags: string[][] = [
       ['d', hashedNametag],
       ['nametag', hashedNametag],
       ['t', hashedNametag],
+      ['t', hashAddressForTag(directAddress)],
+      ['t', hashAddressForTag(proxyAddress)],
       ['address', nostrPubkey],
-      // Extended tags for indexing
       ['pubkey', compressedPubkey],
       ['l1', l1Address],
-    ]);
+    ];
+
+    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, tags);
 
     await this.publishEvent(event);
     this.log('Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...', 'l1:', l1Address.slice(0, 12) + '...');
