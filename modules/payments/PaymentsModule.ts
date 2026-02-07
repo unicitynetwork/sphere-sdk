@@ -2717,7 +2717,12 @@ export class PaymentsModule {
     this.tombstones = parsed.tombstones;
     this.archivedTokens = parsed.archivedTokens;
     this.forkedTokens = parsed.forkedTokens;
-    this.nametag = parsed.nametag;
+    // Only overwrite nametag if TXF data explicitly includes one.
+    // Nametag is stored separately as nametag-{name} files (not in TXF),
+    // so parsed.nametag is normally null and must not erase the existing value.
+    if (parsed.nametag !== null) {
+      this.nametag = parsed.nametag;
+    }
   }
 
   // ===========================================================================

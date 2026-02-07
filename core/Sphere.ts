@@ -502,6 +502,22 @@ export class Sphere {
     sphere._initialized = true;
     Sphere.instance = sphere;
 
+    // If nametag name exists but token is missing, try to mint it.
+    // This handles the case where the token was lost from IndexedDB.
+    if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
+      console.log(`[Sphere] Nametag @${sphere._identity.nametag} has no token, attempting to mint...`);
+      try {
+        const result = await sphere.mintNametag(sphere._identity.nametag);
+        if (result.success) {
+          console.log(`[Sphere] Nametag token minted successfully on load`);
+        } else {
+          console.warn(`[Sphere] Could not mint nametag token: ${result.error}`);
+        }
+      } catch (err) {
+        console.warn(`[Sphere] Nametag token mint failed:`, err);
+      }
+    }
+
     return sphere;
   }
 
