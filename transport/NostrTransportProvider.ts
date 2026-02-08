@@ -191,6 +191,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   // Event handlers
   private messageHandlers: Set<MessageHandler> = new Set();
+  private pendingMessages: IncomingMessage[] = [];  // buffer for messages arriving before handlers register
   private transferHandlers: Set<TokenTransferHandler> = new Set();
   private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
   private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
@@ -514,6 +515,21 @@ export class NostrTransportProvider implements TransportProvider {
 
   onMessage(handler: MessageHandler): () => void {
     this.messageHandlers.add(handler);
+
+    // Flush any messages that arrived before this handler was registered
+    if (this.pendingMessages.length > 0) {
+      const pending = this.pendingMessages;
+      this.pendingMessages = [];
+      this.log('Flushing', pending.length, 'buffered messages to new handler');
+      for (const message of pending) {
+        try {
+          handler(message);
+        } catch (error) {
+          this.log('Message handler error (buffered):', error);
+        }
+      }
+    }
+
     return () => this.messageHandlers.delete(handler);
   }
 
@@ -1041,12 +1057,17 @@ export class NostrTransportProvider implements TransportProvider {
 
       this.emitEvent({ type: 'message:received', timestamp: Date.now() });
 
-      this.log('Dispatching to', this.messageHandlers.size, 'handlers');
-      for (const handler of this.messageHandlers) {
-        try {
-          handler(message);
-        } catch (error) {
-          this.log('Message handler error:', error);
+      if (this.messageHandlers.size === 0) {
+        this.log('No message handlers registered, buffering message for later delivery');
+        this.pendingMessages.push(message);
+      } else {
+        this.log('Dispatching to', this.messageHandlers.size, 'handlers');
+        for (const handler of this.messageHandlers) {
+          try {
+            handler(message);
+          } catch (error) {
+            this.log('Message handler error:', error);
+          }
         }
       }
     } catch (err) {
