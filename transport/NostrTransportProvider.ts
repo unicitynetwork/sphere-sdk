@@ -4,7 +4,8 @@
  *
  * Uses @unicitylabs/nostr-js-sdk for:
  * - Real secp256k1 event signing
- * - NIP-04 encryption/decryption
+ * - NIP-04 encryption/decryption (legacy)
+ * - NIP-44 encryption/decryption (NIP-17 private DMs)
  * - Event ID calculation
  *
  * WebSocket is injected via factory for cross-platform support
@@ -14,6 +15,7 @@ import { Buffer } from 'buffer';
 import {
   NostrKeyManager,
   NIP04,
+  NIP44,
   Event as NostrEventClass,
   hashNametag,
 } from '@unicitylabs/nostr-js-sdk';
@@ -325,15 +327,72 @@ export class NostrTransportProvider implements TransportProvider {
 
   async sendMessage(recipientPubkey: string, content: string): Promise<string> {
     this.ensureReady();
+    if (!this.keyManager) throw new Error('KeyManager not initialized');
 
-    // Create NIP-04 encrypted DM event
-    const event = await this.createEncryptedEvent(
-      EVENT_KINDS.DIRECT_MESSAGE,
+    const myPubkey = this.keyManager.getPublicKeyHex();
+    const myPrivKeyHex = this.keyManager.getPrivateKeyHex();
+    const now = Math.floor(Date.now() / 1000);
+
+    // 1. Build rumor (kind 14, unsigned)
+    const rumor = {
+      pubkey: myPubkey,
+      created_at: now,
+      kind: 14,
+      tags: [['p', recipientPubkey]],
       content,
-      [['p', recipientPubkey]]
+    };
+
+    // 2. NIP-44 encrypt rumor → seal content
+    const encryptedRumor = NIP44.encryptHex(
+      JSON.stringify(rumor),
+      myPrivKeyHex,
+      recipientPubkey
     );
 
-    await this.publishEvent(event);
+    // 3. Build and sign seal (kind 13) with random timestamp offset for privacy
+    const sealCreatedAt = now - Math.floor(Math.random() * 172800);
+    const sealEvent = NostrEventClass.create(this.keyManager, {
+      kind: 13,
+      tags: [],
+      content: encryptedRumor,
+      created_at: sealCreatedAt,
+    });
+
+    // 4. Generate ephemeral keypair for gift wrap
+    const ephemeralKeys = NostrKeyManager.generate();
+    const ephemeralPrivKeyHex = ephemeralKeys.getPrivateKeyHex();
+
+    // 5. NIP-44 encrypt seal with ephemeral key
+    const encryptedSeal = NIP44.encryptHex(
+      JSON.stringify(sealEvent.toJSON()),
+      ephemeralPrivKeyHex,
+      recipientPubkey
+    );
+
+    // 6. Build and sign gift wrap (kind 1059) with ephemeral key
+    const wrapCreatedAt = now - Math.floor(Math.random() * 172800);
+    const wrapEvent = NostrEventClass.create(ephemeralKeys, {
+      kind: 1059,
+      tags: [['p', recipientPubkey]],
+      content: encryptedSeal,
+      created_at: wrapCreatedAt,
+    });
+
+    // Clean up ephemeral key
+    ephemeralKeys.clear();
+
+    // 7. Publish gift wrap
+    const giftWrap: NostrEvent = {
+      id: wrapEvent.id,
+      kind: wrapEvent.kind,
+      content: wrapEvent.content,
+      tags: wrapEvent.tags,
+      pubkey: wrapEvent.pubkey,
+      created_at: wrapEvent.created_at,
+      sig: wrapEvent.sig,
+    };
+
+    await this.publishEvent(giftWrap);
 
     this.emitEvent({
       type: 'message:sent',
@@ -341,7 +400,7 @@ export class NostrTransportProvider implements TransportProvider {
       data: { recipient: recipientPubkey },
     });
 
-    return event.id;
+    return giftWrap.id;
   }
 
   onMessage(handler: MessageHandler): () => void {
@@ -706,6 +765,9 @@ export class NostrTransportProvider implements TransportProvider {
         case EVENT_KINDS.DIRECT_MESSAGE:
           await this.handleDirectMessage(event);
           break;
+        case 1059: // NIP-17 gift wrap
+          await this.handleGiftWrap(event);
+          break;
         case EVENT_KINDS.TOKEN_TRANSFER:
           await this.handleTokenTransfer(event);
           break;
@@ -749,6 +811,73 @@ export class NostrTransportProvider implements TransportProvider {
       } catch (error) {
         this.log('Message handler error:', error);
       }
+    }
+  }
+
+  /**
+   * Unwrap a NIP-17 gift-wrapped private message (kind 1059).
+   *
+   * 1. NIP-44 decrypt gift wrap content using ephemeral sender pubkey → seal (kind 13)
+   * 2. Verify seal signature
+   * 3. NIP-44 decrypt seal content using seal author pubkey → rumor (kind 14)
+   * 4. Verify seal.pubkey === rumor.pubkey (anti-impersonation)
+   * 5. Dispatch as a normal incoming DM
+   */
+  private async handleGiftWrap(event: NostrEvent): Promise<void> {
+    if (!this.identity || !this.keyManager) return;
+
+    try {
+      const myPrivKeyHex = this.keyManager.getPrivateKeyHex();
+
+      // 1. Decrypt gift wrap → seal
+      const sealJson = NIP44.decryptHex(event.content, myPrivKeyHex, event.pubkey);
+      const seal = JSON.parse(sealJson) as NostrEvent;
+
+      // 2. Verify seal is kind 13
+      if (seal.kind !== 13) {
+        this.log('NIP-17: Seal is not kind 13:', seal.kind);
+        return;
+      }
+
+      // 3. Decrypt seal → rumor
+      const rumorJson = NIP44.decryptHex(seal.content, myPrivKeyHex, seal.pubkey);
+      const rumor = JSON.parse(rumorJson) as NostrEvent;
+
+      // 4. Verify rumor is kind 14
+      if (rumor.kind !== 14) {
+        this.log('NIP-17: Rumor is not kind 14:', rumor.kind);
+        return;
+      }
+
+      // 5. Anti-impersonation: seal pubkey must match rumor pubkey
+      if (seal.pubkey !== rumor.pubkey) {
+        this.log('NIP-17: Seal/rumor pubkey mismatch');
+        return;
+      }
+
+      // Skip our own messages
+      if (rumor.pubkey === this.keyManager.getPublicKeyHex()) return;
+
+      // Dispatch as incoming DM
+      const message: IncomingMessage = {
+        id: event.id,
+        senderPubkey: rumor.pubkey,
+        content: rumor.content,
+        timestamp: rumor.created_at * 1000,
+        encrypted: true,
+      };
+
+      this.emitEvent({ type: 'message:received', timestamp: Date.now() });
+
+      for (const handler of this.messageHandlers) {
+        try {
+          handler(message);
+        } catch (error) {
+          this.log('Message handler error:', error);
+        }
+      }
+    } catch (error) {
+      this.log('NIP-17: Failed to unwrap gift wrap:', error);
     }
   }
 
@@ -1042,6 +1171,7 @@ export class NostrTransportProvider implements TransportProvider {
         EVENT_KINDS.TOKEN_TRANSFER,
         EVENT_KINDS.PAYMENT_REQUEST,
         EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
+        1059, // NIP-17 gift-wrapped private messages
       ],
       '#p': [nostrPubkey],
       since: Math.floor(Date.now() / 1000) - 86400, // Last 24h
