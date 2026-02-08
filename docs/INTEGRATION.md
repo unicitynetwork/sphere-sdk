@@ -30,7 +30,10 @@ The easiest way to set up providers is using the factory functions:
 ```typescript
 // Browser
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
-const providers = createBrowserProviders({ network: 'testnet' });
+const providers = createBrowserProviders({
+  network: 'testnet',
+  price: { platform: 'coingecko' },  // Optional: enables fiat prices
+});
 
 // Node.js
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
@@ -38,6 +41,7 @@ const providers = createNodeProviders({
   network: 'testnet',
   dataDir: './wallet',
   tokensDir: './tokens',
+  price: { platform: 'coingecko', apiKey: 'CG-xxx' },  // Optional
 });
 ```
 
@@ -208,11 +212,20 @@ interface AddressInfo {
 
 ## L3 Payments
 
-### Get Balance
+### Get Balance & Assets
 
 ```typescript
-const balance = await sphere.payments.getBalance();
-// Returns: { total: '1000000', available: '1000000', pending: '0' }
+// Total portfolio value in USD (null if PriceProvider not configured)
+const totalUsd = await sphere.payments.getBalance();
+console.log('Total USD:', totalUsd); // number | null
+
+// Get assets with price data
+const assets = await sphere.payments.getAssets();
+for (const asset of assets) {
+  console.log(`${asset.symbol}: ${asset.totalAmount}`);
+  console.log(`  Price: $${asset.priceUsd ?? 'N/A'}`);
+  console.log(`  Value: $${asset.fiatValueUsd?.toFixed(2) ?? 'N/A'}`);
+}
 ```
 
 ### Get Tokens

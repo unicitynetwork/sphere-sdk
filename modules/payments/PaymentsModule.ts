@@ -14,7 +14,6 @@
 import type {
   Asset,
   Token,
-  TokenBalance,
   TokenStatus,
   TransferRequest,
   TransferResult,
@@ -43,6 +42,7 @@ import type {
   IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
 import type { OracleProvider } from '../../oracle';
+import type { PriceProvider } from '../../price';
 import type {
   PaymentRequest,
   IncomingPaymentRequest,
@@ -499,6 +499,8 @@ export interface PaymentsModuleDependencies {
   chainCode?: string;
   /** Additional L1 addresses to watch */
   l1Addresses?: string[];
+  /** Price provider (optional — enables fiat value display) */
+  price?: PriceProvider;
 }
 
 // =============================================================================
@@ -560,6 +562,9 @@ export class PaymentsModule {
     return this.moduleConfig;
   }
 
+  /** Price provider (optional) */
+  private priceProvider: PriceProvider | null = null;
+
   private log(...args: unknown[]): void {
     if (this.moduleConfig.debug) {
       console.log('[PaymentsModule]', ...args);
@@ -575,6 +580,7 @@ export class PaymentsModule {
    */
   initialize(deps: PaymentsModuleDependencies): void {
     this.deps = deps;
+    this.priceProvider = deps.price ?? null;
 
     // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
     if (this.l1) {
@@ -1321,59 +1327,66 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get balance for coin type
+   * Set or update price provider
    */
-  getBalance(coinId?: string): TokenBalance[] {
-    const balances = new Map<string, TokenBalance>();
-
-    for (const token of this.tokens.values()) {
-      if (token.status !== 'confirmed') continue;
-      if (coinId && token.coinId !== coinId) continue;
-
-      const key = token.coinId;
-      const existing = balances.get(key);
-
-      if (existing) {
-        (existing as { totalAmount: string }).totalAmount = (
-          BigInt(existing.totalAmount) + BigInt(token.amount)
-        ).toString();
-        (existing as { tokenCount: number }).tokenCount++;
-      } else {
-        balances.set(key, {
-          coinId: token.coinId,
-          symbol: token.symbol,
-          name: token.name,
-          totalAmount: token.amount,
-          tokenCount: 1,
-          decimals: 8,
-        });
-      }
-    }
-
-    return Array.from(balances.values());
+  setPriceProvider(provider: PriceProvider): void {
+    this.priceProvider = provider;
   }
 
   /**
-   * Get aggregated assets (tokens grouped by coinId)
+   * Get total portfolio value in USD
+   * Returns null if PriceProvider is not configured
+   */
+  async getBalance(): Promise<number | null> {
+    const assets = await this.getAssets();
+
+    if (!this.priceProvider) {
+      return null;
+    }
+
+    let total = 0;
+    let hasAnyPrice = false;
+
+    for (const asset of assets) {
+      if (asset.fiatValueUsd != null) {
+        total += asset.fiatValueUsd;
+        hasAnyPrice = true;
+      }
+    }
+
+    return hasAnyPrice ? total : null;
+  }
+
+  /**
+   * Get aggregated assets (tokens grouped by coinId) with price data
    * Only includes confirmed tokens
    */
-  getAssets(coinId?: string): Asset[] {
-    const assets = new Map<string, Asset>();
+  async getAssets(coinId?: string): Promise<Asset[]> {
+    // Aggregate tokens by coinId
+    const assetsMap = new Map<string, {
+      coinId: string;
+      symbol: string;
+      name: string;
+      decimals: number;
+      iconUrl?: string;
+      totalAmount: string;
+      tokenCount: number;
+    }>();
 
     for (const token of this.tokens.values()) {
       if (token.status !== 'confirmed') continue;
       if (coinId && token.coinId !== coinId) continue;
 
       const key = token.coinId;
-      const existing = assets.get(key);
+      const existing = assetsMap.get(key);
 
       if (existing) {
-        (existing as { totalAmount: string }).totalAmount = (
+        existing.totalAmount = (
           BigInt(existing.totalAmount) + BigInt(token.amount)
         ).toString();
-        (existing as { tokenCount: number }).tokenCount++;
+        existing.tokenCount++;
       } else {
-        assets.set(key, {
+        assetsMap.set(key, {
           coinId: token.coinId,
           symbol: token.symbol,
           name: token.name,
@@ -1385,7 +1398,76 @@ export class PaymentsModule {
       }
     }
 
-    return Array.from(assets.values());
+    const rawAssets = Array.from(assetsMap.values());
+
+    // Fetch prices if provider is available
+    let priceMap: Map<string, { priceUsd: number; priceEur?: number; change24h?: number }> | null = null;
+
+    if (this.priceProvider && rawAssets.length > 0) {
+      const registry = TokenRegistry.getInstance();
+      const nameToCoins = new Map<string, string[]>(); // tokenName -> coinIds[]
+
+      for (const asset of rawAssets) {
+        const def = registry.getDefinition(asset.coinId);
+        if (def?.name) {
+          const existing = nameToCoins.get(def.name);
+          if (existing) {
+            existing.push(asset.coinId);
+          } else {
+            nameToCoins.set(def.name, [asset.coinId]);
+          }
+        }
+      }
+
+      if (nameToCoins.size > 0) {
+        const tokenNames = Array.from(nameToCoins.keys());
+        const prices = await this.priceProvider.getPrices(tokenNames);
+
+        priceMap = new Map();
+        for (const [name, coinIds] of nameToCoins) {
+          const price = prices.get(name);
+          if (price) {
+            for (const cid of coinIds) {
+              priceMap.set(cid, {
+                priceUsd: price.priceUsd,
+                priceEur: price.priceEur,
+                change24h: price.change24h,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // Build final Asset array with price data
+    return rawAssets.map((raw) => {
+      const price = priceMap?.get(raw.coinId);
+      let fiatValueUsd: number | null = null;
+      let fiatValueEur: number | null = null;
+
+      if (price) {
+        const humanAmount = Number(raw.totalAmount) / Math.pow(10, raw.decimals);
+        fiatValueUsd = humanAmount * price.priceUsd;
+        if (price.priceEur != null) {
+          fiatValueEur = humanAmount * price.priceEur;
+        }
+      }
+
+      return {
+        coinId: raw.coinId,
+        symbol: raw.symbol,
+        name: raw.name,
+        decimals: raw.decimals,
+        iconUrl: raw.iconUrl,
+        totalAmount: raw.totalAmount,
+        tokenCount: raw.tokenCount,
+        priceUsd: price?.priceUsd ?? null,
+        priceEur: price?.priceEur ?? null,
+        change24h: price?.change24h ?? null,
+        fiatValueUsd,
+        fiatValueEur,
+      };
+    });
   }
 
   /**

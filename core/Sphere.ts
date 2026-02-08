@@ -52,6 +52,7 @@ import type {
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
 import type { TransportProvider } from '../transport';
 import type { OracleProvider } from '../oracle';
+import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import {
@@ -123,6 +124,8 @@ export interface SphereCreateOptions {
   oracle: OracleProvider;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /** Optional price provider for fiat conversion */
+  price?: PriceProvider;
   /**
    * Network type (mainnet, testnet, dev) - informational only.
    * Actual network configuration comes from provider URLs.
@@ -143,6 +146,8 @@ export interface SphereLoadOptions {
   oracle: OracleProvider;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /** Optional price provider for fiat conversion */
+  price?: PriceProvider;
   /**
    * Network type (mainnet, testnet, dev) - informational only.
    * Actual network configuration comes from provider URLs.
@@ -177,6 +182,8 @@ export interface SphereImportOptions {
   oracle: OracleProvider;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /** Optional price provider for fiat conversion */
+  price?: PriceProvider;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -209,6 +216,8 @@ export interface SphereInitOptions {
   nametag?: string;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /** Optional price provider for fiat conversion */
+  price?: PriceProvider;
   /**
    * Network type (mainnet, testnet, dev) - informational only.
    * Actual network configuration comes from provider URLs.
@@ -289,6 +298,7 @@ export class Sphere {
   private _tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>> = new Map();
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
+  private _priceProvider: PriceProvider | null;
 
   // Modules
   private _payments: PaymentsModule;
@@ -306,11 +316,13 @@ export class Sphere {
     transport: TransportProvider,
     oracle: OracleProvider,
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>,
-    l1Config?: L1Config
+    l1Config?: L1Config,
+    priceProvider?: PriceProvider,
   ) {
     this._storage = storage;
     this._transport = transport;
     this._oracle = oracle;
+    this._priceProvider = priceProvider ?? null;
 
     // Initialize token storage providers map
     if (tokenStorage) {
@@ -385,6 +397,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         l1: options.l1,
+        price: options.price,
       });
       return { sphere, created: false };
     }
@@ -415,6 +428,7 @@ export class Sphere {
       derivationPath: options.derivationPath,
       nametag: options.nametag,
       l1: options.l1,
+      price: options.price,
     });
 
     return { sphere, created: true, generatedMnemonic };
@@ -439,7 +453,8 @@ export class Sphere {
       options.transport,
       options.oracle,
       options.tokenStorage,
-      options.l1
+      options.l1,
+      options.price,
     );
 
     // Store encrypted mnemonic
@@ -484,7 +499,8 @@ export class Sphere {
       options.transport,
       options.oracle,
       options.tokenStorage,
-      options.l1
+      options.l1,
+      options.price,
     );
 
     // Load identity from storage
@@ -519,7 +535,8 @@ export class Sphere {
       options.transport,
       options.oracle,
       options.tokenStorage,
-      options.l1
+      options.l1,
+      options.price,
     );
 
     if (options.mnemonic) {
@@ -757,6 +774,14 @@ export class Sphere {
    */
   hasTokenStorageProvider(providerId: string): boolean {
     return this._tokenStorageProviders.has(providerId);
+  }
+
+  /**
+   * Set or update the price provider after initialization
+   */
+  setPriceProvider(provider: PriceProvider): void {
+    this._priceProvider = provider;
+    this._payments.setPriceProvider(provider);
   }
 
   getTransport(): TransportProvider {
@@ -1548,6 +1573,7 @@ export class Sphere {
       oracle: this._oracle,
       emitEvent,
       chainCode: this._masterKey?.chainCode,
+      price: this._priceProvider ?? undefined,
     });
 
     this._communications.initialize({
@@ -2320,6 +2346,7 @@ export class Sphere {
       emitEvent,
       // Pass chain code for L1 HD derivation
       chainCode: this._masterKey?.chainCode,
+      price: this._priceProvider ?? undefined,
     });
 
     this._communications.initialize({
