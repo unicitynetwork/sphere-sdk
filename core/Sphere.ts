@@ -79,6 +79,7 @@ import {
   type AddressInfo,
 } from './crypto';
 import { encryptSimple, decryptSimple } from './encryption';
+import { vestingClassifier } from '../l1/vesting';
 import {
   parseWalletText,
   parseAndDecryptWalletText,
@@ -664,6 +665,9 @@ export class Sphere {
     if (tokenStorage?.clear) {
       await tokenStorage.clear();
     }
+
+    // Clear L1 vesting cache
+    await vestingClassifier.destroy();
 
     if (Sphere.instance) {
       await Sphere.instance.destroy();
