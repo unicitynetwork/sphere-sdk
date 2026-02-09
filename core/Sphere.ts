@@ -461,6 +461,9 @@ export class Sphere {
     sphere._initialized = true;
     Sphere.instance = sphere;
 
+    // Publish identity binding via transport (makes wallet discoverable)
+    await sphere.syncIdentityWithTransport();
+
     // Register nametag if provided, otherwise try to recover from transport
     if (options.nametag) {
       await sphere.registerNametag(options.nametag);
