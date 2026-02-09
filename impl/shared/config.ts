@@ -97,6 +97,8 @@ export interface BasePriceConfig {
   platform?: PricePlatform;
   /** API key for the price platform (optional for free tiers) */
   apiKey?: string;
+  /** Custom base URL (e.g., for CORS proxy in browser environments) */
+  baseUrl?: string;
   /** Cache TTL in milliseconds (default: 60000) */
   cacheTtlMs?: number;
   /** Request timeout in milliseconds (default: 10000) */

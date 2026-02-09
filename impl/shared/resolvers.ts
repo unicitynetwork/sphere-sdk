@@ -184,6 +184,7 @@ export function resolvePriceConfig(
   return {
     platform: config.platform ?? 'coingecko',
     apiKey: config.apiKey,
+    baseUrl: config.baseUrl,
     cacheTtlMs: config.cacheTtlMs,
     timeout: config.timeout,
     debug: config.debug,

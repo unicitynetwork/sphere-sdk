@@ -38,6 +38,8 @@ export interface PriceProviderConfig {
   platform: PricePlatform;
   /** API key for the platform (optional for free tiers) */
   apiKey?: string;
+  /** Custom base URL (e.g., for CORS proxy in browser environments) */
+  baseUrl?: string;
   /** Cache TTL in milliseconds (default: 60000 = 1 minute) */
   cacheTtlMs?: number;
   /** Request timeout in milliseconds (default: 10000) */

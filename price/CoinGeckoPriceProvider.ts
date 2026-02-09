@@ -12,7 +12,8 @@ import type { PriceProvider, PricePlatform, TokenPrice, PriceProviderConfig } fr
 // =============================================================================
 
 interface CacheEntry {
-  price: TokenPrice;
+  /** Token price, or null if the token was not found on the platform */
+  price: TokenPrice | null;
   expiresAt: number;
 }
 
@@ -51,9 +52,10 @@ export class CoinGeckoPriceProvider implements PriceProvider {
     this.timeout = config?.timeout ?? 10_000;
     this.debug = config?.debug ?? false;
 
-    this.baseUrl = this.apiKey
-      ? 'https://pro-api.coingecko.com/api/v3'
-      : 'https://api.coingecko.com/api/v3';
+    this.baseUrl = config?.baseUrl
+      ?? (this.apiKey
+        ? 'https://pro-api.coingecko.com/api/v3'
+        : 'https://api.coingecko.com/api/v3');
   }
 
   async getPrices(tokenNames: string[]): Promise<Map<string, TokenPrice>> {
@@ -69,7 +71,10 @@ export class CoinGeckoPriceProvider implements PriceProvider {
     for (const name of tokenNames) {
       const cached = this.cache.get(name);
       if (cached && cached.expiresAt > now) {
-        result.set(name, cached.price);
+        // null = negative cache (token not found on platform), skip adding to result
+        if (cached.price !== null) {
+          result.set(name, cached.price);
+        }
       } else {
         uncachedNames.push(name);
       }
@@ -120,6 +125,13 @@ export class CoinGeckoPriceProvider implements PriceProvider {
         }
       }
 
+      // Negative cache: tokens not found on CoinGecko won't be re-requested until TTL expires
+      for (const name of uncachedNames) {
+        if (!result.has(name)) {
+          this.cache.set(name, { price: null, expiresAt: now + this.cacheTtlMs });
+        }
+      }
+
       if (this.debug) {
         console.log(`[CoinGecko] Fetched ${result.size} prices`);
       }
@@ -131,7 +143,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       // On error, return stale cached data if available
       for (const name of uncachedNames) {
         const stale = this.cache.get(name);
-        if (stale) {
+        if (stale?.price) {
           result.set(name, stale.price);
         }
       }
