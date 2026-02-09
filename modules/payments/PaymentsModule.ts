@@ -36,6 +36,7 @@ import { NametagMinter, type MintNametagResult } from './NametagMinter';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type {
   TransportProvider,
+  PeerInfo,
   IncomingTokenTransfer,
   PaymentRequestPayload,
   PaymentRequestResponsePayload,
@@ -782,11 +783,10 @@ export class PaymentsModule {
     };
 
     try {
-      // Resolve recipient pubkey for Nostr delivery
-      const recipientPubkey = await this.resolveRecipient(request.recipient);
-
-      // Resolve recipient address for on-chain transfer
-      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode);
+      // Resolve recipient once — single network query
+      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
       // Create signing service
       const signingService = await this.createSigningService();
@@ -1023,11 +1023,10 @@ export class PaymentsModule {
     const startTime = performance.now();
 
     try {
-      // Resolve recipient pubkey for Nostr delivery
-      const recipientPubkey = await this.resolveRecipient(request.recipient);
-
-      // Resolve recipient address for on-chain transfer
-      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode);
+      // Resolve recipient once — single network query
+      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
       // Create signing service
       const signingService = await this.createSigningService();
@@ -1313,8 +1312,9 @@ export class PaymentsModule {
     }
 
     try {
-      // Resolve recipient pubkey
-      const recipientPubkey = await this.resolveRecipient(recipientPubkeyOrNametag);
+      // Resolve recipient
+      const peerInfo = await this.deps!.transport.resolve?.(recipientPubkeyOrNametag) ?? null;
+      const recipientPubkey = this.resolveTransportPubkey(recipientPubkeyOrNametag, peerInfo);
 
       // Build payload
       const payload: PaymentRequestPayload = {
@@ -2733,34 +2733,13 @@ export class PaymentsModule {
    * Returns true for: hex pubkeys (64+ chars), PROXY:, DIRECT: prefixed addresses
    */
   /**
-   * Resolve recipient to Nostr transport pubkey for messaging.
-   * Supports: @nametag, DIRECT://, PROXY://, hex pubkey (64/66 chars), bare nametag.
+   * Resolve recipient to transport pubkey for messaging.
+   * Uses pre-resolved PeerInfo if available, otherwise resolves via transport.
    */
-  private async resolveRecipient(recipient: string): Promise<string> {
-    // Explicit nametag with @
-    if (recipient.startsWith('@')) {
-      const nametag = recipient.slice(1);
-      const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
-      if (!pubkey) {
-        throw new Error(`Nametag not found: ${nametag}`);
-      }
-      return pubkey;
-    }
-
-    // DIRECT:// or PROXY:// address — reverse lookup to find transport pubkey
-    if (recipient.startsWith('DIRECT:') || recipient.startsWith('PROXY:')) {
-      if (this.deps?.transport.resolveAddressInfo) {
-        const info = await this.deps.transport.resolveAddressInfo(recipient);
-        if (info?.transportPubkey) {
-          this.log(`Resolved address "${recipient.slice(0, 20)}..." to transport pubkey`);
-          return info.transportPubkey;
-        }
-      }
-      throw new Error(
-        `Cannot resolve recipient for address "${recipient.slice(0, 30)}...". ` +
-        `No binding event found. The recipient must register their nametag first, ` +
-        `or use @nametag format instead.`
-      );
+  private resolveTransportPubkey(recipient: string, peerInfo?: PeerInfo | null): string {
+    // If we have PeerInfo, use it
+    if (peerInfo?.transportPubkey) {
+      return peerInfo.transportPubkey;
     }
 
     // Hex pubkey (64+ hex chars) — use as transport pubkey directly
@@ -2772,19 +2751,9 @@ export class PaymentsModule {
       return recipient;
     }
 
-    // Smart detection: try as nametag first
-    if (this.deps?.transport.resolveNametag) {
-      const pubkey = await this.deps.transport.resolveNametag(recipient);
-      if (pubkey) {
-        this.log(`Resolved "${recipient}" as nametag to pubkey`);
-        return pubkey;
-      }
-    }
-
-    // If not found as nametag and doesn't look like an address, throw error
     throw new Error(
-      `Recipient "${recipient}" is not a valid nametag or address. ` +
-      `Use @nametag for explicit nametag or a valid hex pubkey/PROXY:/DIRECT: address.`
+      `Cannot resolve transport pubkey for "${recipient}". ` +
+      `No binding event found. The recipient must publish their identity first.`
     );
   }
 
@@ -2858,123 +2827,64 @@ export class PaymentsModule {
   }
 
   /**
-   * Resolve nametag to 33-byte compressed public key using resolveNametagInfo
-   * Returns null if nametag not found
-   *
-   * NOTE: Legacy nametags without chainPubkey CANNOT be used for transfers.
-   * The transportPubkey (Nostr pubkey) is a different key from the L3 chainPubkey,
-   * so deriving one from the other is impossible. Legacy nametags must be re-registered
-   * with the new SDK format that includes chainPubkey.
+   * Resolve recipient to IAddress for L3 transfers.
+   * Uses pre-resolved PeerInfo when available to avoid redundant network queries.
    */
-  private async resolveNametagToPublicKey(nametag: string): Promise<string | null> {
-    if (!this.deps?.transport.resolveNametagInfo) {
-      this.log('resolveNametagInfo not available on transport');
-      return null;
-    }
-
-    const info = await this.deps.transport.resolveNametagInfo(nametag);
-    if (!info) {
-      this.log(`Nametag "${nametag}" not found`);
-      return null;
-    }
-
-    // Use chainPubkey if available (required for correct address derivation)
-    if (info.chainPubkey) {
-      return info.chainPubkey;
-    }
-
-    // Legacy nametag without chainPubkey - PROXY fallback will be used in resolveRecipientAddress
-    this.log(`Nametag "${nametag}" has no chainPubkey - will use PROXY address fallback`);
-    return null;
-  }
-
-  /**
-   * Resolve recipient to IAddress for L3 transfers
-   * Supports: nametag (with or without @), PROXY:, DIRECT:, hex pubkey
-   */
-  private async resolveRecipientAddress(recipient: string, addressMode: 'auto' | 'direct' | 'proxy' = 'auto'): Promise<IAddress> {
+  private async resolveRecipientAddress(
+    recipient: string,
+    addressMode: 'auto' | 'direct' | 'proxy' = 'auto',
+    peerInfo?: PeerInfo | null,
+  ): Promise<IAddress> {
     const { AddressFactory } = await import('@unicitylabs/state-transition-sdk/lib/address/AddressFactory');
     const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
 
-    // Explicit nametag with @
-    if (recipient.startsWith('@')) {
-      const nametag = recipient.slice(1);
-      const info = await this.deps?.transport.resolveNametagInfo?.(nametag);
-      if (!info) {
-        throw new Error(`Nametag "@${nametag}" not found`);
-      }
-
-      // Force PROXY mode
-      if (addressMode === 'proxy') {
-        console.log(`[Payments] Using PROXY address for @${nametag} (forced)`);
-        return ProxyAddress.fromNameTag(nametag);
-      }
-
-      // Force DIRECT mode - requires directAddress to be available
-      if (addressMode === 'direct') {
-        if (!info.directAddress) {
-          throw new Error(`Nametag "@${nametag}" has no DirectAddress stored. It may be a legacy registration.`);
-        }
-        console.log(`[Payments] Using DirectAddress for @${nametag} (forced): ${info.directAddress.slice(0, 30)}...`);
-        return AddressFactory.createAddress(info.directAddress);
-      }
-
-      // AUTO mode: NEW nametags have directAddress stored, LEGACY use PROXY
-      if (info.directAddress) {
-        console.log(`[Payments] Using stored DirectAddress for @${nametag}: ${info.directAddress.slice(0, 30)}...`);
-        return AddressFactory.createAddress(info.directAddress);
-      }
-
-      // LEGACY nametags don't have directAddress - use PROXY address
-      this.log(`Using PROXY address for legacy nametag @${nametag}`);
-      return ProxyAddress.fromNameTag(nametag);
-    }
-
-    // PROXY: or DIRECT: prefixed - parse using AddressFactory (explicit address overrides mode)
+    // PROXY: or DIRECT: prefixed — parse directly (explicit address overrides mode)
     if (recipient.startsWith('PROXY:') || recipient.startsWith('DIRECT:')) {
       return AddressFactory.createAddress(recipient);
     }
 
-    // If it looks like a hex pubkey (66 chars = 33 bytes compressed), create DirectAddress
+    // 66-char hex (33-byte compressed pubkey) — create DirectAddress
     if (recipient.length === 66 && /^[0-9a-fA-F]+$/.test(recipient)) {
       this.log(`Creating DirectAddress from 33-byte compressed pubkey`);
       return this.createDirectAddressFromPubkey(recipient);
     }
 
-    // Smart detection: try as nametag
-    const info = await this.deps?.transport.resolveNametagInfo?.(recipient);
-    if (info) {
-      // Force PROXY mode
-      if (addressMode === 'proxy') {
-        console.log(`[Payments] Using PROXY address for "${recipient}" (forced)`);
-        return ProxyAddress.fromNameTag(recipient);
-      }
-
-      // Force DIRECT mode
-      if (addressMode === 'direct') {
-        if (!info.directAddress) {
-          throw new Error(`Nametag "${recipient}" has no DirectAddress stored. It may be a legacy registration.`);
-        }
-        console.log(`[Payments] Using DirectAddress for "${recipient}" (forced): ${info.directAddress.slice(0, 30)}...`);
-        return AddressFactory.createAddress(info.directAddress);
-      }
-
-      // AUTO mode: NEW nametags have directAddress - use it
-      if (info.directAddress) {
-        this.log(`Using stored DirectAddress for nametag "${recipient}"`);
-        return AddressFactory.createAddress(info.directAddress);
-      }
-
-      // LEGACY nametags - use PROXY
-      this.log(`Using PROXY address for legacy nametag "${recipient}"`);
-      return ProxyAddress.fromNameTag(recipient);
+    // For nametag-based recipients, use PeerInfo (pre-resolved or resolve now)
+    const info = peerInfo ?? await this.deps?.transport.resolve?.(recipient) ?? null;
+    if (!info) {
+      throw new Error(
+        `Recipient "${recipient}" not found. ` +
+        `Use @nametag, a valid PROXY:/DIRECT: address, or a 33-byte hex pubkey.`
+      );
     }
 
-    // Not found as nametag and doesn't look like an address
-    throw new Error(
-      `Recipient "${recipient}" is not a valid nametag or L3 address. ` +
-      `Use @nametag for explicit nametag or a valid 33-byte hex pubkey/PROXY:/DIRECT: address.`
-    );
+    // Determine nametag for PROXY address derivation
+    const nametag = recipient.startsWith('@') ? recipient.slice(1)
+      : info.nametag || recipient;
+
+    // Force PROXY mode
+    if (addressMode === 'proxy') {
+      console.log(`[Payments] Using PROXY address for "${nametag}" (forced)`);
+      return ProxyAddress.fromNameTag(nametag);
+    }
+
+    // Force DIRECT mode
+    if (addressMode === 'direct') {
+      if (!info.directAddress) {
+        throw new Error(`"${nametag}" has no DirectAddress stored. It may be a legacy registration.`);
+      }
+      console.log(`[Payments] Using DirectAddress for "${nametag}" (forced): ${info.directAddress.slice(0, 30)}...`);
+      return AddressFactory.createAddress(info.directAddress);
+    }
+
+    // AUTO mode: prefer directAddress, fallback to PROXY for legacy
+    if (info.directAddress) {
+      this.log(`Using DirectAddress for "${nametag}": ${info.directAddress.slice(0, 30)}...`);
+      return AddressFactory.createAddress(info.directAddress);
+    }
+
+    this.log(`Using PROXY address for legacy nametag "${nametag}"`);
+    return ProxyAddress.fromNameTag(nametag);
   }
 
   /**

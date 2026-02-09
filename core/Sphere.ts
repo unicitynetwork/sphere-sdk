@@ -50,7 +50,7 @@ import type {
   WalletJSONExportOptions,
 } from '../types';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
-import type { TransportProvider } from '../transport';
+import type { TransportProvider, PeerInfo } from '../transport';
 import type { OracleProvider } from '../oracle';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
@@ -281,7 +281,7 @@ export class Sphere {
   private _derivationMode: DerivationMode = 'bip32';
   private _basePath: string = DEFAULT_BASE_PATH;
   private _currentAddressIndex: number = 0;
-  /** Map of addressId -> (nametagIndex -> nametag). Supports multiple nametags per address (e.g., from Nostr recovery) */
+  /** Map of addressId -> (nametagIndex -> nametag). Supports multiple nametags per address (e.g., from transport recovery) */
   private _addressNametags: Map<string, Map<number, string>> = new Map();
   /** Cached PROXY address (computed once when nametag is set) */
   private _cachedProxyAddress: string | undefined = undefined;
@@ -461,12 +461,12 @@ export class Sphere {
     sphere._initialized = true;
     Sphere.instance = sphere;
 
-    // Register nametag if provided, otherwise try to recover from Nostr
+    // Register nametag if provided, otherwise try to recover from transport
     if (options.nametag) {
       await sphere.registerNametag(options.nametag);
     } else {
-      // Try to recover nametag from Nostr (for wallet import scenarios)
-      await sphere.recoverNametagFromNostr();
+      // Try to recover nametag from transport (for wallet import scenarios)
+      await sphere.recoverNametagFromTransport();
     }
 
     return sphere;
@@ -496,8 +496,8 @@ export class Sphere {
     await sphere.initializeProviders();
     await sphere.initializeModules();
 
-    // Sync nametag with Nostr (re-register if missing)
-    await sphere.syncNametagWithNostr();
+    // Publish identity binding via transport
+    await sphere.syncIdentityWithTransport();
 
     sphere._initialized = true;
     Sphere.instance = sphere;
@@ -569,7 +569,7 @@ export class Sphere {
 
     // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
     if (!options.nametag) {
-      await sphere.recoverNametagFromNostr();
+      await sphere.recoverNametagFromTransport();
     }
 
     // Mark wallet as created only after successful initialization
@@ -1542,6 +1542,9 @@ export class Sphere {
     // Re-initialize modules with new identity
     await this.reinitializeModulesForNewAddress();
 
+    // Publish identity binding for the new address
+    await this.syncIdentityWithTransport();
+
     this.emitEvent('identity:changed', {
       l1Address: this._identity.l1Address,
       directAddress: this._identity.directAddress,
@@ -1774,6 +1777,23 @@ export class Sphere {
     return this._cachedProxyAddress;
   }
 
+  /**
+   * Resolve any identifier to full peer information.
+   * Accepts @nametag, bare nametag, DIRECT://, PROXY://, L1 address, or transport pubkey.
+   *
+   * @example
+   * ```ts
+   * const peer = await sphere.resolve('@alice');
+   * const peer = await sphere.resolve('DIRECT://...');
+   * const peer = await sphere.resolve('alpha1...');
+   * const peer = await sphere.resolve('ab12cd...'); // 64-char hex transport pubkey
+   * ```
+   */
+  async resolve(identifier: string): Promise<PeerInfo | null> {
+    this.ensureReady();
+    return this._transport.resolve?.(identifier) ?? null;
+  }
+
   /** Compute and cache the PROXY address from the current nametag */
   private async _updateCachedProxyAddress(): Promise<void> {
     const nametag = this._identity?.nametag;
@@ -1818,12 +1838,13 @@ export class Sphere {
       throw new Error(`Nametag already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`);
     }
 
-    // Register with transport provider (Nostr)
-    if (this._transport.registerNametag) {
-      const success = await this._transport.registerNametag(
-        cleanNametag,
+    // Publish identity binding with nametag (updates existing binding event)
+    if (this._transport.publishIdentityBinding) {
+      const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
-        this._identity!.directAddress || ''
+        this._identity!.l1Address,
+        this._identity!.directAddress || '',
+        cleanNametag,
       );
       if (!success) {
         throw new Error('Failed to register nametag. It may already be taken.');
@@ -1855,7 +1876,7 @@ export class Sphere {
       const result = await this.mintNametag(cleanNametag);
       if (!result.success) {
         console.warn(`[Sphere] Failed to mint nametag token: ${result.error}`);
-        // Don't throw - nametag is registered on Nostr, token can be minted later
+        // Don't throw - nametag is published via transport, token can be minted later
       } else {
         console.log(`[Sphere] Nametag token minted successfully`);
       }
@@ -1951,43 +1972,40 @@ export class Sphere {
   }
 
   /**
-   * Sync nametag with Nostr on wallet load
-   * If local nametag exists but not registered on Nostr, re-register it
+   * Publish identity binding via transport.
+   * Always publishes base identity (chainPubkey, l1Address, directAddress).
+   * If nametag is set, also publishes nametag hash, proxy address, encrypted nametag.
    */
-  private async syncNametagWithNostr(): Promise<void> {
-    const nametag = this._identity?.nametag;
-    if (!nametag) {
-      return; // No nametag to sync
-    }
-
-    if (!this._transport.resolveNametag || !this._transport.registerNametag) {
-      return; // Transport doesn't support nametag operations
+  private async syncIdentityWithTransport(): Promise<void> {
+    if (!this._transport.publishIdentityBinding) {
+      return; // Transport doesn't support identity binding
     }
 
     try {
-      // Register nametag (will check if already registered and re-publish if needed)
-      const success = await this._transport.registerNametag(
-        nametag,
+      const nametag = this._identity?.nametag;
+      const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
-        this._identity!.directAddress || ''
+        this._identity!.l1Address,
+        this._identity!.directAddress || '',
+        nametag || undefined,
       );
       if (success) {
-        console.log(`[Sphere] Nametag @${nametag} synced with Nostr`);
-      } else {
+        console.log(`[Sphere] Identity binding published${nametag ? ` with nametag @${nametag}` : ''}`);
+      } else if (nametag) {
         console.warn(`[Sphere] Nametag @${nametag} is taken by another pubkey`);
       }
     } catch (error) {
-      // Don't fail wallet load on nametag sync errors
-      console.warn(`[Sphere] Nametag sync failed:`, error);
+      // Don't fail wallet load on identity sync errors
+      console.warn(`[Sphere] Identity binding sync failed:`, error);
     }
   }
 
   /**
-   * Recover nametag from Nostr after wallet import
+   * Recover nametag from transport after wallet import.
    * Searches for encrypted nametag events authored by this wallet's pubkey
-   * and decrypts them to restore the nametag association
+   * and decrypts them to restore the nametag association.
    */
-  private async recoverNametagFromNostr(): Promise<void> {
+  private async recoverNametagFromTransport(): Promise<void> {
     // Skip if already has a nametag
     if (this._identity?.nametag) {
       return;
@@ -2023,12 +2041,13 @@ export class Sphere {
         }
         await this.persistAddressNametags();
 
-        // Re-register to ensure event has latest format with all fields
-        if (this._transport.registerNametag) {
-          await this._transport.registerNametag(
-            recoveredNametag,
+        // Re-publish identity binding with recovered nametag
+        if (this._transport.publishIdentityBinding) {
+          await this._transport.publishIdentityBinding(
             this._identity!.chainPubkey,
-            this._identity!.directAddress || ''
+            this._identity!.l1Address,
+            this._identity!.directAddress || '',
+            recoveredNametag,
           );
         }
 
