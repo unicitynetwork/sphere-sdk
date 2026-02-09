@@ -303,16 +303,24 @@ TxfStorageDataBase {
 
 5. **TypeScript 5.6 compatibility**: Web Crypto API ArrayBuffer types fixed
 
+6. **PriceProvider** (optional): CoinGecko integration for token fiat prices
+   - `getBalance()` returns total USD value (`number | null`)
+   - `getAssets()` returns assets enriched with `priceUsd`, `fiatValueUsd`, `change24h`
+   - `baseUrl` config for CORS proxy in browser environments
+   - Negative cache: tokens not found on CoinGecko are cached to prevent repeated requests
+   - `setPriceProvider()` for runtime provider configuration
+
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 611+
+**Total tests:** 825+
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
 - `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
+- `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
 
 ## Dependencies

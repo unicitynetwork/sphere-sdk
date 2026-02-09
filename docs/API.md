@@ -1070,8 +1070,10 @@ const providers = createBrowserProviders({
   price: {
     platform: 'coingecko',       // Currently supported: 'coingecko'
     apiKey: 'CG-xxx',            // Optional (free tier works without key)
+    baseUrl: '/api/coingecko',   // Optional: custom base URL (e.g., CORS proxy)
     cacheTtlMs: 60000,           // Cache TTL (default: 60s)
     timeout: 10000,              // Request timeout (default: 10s)
+    debug: false,                // Enable debug logging
   },
 });
 
@@ -1105,10 +1107,55 @@ interface PriceProvider {
 }
 ```
 
+### PriceProviderConfig
+
+```typescript
+interface PriceProviderConfig {
+  platform: PricePlatform;     // 'coingecko'
+  apiKey?: string;             // API key (optional for free tier)
+  baseUrl?: string;            // Custom base URL (e.g., for CORS proxy)
+  cacheTtlMs?: number;        // Cache TTL in ms (default: 60000)
+  timeout?: number;            // Request timeout in ms (default: 10000)
+  debug?: boolean;             // Enable debug logging
+}
+```
+
 ### CoinGeckoPriceProvider
 
 - **Free tier**: `api.coingecko.com` (no API key needed, rate-limited)
 - **Pro tier**: `pro-api.coingecko.com` (requires API key via `x-cg-pro-api-key` header)
+- **Custom URL**: `baseUrl` overrides the default API endpoint (useful for CORS proxy in browser)
 - Internal cache with configurable TTL (default 60s)
+- **Negative cache**: tokens not found on CoinGecko are cached as "not found" for the TTL duration, preventing repeated API requests for project-specific tokens
 - Partial fetch: only requests uncached tokens from API
 - Stale-on-error: returns cached data on API failure instead of throwing
+
+### CORS Proxy (Browser)
+
+CoinGecko's free API does not include CORS headers, so browser requests will be blocked. Solutions:
+
+1. **Development**: Use a dev server proxy (e.g., Vite):
+   ```typescript
+   // vite.config.ts
+   export default defineConfig({
+     server: {
+       proxy: {
+         '/api/coingecko': {
+           target: 'https://api.coingecko.com/api/v3',
+           changeOrigin: true,
+           rewrite: (path) => path.replace(/^\/api\/coingecko/, ''),
+         },
+       },
+     },
+   });
+
+   // SDK config
+   const providers = createBrowserProviders({
+     network: 'testnet',
+     price: { platform: 'coingecko', baseUrl: '/api/coingecko' },
+   });
+   ```
+
+2. **Production**: Use a reverse proxy (Nginx, Cloudflare Worker, etc.) or the CoinGecko Pro API which supports CORS natively.
+
+3. **Node.js**: No proxy needed — server-side requests are not subject to CORS.
