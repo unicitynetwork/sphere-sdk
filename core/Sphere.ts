@@ -563,13 +563,19 @@ export class Sphere {
       throw new Error('Either mnemonic or masterKey is required');
     }
 
+    console.log('[Sphere.import] Starting import...');
+
     // Clear existing wallet if any (including token data)
+    console.log('[Sphere.import] Clearing existing wallet data...');
     await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
+    console.log('[Sphere.import] Clear done');
 
     // Reconnect storage after clear (clear may have called destroy() on the
     // previous instance which disconnects the shared storage provider)
     if (!options.storage.isConnected()) {
+      console.log('[Sphere.import] Reconnecting storage...');
       await options.storage.connect();
+      console.log('[Sphere.import] Storage reconnected');
     }
 
     const sphere = new Sphere(
@@ -586,10 +592,13 @@ export class Sphere {
       if (!Sphere.validateMnemonic(options.mnemonic)) {
         throw new Error('Invalid mnemonic');
       }
+      console.log('[Sphere.import] Storing mnemonic...');
       await sphere.storeMnemonic(options.mnemonic, options.derivationPath, options.basePath);
+      console.log('[Sphere.import] Initializing identity from mnemonic...');
       await sphere.initializeIdentityFromMnemonic(options.mnemonic, options.derivationPath);
     } else if (options.masterKey) {
       // Store master key directly
+      console.log('[Sphere.import] Storing master key...');
       await sphere.storeMasterKey(
         options.masterKey,
         options.chainCode,
@@ -597,6 +606,7 @@ export class Sphere {
         options.basePath,
         options.derivationMode
       );
+      console.log('[Sphere.import] Initializing identity from master key...');
       await sphere.initializeIdentityFromMasterKey(
         options.masterKey,
         options.chainCode,
@@ -605,28 +615,37 @@ export class Sphere {
     }
 
     // Initialize everything
+    console.log('[Sphere.import] Initializing providers...');
     await sphere.initializeProviders();
+    console.log('[Sphere.import] Providers initialized. Initializing modules...');
     await sphere.initializeModules();
+    console.log('[Sphere.import] Modules initialized');
 
     // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
     if (!options.nametag) {
+      console.log('[Sphere.import] Recovering nametag from transport...');
       await sphere.recoverNametagFromTransport();
+      console.log('[Sphere.import] Nametag recovery done');
     }
 
     // Mark wallet as created only after successful initialization
+    console.log('[Sphere.import] Finalizing wallet creation...');
     await sphere.finalizeWalletCreation();
 
     sphere._initialized = true;
     Sphere.instance = sphere;
 
     // Track address 0 in the registry
+    console.log('[Sphere.import] Tracking address 0...');
     await sphere.ensureAddressTracked(0);
 
     // Register nametag if provided (this overrides any recovered nametag)
     if (options.nametag) {
+      console.log('[Sphere.import] Registering nametag...');
       await sphere.registerNametag(options.nametag);
     }
 
+    console.log('[Sphere.import] Import complete');
     return sphere;
   }
 
@@ -656,6 +675,7 @@ export class Sphere {
     const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
 
     // Clear global wallet data
+    console.log('[Sphere.clear] Removing storage keys...');
     await storage.remove(STORAGE_KEYS_GLOBAL.MNEMONIC);
     await storage.remove(STORAGE_KEYS_GLOBAL.MASTER_KEY);
     await storage.remove(STORAGE_KEYS_GLOBAL.CHAIN_CODE);
@@ -669,17 +689,35 @@ export class Sphere {
     // Per-address data
     await storage.remove(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
     await storage.remove(STORAGE_KEYS_ADDRESS.OUTBOX);
+    console.log('[Sphere.clear] Storage keys removed');
 
-    // Clear token storage if provided
+    // Clear token storage if provided (with timeout to prevent IndexedDB deadlock)
     if (tokenStorage?.clear) {
-      await tokenStorage.clear();
+      console.log('[Sphere.clear] Clearing token storage...');
+      try {
+        await Promise.race([
+          tokenStorage.clear(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('tokenStorage.clear() timed out after 2s')), 2000),
+          ),
+        ]);
+        console.log('[Sphere.clear] Token storage cleared');
+      } catch (err) {
+        console.warn('[Sphere.clear] Token storage clear failed/timed out:', err);
+      }
     }
 
     // Clear L1 vesting cache
+    console.log('[Sphere.clear] Destroying vesting classifier...');
     await vestingClassifier.destroy();
+    console.log('[Sphere.clear] Vesting classifier destroyed');
 
     if (Sphere.instance) {
+      console.log('[Sphere.clear] Destroying Sphere instance...');
       await Sphere.instance.destroy();
+      console.log('[Sphere.clear] Sphere instance destroyed');
+    } else {
+      console.log('[Sphere.clear] No Sphere instance to destroy');
     }
   }
 
@@ -2859,9 +2897,13 @@ export class Sphere {
       provider.setIdentity(this._identity!);
     }
 
-    // Connect providers
-    await this._storage.connect();
-    await this._transport.connect();
+    // Connect providers (skip if already connected, e.g. after setIdentity reconnect)
+    if (!this._storage.isConnected()) {
+      await this._storage.connect();
+    }
+    if (!this._transport.isConnected()) {
+      await this._transport.connect();
+    }
     await this._oracle.initialize();
 
     // Initialize all token storage providers

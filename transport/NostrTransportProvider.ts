@@ -273,8 +273,15 @@ export class NostrTransportProvider implements TransportProvider {
         },
       });
 
-      // Connect to all relays
-      await this.nostrClient.connect(...this.config.relays);
+      // Connect to all relays (with timeout to prevent indefinite hang)
+      await Promise.race([
+        this.nostrClient.connect(...this.config.relays),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(
+            `Transport connection timed out after ${this.config.timeout}ms`
+          )), this.config.timeout)
+        ),
+      ]);
 
       // Need at least one successful connection
       if (!this.nostrClient.isConnected()) {
@@ -476,7 +483,14 @@ export class NostrTransportProvider implements TransportProvider {
       });
 
       // Connect with new identity, set up subscriptions, then disconnect old client
-      await this.nostrClient.connect(...this.config.relays);
+      await Promise.race([
+        this.nostrClient.connect(...this.config.relays),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(
+            `Transport reconnection timed out after ${this.config.timeout}ms`
+          )), this.config.timeout)
+        ),
+      ]);
       this.subscribeToEvents();
       oldClient.disconnect();
     } else if (this.isConnected()) {
