@@ -688,9 +688,9 @@ export class PaymentsModule {
     }
 
     // Subscribe to incoming transfers
-    this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) => {
-      this.handleIncomingTransfer(transfer);
-    });
+    this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) =>
+      this.handleIncomingTransfer(transfer)
+    );
 
     // Subscribe to incoming payment requests (if supported)
     if (deps.transport.onPaymentRequest) {
@@ -1755,6 +1755,62 @@ export class PaymentsModule {
     } catch (error) {
       this.log('Failed to send payment request response:', error);
     }
+  }
+
+  // ===========================================================================
+  // Public API - Receive
+  // ===========================================================================
+
+  /**
+   * Fetch and process pending incoming transfers from the transport layer.
+   *
+   * Performs a one-shot query to fetch all pending events, processes them
+   * through the existing pipeline, and resolves after all stored events
+   * are handled. Useful for batch/CLI apps that need explicit receive.
+   *
+   * @param callback - Optional callback for each received transfer (same as transfer:incoming)
+   * @returns Array of IncomingTransfer objects received during this call
+   */
+  async receive(
+    callback?: (transfer: IncomingTransfer) => void
+  ): Promise<IncomingTransfer[]> {
+    this.ensureInitialized();
+
+    if (!this.deps!.transport.fetchPendingEvents) {
+      throw new Error('Transport provider does not support fetchPendingEvents');
+    }
+
+    // Snapshot token keys before fetch
+    const tokensBefore = new Set(this.tokens.keys());
+
+    // Fetch and process — events flow through handleIncomingTransfer() pipeline.
+    // fetchPendingEvents() collects events until EOSE, then processes sequentially
+    // with await. Event dedup in the transport layer prevents double-processing
+    // with the persistent subscription.
+    await this.deps!.transport.fetchPendingEvents();
+
+    // Reload from storage to get a clean, consistent state.
+    // Handlers save tokens during processing (with potentially different IDs for
+    // V5 pending tokens vs finalized tokens). load() clears the in-memory map
+    // and reloads from TXF + pending V5 storage, ensuring no duplicates.
+    await this.load();
+
+    // Identify newly added tokens
+    const received: IncomingTransfer[] = [];
+    for (const [tokenId, token] of this.tokens) {
+      if (!tokensBefore.has(tokenId)) {
+        const transfer: IncomingTransfer = {
+          id: tokenId,
+          senderPubkey: '',
+          tokens: [token],
+          receivedAt: Date.now(),
+        };
+        received.push(transfer);
+        if (callback) callback(transfer);
+      }
+    }
+
+    return received;
   }
 
   // ===========================================================================

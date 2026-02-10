@@ -217,6 +217,29 @@ const result = await sphere.payments.send({
 });
 ```
 
+#### `receive(callback?: (transfer: IncomingTransfer) => void): Promise<IncomingTransfer[]>`
+
+Fetch and process pending incoming transfers from the transport layer (one-shot query).
+
+Unlike the persistent subscription that delivers events asynchronously, `receive()` explicitly
+queries the Nostr relay and resolves after all stored events are processed. Useful for
+batch/CLI applications.
+
+- **callback** (optional): Invoked for each transfer received, same signature as `transfer:incoming` event
+- **Returns**: Array of `IncomingTransfer` objects received during this call
+
+```typescript
+// Simple usage
+const transfers = await sphere.payments.receive();
+
+// With callback
+await sphere.payments.receive((transfer) => {
+  console.log(`Received ${transfer.tokens.length} tokens`);
+});
+```
+
+---
+
 ### Methods: Unconfirmed Token Resolution
 
 #### `resolveUnconfirmed(): Promise<UnconfirmedResolutionResult>`

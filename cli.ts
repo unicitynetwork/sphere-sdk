@@ -592,9 +592,8 @@ async function main() {
         const sphere = await getSphere();
 
         if (finalize) {
-          // Wait briefly for Nostr relay to deliver stored events before checking balance
-          await new Promise(r => setTimeout(r, 2000));
-          await sphere.payments.load();
+          // Fetch pending transfers from Nostr relay (one-shot query, waits for EOSE)
+          await sphere.payments.receive();
 
           // Finalize unconfirmed tokens: submit tx commitments and fetch inclusion proofs
           const balancesBefore = sphere.payments.getBalance();
