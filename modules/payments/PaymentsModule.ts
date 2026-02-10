@@ -1153,6 +1153,13 @@ export class PaymentsModule {
 
     // V5: save immediately as unconfirmed, resolve proofs lazily
     try {
+      // Use deterministic ID from splitGroupId to deduplicate Nostr re-deliveries
+      const deterministicId = `v5split_${bundle.splitGroupId}`;
+      if (this.tokens.has(deterministicId)) {
+        this.log(`V5 bundle ${deterministicId.slice(0, 16)}... already exists, skipping duplicate`);
+        return { success: true, durationMs: 0 };
+      }
+
       const registry = TokenRegistry.getInstance();
       const pendingData: PendingV5Finalization = {
         type: 'v5_bundle',
@@ -1164,7 +1171,7 @@ export class PaymentsModule {
       };
 
       const uiToken: Token = {
-        id: crypto.randomUUID(),
+        id: deterministicId,
         coinId: bundle.coinId,
         symbol: registry.getSymbol(bundle.coinId) || bundle.coinId,
         name: registry.getName(bundle.coinId) || bundle.coinId,

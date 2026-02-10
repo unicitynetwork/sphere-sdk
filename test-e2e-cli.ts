@@ -12,7 +12,8 @@
 
 import { execSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { rmSync, existsSync } from 'node:fs';
+import { rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import * as path from 'node:path';
 
 // =============================================================================
 // Constants
@@ -20,8 +21,10 @@ import { rmSync, existsSync } from 'node:fs';
 
 const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
 const CLI_CMD = 'npx tsx cli.ts';
-const TRANSFER_TIMEOUT_MS = 90_000;
-const POLL_INTERVAL_MS = 2_000;
+const CONFIG_FILE = '.sphere-cli/config.json';
+const PROFILES_FILE = '.sphere-cli/profiles.json';
+const TRANSFER_TIMEOUT_MS = 120_000;
+const POLL_INTERVAL_MS = 3_000;
 const INTER_TEST_DELAY_MS = 3_000;
 const FAUCET_TOPUP_TIMEOUT_MS = 90_000;
 
@@ -67,19 +70,39 @@ interface TestResult {
 }
 
 // =============================================================================
+// Profile Switching (direct config file writes, no Sphere creation)
+// =============================================================================
+
+/**
+ * Switch the active CLI profile by writing the config file directly.
+ * This avoids creating a Sphere instance (which `wallet use` does),
+ * preventing Nostr messages from being consumed before the actual command runs.
+ */
+function switchProfile(profileName: string): void {
+  const profilesData = readFileSync(PROFILES_FILE, 'utf8');
+  const profiles = JSON.parse(profilesData) as { profiles: Array<{ name: string; dataDir: string; tokensDir: string; network: string }> };
+  const profile = profiles.profiles.find(p => p.name === profileName);
+  if (!profile) throw new Error(`Profile "${profileName}" not found`);
+
+  const config = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+  config.dataDir = profile.dataDir;
+  config.tokensDir = profile.tokensDir;
+  config.currentProfile = profileName;
+  config.network = profile.network;
+  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+// =============================================================================
 // CLI Helpers
 // =============================================================================
 
 /**
- * Switch to a profile and run a CLI command. Returns stdout and duration.
+ * Switch to a profile (via config file) and run a CLI command.
+ * Returns stdout and duration.
  */
 function cli(cmd: string, profile?: string): CliResult {
   if (profile) {
-    execSync(`${CLI_CMD} wallet use ${profile}`, {
-      encoding: 'utf8',
-      timeout: 30_000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    switchProfile(profile);
   }
 
   const start = performance.now();
@@ -145,8 +168,16 @@ function parseAmountToSmallest(humanStr: string, decimals: number): bigint {
 }
 
 /**
- * Poll `balance` until a coin appears at >= minAmount (in smallest units).
- * Returns the parsed balance and total poll time.
+ * Read balance using `balance --finalize` which includes a 2s Nostr sync delay.
+ * This ensures incoming Nostr messages are received before reading balance.
+ */
+function readBalance(profile: string, coinSymbol: string): { balance: ParsedBalance | null; durationMs: number } {
+  const { stdout, durationMs } = cli('balance --finalize', profile);
+  return { balance: parseBalanceOutput(stdout, coinSymbol), durationMs };
+}
+
+/**
+ * Poll balance (using --finalize for Nostr sync) until a coin appears at >= minAmount.
  */
 function waitForBalance(
   profile: string,
@@ -159,8 +190,7 @@ function waitForBalance(
 
   while (performance.now() - startTime < timeoutMs) {
     try {
-      const { stdout } = cli('balance', profile);
-      const parsed = parseBalanceOutput(stdout, coinSymbol);
+      const { balance: parsed } = readBalance(profile, coinSymbol);
 
       if (parsed) {
         const confirmedSmallest = parseAmountToSmallest(parsed.confirmed, decimals);
@@ -182,8 +212,7 @@ function waitForBalance(
   }
 
   // Final check
-  const { stdout } = cli('balance', profile);
-  const parsed = parseBalanceOutput(stdout, coinSymbol);
+  const { balance: parsed } = readBalance(profile, coinSymbol);
   return {
     balance: parsed || { confirmed: '0', unconfirmed: '0', tokens: 0 },
     durationMs: performance.now() - startTime,
@@ -211,6 +240,7 @@ function generateTestRunId(): string {
 
 function setupWallet(profile: string, nametag: string): void {
   console.log(`[SETUP] Creating wallet profile: ${profile}, nametag: @${nametag}`);
+  // wallet create also switches to the new profile internally
   cli(`wallet create ${profile}`);
   const { stdout } = cli(`init --nametag ${nametag}`, profile);
   console.log(`  Init output (trimmed): ${stdout.split('\n').find(l => l.includes('initialized')) || 'OK'}`);
@@ -250,8 +280,9 @@ async function topupAndWait(profile: string, nametag: string): Promise<void> {
   while (performance.now() - startTime < FAUCET_TOPUP_TIMEOUT_MS) {
     let allReceived = true;
 
+    // Use --finalize for Nostr sync on each poll
+    const { stdout } = cli('balance --finalize', profile);
     for (const coin of FAUCET_COINS) {
-      const { stdout } = cli('balance', profile);
       const parsed = parseBalanceOutput(stdout, coin.symbol);
       if (!parsed || (parsed.confirmed === '0' && parsed.unconfirmed === '0')) {
         allReceived = false;
@@ -262,8 +293,6 @@ async function topupAndWait(profile: string, nametag: string): Promise<void> {
     if (allReceived) {
       const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
       console.log(`  All tokens received in ${elapsed}s`);
-      // Print final balances
-      const { stdout } = cli('balance', profile);
       for (const coin of FAUCET_COINS) {
         const parsed = parseBalanceOutput(stdout, coin.symbol);
         if (parsed) {
@@ -320,16 +349,14 @@ function runTransferTest(config: TransferTestConfig): TestResult {
   };
 
   try {
-    // 1. Snapshot sender balance BEFORE
-    const { stdout: senderBeforeOut } = cli('balance', senderProfile);
-    const senderBefore = parseBalanceOutput(senderBeforeOut, coinSymbol);
+    // 1. Snapshot sender balance BEFORE (use --finalize for Nostr sync)
+    const { balance: senderBefore } = readBalance(senderProfile, coinSymbol);
     const senderBeforeTotal = senderBefore
       ? parseAmountToSmallest(senderBefore.confirmed, decimals) + parseAmountToSmallest(senderBefore.unconfirmed, decimals)
       : 0n;
 
     // 2. Snapshot receiver balance BEFORE
-    const { stdout: receiverBeforeOut } = cli('balance', receiverProfile);
-    const receiverBefore = parseBalanceOutput(receiverBeforeOut, coinSymbol);
+    const { balance: receiverBefore } = readBalance(receiverProfile, coinSymbol);
     const receiverBeforeTotal = receiverBefore
       ? parseAmountToSmallest(receiverBefore.confirmed, decimals) + parseAmountToSmallest(receiverBefore.unconfirmed, decimals)
       : 0n;
@@ -356,7 +383,7 @@ function runTransferTest(config: TransferTestConfig): TestResult {
     }
     console.log(`    Send completed in ${sendTime.toFixed(0)}ms`);
 
-    // 4. Poll receiver balance until amount arrives
+    // 4. Poll receiver balance until amount arrives (uses --finalize for Nostr sync)
     console.log(`[3] Waiting for receiver balance...`);
     const expectedReceiverTotal = receiverBeforeTotal + amountSmallest;
     const { balance: receiverAfter, durationMs: recvTime } = waitForBalance(
@@ -365,26 +392,30 @@ function runTransferTest(config: TransferTestConfig): TestResult {
     result.receiveTimeMs = recvTime;
     console.log(`    Received in ${recvTime.toFixed(0)}ms — ${receiverAfter.confirmed} ${coinSymbol}`);
 
-    // 5. Finalize on receiver
+    // 5. Finalize on receiver (explicit finalization pass)
     console.log(`[4] Finalizing receiver...`);
     const { durationMs: finTime } = cli('balance --finalize', receiverProfile);
     result.finalizeTimeMs = finTime;
     console.log(`    Finalize completed in ${finTime.toFixed(0)}ms`);
 
-    // 6. Wait for sender's change token
-    console.log(`[5] Waiting for sender change token (up to 15s)...`);
+    // 6. Wait for sender's change token (use --finalize for Nostr sync)
+    console.log(`[5] Waiting for sender change token (up to 20s)...`);
     const expectedSenderTotal = senderBeforeTotal - amountSmallest;
     const { balance: senderAfter } = waitForBalance(
-      senderProfile, coinSymbol, expectedSenderTotal, 15_000,
+      senderProfile, coinSymbol, expectedSenderTotal, 20_000,
     );
     const senderAfterTotal = parseAmountToSmallest(senderAfter.confirmed, decimals)
       + parseAmountToSmallest(senderAfter.unconfirmed, decimals);
 
-    // 7. Verify balance conservation
-    const receiverAfterTotal = parseAmountToSmallest(receiverAfter.confirmed, decimals)
-      + parseAmountToSmallest(receiverAfter.unconfirmed, decimals);
+    // 7. Re-read receiver balance after finalization for accurate verification
+    const { balance: receiverFinal } = readBalance(receiverProfile, coinSymbol);
+    const receiverFinalTotal = receiverFinal
+      ? parseAmountToSmallest(receiverFinal.confirmed, decimals) + parseAmountToSmallest(receiverFinal.unconfirmed, decimals)
+      : 0n;
+
+    // 8. Verify balance conservation
     const senderDelta = senderBeforeTotal - senderAfterTotal;
-    const receiverDelta = receiverAfterTotal - receiverBeforeTotal;
+    const receiverDelta = receiverFinalTotal - receiverBeforeTotal;
 
     console.log(`\n[6] BALANCE VERIFICATION:`);
     console.log(`    Sender lost:     ${senderDelta} (expected: ${amountSmallest})`);
@@ -681,7 +712,7 @@ async function main(): Promise<void> {
 
     // Finalize Bob's tokens before send-back
     console.log('\n[RESOLVE] Finalizing Bob UCT tokens before send-back...');
-    const { stdout: finOut, durationMs: finMs } = cli('balance --finalize', bobProfile);
+    const { durationMs: finMs } = cli('balance --finalize', bobProfile);
     console.log(`  Finalize completed in ${finMs.toFixed(0)}ms`);
 
     // Test 7: Send-back UCT (instant, bob → alice)
