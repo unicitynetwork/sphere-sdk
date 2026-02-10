@@ -217,20 +217,13 @@ const result = await sphere.payments.send({
 });
 ```
 
-#### `receive(): Promise<IncomingTransfer[]>`
-#### `receive(callback): Promise<IncomingTransfer[]>`
-#### `receive(options: ReceiveOptions): Promise<ReceiveResult>`
+#### `receive(options?: ReceiveOptions): Promise<ReceiveResult>`
 
 Fetch and process pending incoming transfers from the transport layer (one-shot query).
 
 Unlike the persistent subscription that delivers events asynchronously, `receive()` explicitly
 queries the Nostr relay and resolves after all stored events are processed. Useful for
 batch/CLI applications.
-
-**Overloads:**
-
-- `receive()` / `receive(callback)` — Legacy mode. Fetches events and returns array of new transfers.
-- `receive(options)` — Options mode. Returns `ReceiveResult` with finalization support.
 
 **ReceiveOptions:**
 
@@ -252,16 +245,13 @@ batch/CLI applications.
 | `finalizationDurationMs` | `number` | Duration of finalization in ms |
 
 ```typescript
-// Simple usage (legacy)
-const transfers = await sphere.payments.receive();
+// Simple usage — fetch and submit commitments once
+const { transfers } = await sphere.payments.receive();
 
-// With callback (legacy)
-await sphere.payments.receive((transfer) => {
-  console.log(`Received ${transfer.tokens.length} tokens`);
+// With callback
+await sphere.payments.receive({
+  callback: (transfer) => console.log(`Received ${transfer.tokens.length} tokens`),
 });
-
-// With options — submit commitments, don't wait
-const result = await sphere.payments.receive({});
 
 // Wait for finalization
 const result = await sphere.payments.receive({

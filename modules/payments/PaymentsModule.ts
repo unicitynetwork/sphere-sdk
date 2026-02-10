@@ -1798,40 +1798,21 @@ export class PaymentsModule {
    * through the existing pipeline, and resolves after all stored events
    * are handled. Useful for batch/CLI apps that need explicit receive.
    *
-   * @returns Array of IncomingTransfer objects received during this call
-   */
-  async receive(): Promise<IncomingTransfer[]>;
-  /**
-   * Fetch and process pending incoming transfers with a callback.
-   *
-   * @param callback - Invoked for each received transfer (same as transfer:incoming)
-   * @returns Array of IncomingTransfer objects received during this call
-   */
-  async receive(callback: (transfer: IncomingTransfer) => void): Promise<IncomingTransfer[]>;
-  /**
-   * Fetch and process pending incoming transfers with options.
-   *
    * When `finalize` is true, polls resolveUnconfirmed() + load() until all
-   * tokens are confirmed or the timeout expires.
+   * tokens are confirmed or the timeout expires. Otherwise calls
+   * resolveUnconfirmed() once to submit pending commitments.
    *
-   * @param options - Receive options including finalization control
+   * @param options - Optional receive options including finalization control
    * @returns ReceiveResult with transfers and finalization metadata
    */
-  async receive(options: ReceiveOptions): Promise<ReceiveResult>;
-  async receive(
-    callbackOrOptions?: ((transfer: IncomingTransfer) => void) | ReceiveOptions
-  ): Promise<IncomingTransfer[] | ReceiveResult> {
+  async receive(options?: ReceiveOptions): Promise<ReceiveResult> {
     this.ensureInitialized();
-
-    // Normalize arguments
-    const isLegacy = typeof callbackOrOptions === 'function' || callbackOrOptions === undefined;
-    const options: ReceiveOptions = isLegacy
-      ? { callback: callbackOrOptions as ((transfer: IncomingTransfer) => void) | undefined }
-      : callbackOrOptions;
 
     if (!this.deps!.transport.fetchPendingEvents) {
       throw new Error('Transport provider does not support fetchPendingEvents');
     }
+
+    const opts = options ?? {};
 
     // Phase 1: Fetch pending events
     // Snapshot token keys before fetch
@@ -1860,27 +1841,22 @@ export class PaymentsModule {
           receivedAt: Date.now(),
         };
         received.push(transfer);
-        if (options.callback) options.callback(transfer);
+        if (opts.callback) opts.callback(transfer);
       }
-    }
-
-    // Legacy mode: return plain array
-    if (isLegacy) {
-      return received;
     }
 
     // Phase 2: Finalization
     const result: ReceiveResult = { transfers: received };
 
-    if (options.finalize) {
-      const timeout = options.timeout ?? 60_000;
-      const pollInterval = options.pollInterval ?? 2_000;
+    if (opts.finalize) {
+      const timeout = opts.timeout ?? 60_000;
+      const pollInterval = opts.pollInterval ?? 2_000;
       const startTime = Date.now();
 
       while (Date.now() - startTime < timeout) {
         const resolution = await this.resolveUnconfirmed();
         result.finalization = resolution;
-        if (options.onProgress) options.onProgress(resolution);
+        if (opts.onProgress) opts.onProgress(resolution);
 
         // Check if any unconfirmed tokens remain
         const stillUnconfirmed = Array.from(this.tokens.values()).some(

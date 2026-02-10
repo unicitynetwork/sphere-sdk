@@ -57,7 +57,7 @@ await sphere.payments.send({
 });
 
 // Fetch pending transfers (explicit one-shot query)
-const transfers = await sphere.payments.receive();
+const { transfers } = await sphere.payments.receive();
 
 // Register nametag (mints token on-chain!)
 await sphere.registerNametag('myname');

@@ -225,12 +225,12 @@ For batch/CLI apps, use `receive()` to explicitly query the Nostr relay for pend
 
 ```typescript
 // Fetch and process all pending incoming transfers
-const transfers = await sphere.payments.receive();
+const { transfers } = await sphere.payments.receive();
 console.log(`Received ${transfers.length} transfers`);
 
 // With callback for each transfer
-await sphere.payments.receive((transfer) => {
-  console.log(`Received ${transfer.tokens.length} tokens`);
+await sphere.payments.receive({
+  callback: (transfer) => console.log(`Received ${transfer.tokens.length} tokens`),
 });
 ```
 

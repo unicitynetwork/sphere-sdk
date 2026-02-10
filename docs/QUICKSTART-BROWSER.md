@@ -291,7 +291,7 @@ async function sendTokens(recipient: string, amount: string) {
 For explicit receive (useful in batch operations or when you need to poll):
 
 ```typescript
-const transfers = await sphere.payments.receive();
+const { transfers } = await sphere.payments.receive();
 console.log(`Received ${transfers.length} new transfers`);
 ```
 

@@ -306,12 +306,12 @@ For batch/CLI applications that need explicit receive (one-shot query instead of
 
 ```typescript
 // Fetch and process all pending incoming transfers from Nostr
-const transfers = await sphere.payments.receive();
+const { transfers } = await sphere.payments.receive();
 console.log(`Received ${transfers.length} transfers`);
 
 // With per-transfer callback
-await sphere.payments.receive((transfer) => {
-  console.log(`Received ${transfer.tokens.length} tokens`);
+await sphere.payments.receive({
+  callback: (transfer) => console.log(`Received ${transfer.tokens.length} tokens`),
 });
 ```
 
