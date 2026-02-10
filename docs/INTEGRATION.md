@@ -250,7 +250,7 @@ const unconfirmed = sphere.payments.getTokens({ status: 'submitted' });
 `send()` auto-selects the optimal transfer path (whole-token NOSTR-FIRST or instant split V5).
 
 ```typescript
-// Send to nametag (auto address mode)
+// Send to nametag (auto address mode, instant transfer — default)
 const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',
@@ -258,8 +258,16 @@ const result = await sphere.payments.send({
   memo: 'Payment for coffee',
 });
 
-// Send with explicit address mode
+// Send with conservative mode (collect all proofs first, then deliver)
 const result2 = await sphere.payments.send({
+  recipient: '@bob',
+  amount: '500000',
+  coinId: 'UCT',
+  transferMode: 'conservative',  // 'instant' (default) | 'conservative'
+});
+
+// Send with explicit address mode
+const result3 = await sphere.payments.send({
   recipient: '@bob',
   amount: '500000',
   coinId: 'UCT',
@@ -274,9 +282,16 @@ if (result.status === 'completed') {
 }
 ```
 
+**Transfer Modes:**
+
+| Mode | Description |
+|------|-------------|
+| `'instant'` (default) | Sends tokens via Nostr immediately. Receiver resolves proofs in background. Fastest sender experience (~2-3s for splits). |
+| `'conservative'` | Collects all aggregator proofs first, then sends fully finalized tokens. Slower but receiver gets immediately usable tokens. |
+
 ### Receive Tokens
 
-Incoming tokens are received automatically via Nostr. Subscribe to events:
+Incoming tokens are received automatically via the persistent Nostr subscription. Subscribe to events:
 
 ```typescript
 sphere.on('transfer:incoming', (transfer) => {
@@ -284,6 +299,19 @@ sphere.on('transfer:incoming', (transfer) => {
   for (const token of transfer.tokens) {
     console.log(`  ${token.amount} ${token.symbol} (status: ${token.status})`);
   }
+});
+```
+
+For batch/CLI applications that need explicit receive (one-shot query instead of persistent subscription):
+
+```typescript
+// Fetch and process all pending incoming transfers from Nostr
+const transfers = await sphere.payments.receive();
+console.log(`Received ${transfers.length} transfers`);
+
+// With per-transfer callback
+await sphere.payments.receive((transfer) => {
+  console.log(`Received ${transfer.tokens.length} tokens`);
 });
 ```
 

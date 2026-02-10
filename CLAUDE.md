@@ -47,12 +47,17 @@ const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
 // Check balance
 const balance = sphere.payments.getBalance();
 
-// Send tokens
+// Send tokens (instant mode — default)
 await sphere.payments.send({
   recipient: '@alice',  // or DIRECT://... address
   amount: '1000000',
   coinId: 'UCT',
+  // transferMode: 'instant',      // default
+  // transferMode: 'conservative', // collect proofs first
 });
+
+// Fetch pending transfers (explicit one-shot query)
+const transfers = await sphere.payments.receive();
 
 // Register nametag (mints token on-chain!)
 await sphere.registerNametag('myname');
