@@ -78,8 +78,11 @@ import {
   type MasterKey,
   type AddressInfo,
 } from './crypto';
-import { encryptSimple, decryptSimple } from './encryption';
+import { encryptSimple, decryptSimple, decryptWithSalt } from './encryption';
+import { scanAddressesImpl } from './scan';
+import type { ScanAddressesOptions, ScanAddressesResult } from './scan';
 import { vestingClassifier } from '../l1/vesting';
+import { generateAddressFromMasterKey } from '../l1/address';
 import {
   parseWalletText,
   parseAndDecryptWalletText,
@@ -563,6 +566,12 @@ export class Sphere {
     // Clear existing wallet if any (including token data)
     await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
 
+    // Reconnect storage after clear (clear may have called destroy() on the
+    // previous instance which disconnects the shared storage provider)
+    if (!options.storage.isConnected()) {
+      await options.storage.connect();
+    }
+
     const sphere = new Sphere(
       options.storage,
       options.transport,
@@ -891,7 +900,7 @@ export class Sphere {
     return {
       source: this._source,
       hasMnemonic: this._mnemonic !== null,
-      hasChainCode: this._masterKey?.chainCode !== undefined,
+      hasChainCode: !!this._masterKey?.chainCode,
       derivationMode: this._derivationMode,
       basePath: this._basePath,
       address0,
@@ -958,7 +967,7 @@ export class Sphere {
 
     if (this._masterKey) {
       masterPrivateKey = this._masterKey.privateKey;
-      chainCode = this._masterKey.chainCode;
+      chainCode = this._masterKey.chainCode || undefined;
     }
 
     // Prepare mnemonic (optionally encrypt)
@@ -1053,7 +1062,7 @@ export class Sphere {
     }
 
     const masterPrivateKey = this._masterKey?.privateKey || '';
-    const chainCode = this._masterKey?.chainCode;
+    const chainCode = this._masterKey?.chainCode || undefined;
     const isBIP32 = this._derivationMode === 'bip32';
     const descriptorPath = this._basePath.replace(/^m\//, '');
 
@@ -1343,27 +1352,106 @@ export class Sphere {
       return { success: true, sphere };
     }
 
-    // Handle JSON (redirect to importFromJSON)
+    // Handle JSON
     if (fileType === 'json') {
       const content = typeof fileContent === 'string'
         ? fileContent
         : new TextDecoder().decode(fileContent);
 
-      const result = await Sphere.importFromJSON({
-        jsonContent: content,
-        password,
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(content);
+      } catch {
+        return { success: false, error: 'Invalid JSON file' };
+      }
+
+      // sphere-wallet format — delegate to importFromJSON
+      if (parsed.type === 'sphere-wallet') {
+        const result = await Sphere.importFromJSON({
+          jsonContent: content,
+          password,
+          storage: options.storage,
+          transport: options.transport,
+          oracle: options.oracle,
+          tokenStorage: options.tokenStorage,
+        });
+
+        if (result.success) {
+          const sphere = Sphere.getInstance();
+          return { success: true, sphere: sphere!, mnemonic: result.mnemonic };
+        }
+
+        if (!password && result.error?.includes('Password required')) {
+          return { success: false, needsPassword: true, error: result.error };
+        }
+
+        return { success: false, error: result.error };
+      }
+
+      // Legacy flat JSON format (webwallet export)
+      let masterKey: string | undefined;
+      let mnemonic: string | undefined;
+
+      if (parsed.encrypted && typeof parsed.encrypted === 'object') {
+        // Encrypted legacy JSON — needs password + salt-based PBKDF2 decryption
+        if (!password) {
+          return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
+        }
+        const enc = parsed.encrypted as { masterPrivateKey?: string; mnemonic?: string; salt?: string };
+        if (!enc.salt || !enc.masterPrivateKey) {
+          return { success: false, error: 'Invalid encrypted wallet format' };
+        }
+        const decryptedKey = decryptWithSalt(enc.masterPrivateKey, password, enc.salt);
+        if (!decryptedKey) {
+          return { success: false, error: 'Failed to decrypt - incorrect password?' };
+        }
+        masterKey = decryptedKey;
+        if (enc.mnemonic) {
+          mnemonic = decryptWithSalt(enc.mnemonic, password, enc.salt) ?? undefined;
+        }
+      } else {
+        // Unencrypted legacy JSON
+        masterKey = parsed.masterPrivateKey as string | undefined;
+        mnemonic = parsed.mnemonic as string | undefined;
+      }
+
+      if (!masterKey) {
+        return { success: false, error: 'No master key found in wallet JSON' };
+      }
+
+      const chainCode = parsed.chainCode as string | undefined;
+      const descriptorPath = parsed.descriptorPath as string | undefined;
+      const derivationMode = (parsed.derivationMode as string | undefined);
+      const isBIP32 = derivationMode === 'bip32' || !!chainCode;
+      const basePath = descriptorPath
+        ? `m/${descriptorPath}`
+        : (isBIP32 ? "m/84'/1'/0'" : DEFAULT_BASE_PATH);
+
+      if (mnemonic) {
+        const sphere = await Sphere.import({
+          mnemonic,
+          basePath,
+          storage: options.storage,
+          transport: options.transport,
+          oracle: options.oracle,
+          tokenStorage: options.tokenStorage,
+          nametag: options.nametag,
+        });
+        return { success: true, sphere, mnemonic };
+      }
+
+      const sphere = await Sphere.import({
+        masterKey,
+        chainCode,
+        basePath,
+        derivationMode: (derivationMode as DerivationMode) || (chainCode ? 'bip32' : 'wif_hmac'),
         storage: options.storage,
         transport: options.transport,
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
+        nametag: options.nametag,
       });
-
-      if (result.success) {
-        const sphere = Sphere.getInstance();
-        return { success: true, sphere: sphere!, mnemonic: result.mnemonic };
-      }
-
-      return result;
+      return { success: true, sphere };
     }
 
     return { success: false, error: 'Unsupported file type' };
@@ -1744,7 +1832,7 @@ export class Sphere {
       transport: this._transport,
       oracle: this._oracle,
       emitEvent,
-      chainCode: this._masterKey?.chainCode,
+      chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
     });
 
@@ -1792,6 +1880,11 @@ export class Sphere {
   private _deriveAddressInternal(index: number, isChange: boolean = false): AddressInfo {
     if (!this._masterKey) {
       throw new Error('HD derivation requires master key with chain code');
+    }
+
+    // WIF/HMAC mode: legacy HMAC-SHA512 derivation (no chain code, no change addresses)
+    if (this._derivationMode === 'wif_hmac') {
+      return generateAddressFromMasterKey(this._masterKey.privateKey, index);
     }
 
     const info = deriveAddressInfo(
@@ -1877,6 +1970,37 @@ export class Sphere {
     }
 
     return addresses;
+  }
+
+  /**
+   * Scan blockchain addresses to discover used addresses with balances.
+   * Derives addresses sequentially and checks L1 balance via Fulcrum.
+   * Uses gap limit to stop after N consecutive empty addresses.
+   *
+   * @param options - Scanning options
+   * @returns Scan results with found addresses and total balance
+   *
+   * @example
+   * ```ts
+   * const result = await sphere.scanAddresses({
+   *   maxAddresses: 100,
+   *   gapLimit: 20,
+   *   onProgress: (p) => console.log(`Scanned ${p.scanned}/${p.total}, found ${p.foundCount}`),
+   * });
+   * console.log(`Found ${result.addresses.length} addresses, total: ${result.totalBalance} ALPHA`);
+   * ```
+   */
+  async scanAddresses(options: ScanAddressesOptions = {}): Promise<ScanAddressesResult> {
+    this.ensureReady();
+
+    if (!this._masterKey) {
+      throw new Error('Address scanning requires HD master key');
+    }
+
+    return scanAddressesImpl(
+      (index, isChange) => this._deriveAddressInternal(index, isChange),
+      options,
+    );
   }
 
   // ===========================================================================
@@ -2619,10 +2743,12 @@ export class Sphere {
   private async initializeIdentityFromMasterKey(
     masterKey: string,
     chainCode?: string,
-    derivationPath?: string
+    _derivationPath?: string
   ): Promise<void> {
-    // Use base path (e.g., m/44'/0'/0') and append chain/index
-    const basePath = derivationPath ?? DEFAULT_BASE_PATH;
+    // Use _basePath (already set by storeMasterKey) for consistency with deriveAddress/scan.
+    // Previously used derivationPath param which was undefined for file imports,
+    // causing identity to derive at DEFAULT_BASE_PATH instead of the wallet's actual path.
+    const basePath = this._basePath;
     const fullPath = `${basePath}/0/0`;
 
     let privateKey: string;
@@ -2637,9 +2763,16 @@ export class Sphere {
         chainCode,
       };
     } else {
-      // Direct master key usage (legacy wallets)
-      privateKey = masterKey;
-      this._masterKey = null;
+      // WIF/HMAC derivation without chain code
+      // Uses HMAC-SHA512(masterKey, path) to derive child keys (legacy webwallet format)
+      const addr0 = generateAddressFromMasterKey(masterKey, 0);
+      privateKey = addr0.privateKey;
+
+      // Store masterKey for future deriveAddress() calls (chainCode unused in wif_hmac mode)
+      this._masterKey = {
+        privateKey: masterKey,
+        chainCode: '',
+      };
     }
 
     const publicKey = getPublicKey(privateKey);
@@ -2694,7 +2827,7 @@ export class Sphere {
       oracle: this._oracle,
       emitEvent,
       // Pass chain code for L1 HD derivation
-      chainCode: this._masterKey?.chainCode,
+      chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
     });
 
