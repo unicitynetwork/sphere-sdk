@@ -1997,10 +1997,53 @@ export class Sphere {
       throw new Error('Address scanning requires HD master key');
     }
 
+    // Auto-provide nametag resolver from transport if caller didn't supply one
+    const resolveNametag = options.resolveNametag ?? (
+      this._transport.resolveAddressInfo
+        ? async (l1Address: string): Promise<string | null> => {
+            try {
+              const info = await this._transport.resolveAddressInfo!(l1Address);
+              return info?.nametag ?? null;
+            } catch { return null; }
+          }
+        : undefined
+    );
+
     return scanAddressesImpl(
       (index, isChange) => this._deriveAddressInternal(index, isChange),
-      options,
+      { ...options, resolveNametag },
     );
+  }
+
+  /**
+   * Bulk-track scanned addresses with visibility and nametag data.
+   * Selected addresses get `hidden: false`, unselected get `hidden: true`.
+   * Performs only 2 storage writes total (tracked addresses + nametags).
+   */
+  async trackScannedAddresses(
+    entries: Array<{ index: number; hidden: boolean; nametag?: string }>,
+  ): Promise<void> {
+    this.ensureReady();
+
+    for (const { index, hidden, nametag } of entries) {
+      const tracked = await this.ensureAddressTracked(index);
+
+      if (nametag) {
+        let nametags = this._addressNametags.get(tracked.addressId);
+        if (!nametags) {
+          nametags = new Map();
+          this._addressNametags.set(tracked.addressId, nametags);
+        }
+        if (!nametags.has(0)) nametags.set(0, nametag);
+      }
+
+      if (tracked.hidden !== hidden) {
+        (tracked as { hidden: boolean }).hidden = hidden;
+      }
+    }
+
+    await this.persistTrackedAddresses();
+    await this.persistAddressNametags();
   }
 
   // ===========================================================================

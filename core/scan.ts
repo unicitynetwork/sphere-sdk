@@ -22,6 +22,8 @@ export interface ScanAddressProgress {
   foundCount: number;
   /** Current gap count (consecutive empty addresses) */
   currentGap: number;
+  /** Number of found addresses that have a nametag */
+  nametagsFoundCount: number;
 }
 
 /** Single scanned address result */
@@ -36,6 +38,8 @@ export interface ScannedAddressResult {
   balance: number;
   /** Whether this is a change address (chain 1) */
   isChange: boolean;
+  /** Nametag associated with this address (resolved during scan) */
+  nametag?: string;
 }
 
 /** Options for scanning addresses */
@@ -50,6 +54,8 @@ export interface ScanAddressesOptions {
   onProgress?: (progress: ScanAddressProgress) => void;
   /** Abort signal for cancellation */
   signal?: AbortSignal;
+  /** Resolve nametag for a found address. Return nametag string or null. */
+  resolveNametag?: (l1Address: string) => Promise<string | null>;
 }
 
 /** Result of scanning */
@@ -82,7 +88,7 @@ export async function scanAddressesImpl(
   const maxAddresses = options.maxAddresses ?? 50;
   const gapLimit = options.gapLimit ?? 20;
   const includeChange = options.includeChange ?? true;
-  const { onProgress, signal } = options;
+  const { onProgress, signal, resolveNametag } = options;
 
   // Dynamic import to avoid hard dependency on L1 for non-L1 consumers
   const { connect, getBalance } = await import('../l1/network');
@@ -91,6 +97,7 @@ export async function scanAddressesImpl(
   const foundAddresses: ScannedAddressResult[] = [];
   let totalBalance = 0;
   let totalScanned = 0;
+  let nametagsFoundCount = 0;
 
   const chains: boolean[] = includeChange ? [false, true] : [false];
   const totalToScan = maxAddresses * chains.length;
@@ -110,18 +117,34 @@ export async function scanAddressesImpl(
         currentAddress: addrInfo.address,
         foundCount: foundAddresses.length,
         currentGap: consecutiveEmpty,
+        nametagsFoundCount,
       });
 
       try {
         const balance = await getBalance(addrInfo.address);
 
         if (balance > 0) {
+          // Resolve nametag for addresses with balance
+          let nametag: string | undefined;
+          if (resolveNametag) {
+            try {
+              const tag = await resolveNametag(addrInfo.address);
+              if (tag) {
+                nametag = tag;
+                nametagsFoundCount++;
+              }
+            } catch {
+              // Nametag resolution failure is non-fatal
+            }
+          }
+
           foundAddresses.push({
             index,
             address: addrInfo.address,
             path: addrInfo.path,
             balance,
             isChange,
+            nametag,
           });
           totalBalance += balance;
           consecutiveEmpty = 0;
