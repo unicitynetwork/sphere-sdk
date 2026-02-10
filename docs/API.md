@@ -217,28 +217,6 @@ const result = await sphere.payments.send({
 });
 ```
 
-#### `processInstantSplitBundle(bundle: InstantSplitBundle, senderPubkey: string): Promise<InstantSplitProcessResult>`
-
-Process a received instant split bundle (recipient side).
-
-- **V5 bundles**: Saved immediately as unconfirmed (`status: 'submitted'`), proofs resolved lazily via `resolveUnconfirmed()`.
-- **V4 bundles** (dev mode): Processed synchronously — all proofs acquired before returning.
-
-```typescript
-interface InstantSplitProcessResult {
-  success: boolean;
-  token?: any;           // Finalized SDK token (if successful)
-  error?: string;
-  durationMs: number;
-}
-```
-
-#### `isInstantSplitBundle(payload: unknown): payload is InstantSplitBundle`
-
-Type-guard to check if a payload is a valid InstantSplitBundle (V4 or V5).
-
----
-
 ### Methods: Unconfirmed Token Resolution
 
 #### `resolveUnconfirmed(): Promise<UnconfirmedResolutionResult>`

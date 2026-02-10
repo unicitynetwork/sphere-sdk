@@ -1140,7 +1140,7 @@ export class PaymentsModule {
    * @param senderPubkey - Sender's public key for verification
    * @returns Processing result with finalized token
    */
-  async processInstantSplitBundle(
+  private async processInstantSplitBundle(
     bundle: InstantSplitBundle,
     senderPubkey: string
   ): Promise<InstantSplitProcessResult> {
@@ -1322,7 +1322,7 @@ export class PaymentsModule {
    * @param payload - The object to test.
    * @returns `true` if the payload matches the InstantSplitBundle shape.
    */
-  isInstantSplitBundle(payload: unknown): payload is InstantSplitBundle {
+  private isInstantSplitBundle(payload: unknown): payload is InstantSplitBundle {
     return isInstantSplitBundle(payload);
   }
 
