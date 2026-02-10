@@ -210,27 +210,47 @@ interface AddressInfo {
 
 ### Get Balance
 
+`getBalance()` is **synchronous** and returns `TokenBalance[]` — one entry per coin type.
+
 ```typescript
-const balance = await sphere.payments.getBalance();
-// Returns: { total: '1000000', available: '1000000', pending: '0' }
+const balances = sphere.payments.getBalance();
+
+for (const bal of balances) {
+  console.log(`${bal.symbol}:`);
+  console.log(`  Confirmed:   ${bal.confirmedAmount} (${bal.confirmedTokenCount} tokens)`);
+  console.log(`  Unconfirmed: ${bal.unconfirmedAmount} (${bal.unconfirmedTokenCount} tokens)`);
+  console.log(`  Total:       ${bal.totalAmount}`);
+}
+
+// Filter to a single coin
+const uctBalances = sphere.payments.getBalance('UCT_COIN_ID_HEX');
 ```
+
+> **Side effect:** `getBalance()` fires a non-blocking `resolveUnconfirmed()` call to advance any pending V5 token finalizations.
 
 ### Get Tokens
 
+`getTokens()` is **synchronous** and returns `Token[]`.
+
 ```typescript
-const tokens = await sphere.payments.getTokens();
+const tokens = sphere.payments.getTokens();
 
 for (const token of tokens) {
   console.log(`Token ${token.id}: ${token.amount} ${token.symbol}`);
-  console.log(`  Status: ${token.status}`);  // 'confirmed' | 'pending' | 'spent'
-  console.log(`  Coin ID: ${token.coinId}`);
+  console.log(`  Status: ${token.status}`);
+  // Possible statuses: 'pending' | 'submitted' | 'confirmed' | 'transferring' | 'spent' | 'invalid'
 }
+
+// Filter by status — e.g., get only unconfirmed tokens
+const unconfirmed = sphere.payments.getTokens({ status: 'submitted' });
 ```
 
 ### Send Tokens
 
+`send()` auto-selects the optimal transfer path (whole-token NOSTR-FIRST or instant split V5).
+
 ```typescript
-// Send to nametag
+// Send to nametag (auto address mode)
 const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',
@@ -238,15 +258,17 @@ const result = await sphere.payments.send({
   memo: 'Payment for coffee',
 });
 
-// Send to public key
-const result = await sphere.payments.send({
-  recipient: '02abc123...',
+// Send with explicit address mode
+const result2 = await sphere.payments.send({
+  recipient: '@bob',
   amount: '500000',
   coinId: 'UCT',
+  addressMode: 'direct',  // 'auto' | 'direct' | 'proxy'
 });
 
-if (result.success) {
-  console.log('Transfer ID:', result.transferId);
+// Check result
+if (result.status === 'completed') {
+  console.log('Transfer completed, txHash:', result.txHash);
 } else {
   console.error('Transfer failed:', result.error);
 }
@@ -258,15 +280,91 @@ Incoming tokens are received automatically via Nostr. Subscribe to events:
 
 ```typescript
 sphere.on('transfer:incoming', (transfer) => {
-  console.log('Received tokens from:', transfer.senderNametag);
-  console.log('Amount:', transfer.amount);
+  console.log('Received tokens from:', transfer.senderPubkey);
+  for (const token of transfer.tokens) {
+    console.log(`  ${token.amount} ${token.symbol} (status: ${token.status})`);
+  }
 });
 ```
 
-### Refresh Tokens
+### Reload Tokens
+
+To reload tokens from storage (e.g., after external changes):
 
 ```typescript
-await sphere.payments.refresh();
+await sphere.payments.load();
+```
+
+---
+
+## Instant Transfers & Token Resolution
+
+### How Transfers Work Internally
+
+When you call `send()`, the SDK automatically selects the optimal path:
+
+1. **Whole-token transfers** (no split needed): Sends the commitment and source token via Nostr immediately, then submits the commitment to the aggregator in the background. The recipient polls for the inclusion proof and finalizes.
+
+2. **Split transfers** (exact amount unavailable): Uses the Instant Split V5 flow — burns the source token, creates mint commitments for the payment and change amounts, and sends the bundle via Nostr. The recipient saves the token as unconfirmed and resolves proofs lazily.
+
+### Receiving Unconfirmed Tokens
+
+V5 split tokens arrive as unconfirmed (status: `'submitted'`). They are immediately usable for balance display but require proof resolution before they can be spent.
+
+```typescript
+sphere.on('transfer:incoming', (transfer) => {
+  for (const token of transfer.tokens) {
+    if (token.status === 'submitted') {
+      console.log('Unconfirmed token received — will resolve automatically');
+    } else if (token.status === 'confirmed') {
+      console.log('Fully confirmed token received');
+    }
+  }
+});
+```
+
+### Checking Confirmed vs Unconfirmed Balance
+
+```typescript
+const balances = sphere.payments.getBalance();
+for (const bal of balances) {
+  if (BigInt(bal.unconfirmedAmount) > 0n) {
+    console.log(`${bal.symbol}: ${bal.unconfirmedAmount} awaiting confirmation`);
+  }
+}
+```
+
+### Resolving Unconfirmed Tokens
+
+`resolveUnconfirmed()` is called automatically by `getBalance()` and `load()`, but you can call it explicitly:
+
+```typescript
+const result = await sphere.payments.resolveUnconfirmed();
+console.log(`Resolved: ${result.resolved}, Still pending: ${result.stillPending}, Failed: ${result.failed}`);
+
+for (const detail of result.details) {
+  console.log(`  Token ${detail.tokenId}: stage=${detail.stage}, status=${detail.status}`);
+}
+```
+
+### Waiting for Full Confirmation
+
+To wait until all tokens are confirmed, poll `resolveUnconfirmed()`:
+
+```typescript
+async function waitForAllConfirmed(maxWaitMs = 60000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const result = await sphere.payments.resolveUnconfirmed();
+    if (result.stillPending === 0) {
+      console.log(`All tokens confirmed (${result.resolved} resolved)`);
+      return;
+    }
+    console.log(`Still pending: ${result.stillPending}`);
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  console.log('Timeout waiting for confirmation');
+}
 ```
 
 ---
@@ -739,19 +837,17 @@ try {
 }
 ```
 
-### Validation Errors
+### Token Validation
 
 ```typescript
-// Check before sending
-const validation = await sphere.payments.validateTransfer({
-  recipient: '@alice',
-  amount: '1000000',
-  coinId: 'UCT',
-});
+// Validate all tokens against the aggregator
+const { valid, invalid } = await sphere.payments.validate();
 
-if (!validation.valid) {
-  console.error(validation.errors);
-  // ['Insufficient balance', 'Invalid recipient']
+if (invalid.length > 0) {
+  console.warn(`${invalid.length} tokens marked invalid`);
+  for (const token of invalid) {
+    console.warn(`  ${token.id}: ${token.amount} ${token.symbol}`);
+  }
 }
 ```
 

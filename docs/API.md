@@ -114,60 +114,444 @@ Delete all wallet data from storage.
 
 ## PaymentsModule
 
-### Methods
+Access via `sphere.payments`.
 
-#### `getBalance(): Promise<Balance>`
+Handles all L3 (Unicity state transition network) token operations including transfers, balance queries, token lifecycle management, nametag minting, and multi-provider sync.
 
-```typescript
-interface Balance {
-  total: string;      // Total balance in smallest units
-  available: string;  // Spendable balance
-  pending: string;    // Unconfirmed balance
-}
+### Transfer Modes
+
+`send()` automatically selects the optimal transfer path:
+
+```
+Path 1 — Whole-Token NOSTR-FIRST (no split needed):
+  ┌─────────┐    commitment + token    ┌───────────┐
+  │  Sender  │ ────── Nostr ──────────>│ Recipient  │
+  └────┬─────┘                         └─────┬──────┘
+       │  submit commitment (background)      │  submit commitment (idempotent)
+       └──────> Aggregator <──────────────────┘  poll for proof → finalize
+
+Path 2 — Instant Split V5 (~2.3s sender latency):
+  ┌─────────┐  burn  ┌────────────┐  bundle via Nostr  ┌───────────┐
+  │  Sender  │──────> │ Aggregator │                    │ Recipient  │
+  └────┬─────┘ proof  └────────────┘                    └─────┬──────┘
+       │ create mints + transfer commitment                   │
+       │ ──────────── Nostr ─────────────────────────────────>│
+       │  background: submit mints, save change               │ submit mint
+       │                                                      │ wait for proof
+       │                                                      │ submit transfer
+       │                                                      │ finalize
 ```
 
-#### `getTokens(): Promise<Token[]>`
+### Address Modes
 
-```typescript
-interface Token {
-  id: string;
-  symbol: string;
-  amount: string;
-  coinId: string;
-  status: 'confirmed' | 'pending' | 'spent';
-  sdkData: string;  // Serialized SDK token
-}
-```
+| Mode | Description |
+|------|-------------|
+| `'auto'` (default) | Uses `DirectAddress` if stored in nametag info; falls back to `ProxyAddress` for legacy nametags |
+| `'direct'` | Forces `DirectAddress` — fails if recipient has no stored direct address |
+| `'proxy'` | Forces `ProxyAddress` via nametag lookup |
+
+---
+
+### Methods: Token Transfers
 
 #### `send(request: TransferRequest): Promise<TransferResult>`
 
+Send tokens to a recipient. Automatically splits tokens when the exact amount is not available as a single token.
+
 ```typescript
 interface TransferRequest {
-  recipient: string;  // Nametag (@name) or public key
-  amount: string;
-  coinId: string;
-  memo?: string;
+  readonly coinId: string;       // Coin type (hex string)
+  readonly amount: string;       // Amount in smallest units
+  readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, or PROXY://
+  readonly memo?: string;        // Optional message
+  readonly addressMode?: AddressMode;  // 'auto' | 'direct' | 'proxy'
 }
 
+type AddressMode = 'auto' | 'direct' | 'proxy';
+
 interface TransferResult {
+  readonly id: string;           // Local transfer UUID
+  status: TransferStatus;        // Current status
+  readonly tokens: Token[];      // Tokens involved
+  txHash?: string;               // Aggregator request ID or split marker
+  error?: string;                // Error message if failed
+}
+
+type TransferStatus = 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';
+```
+
+**Events emitted:** `transfer:confirmed` on success, `transfer:failed` on error.
+
+```typescript
+const result = await sphere.payments.send({
+  recipient: '@alice',
+  amount: '1000000',
+  coinId: 'UCT',
+  addressMode: 'auto',
+});
+console.log(result.status); // 'completed'
+```
+
+#### `sendInstant(request: TransferRequest, options?: InstantSplitOptions): Promise<InstantSplitResult>`
+
+Send tokens using the instant flow. Delegates to `send()` internally — kept for backward compatibility.
+
+```typescript
+interface InstantSplitResult {
   success: boolean;
-  transferId?: string;
+  nostrEventId?: string;
+  splitGroupId?: string;
+  criticalPathDurationMs: number;
+  error?: string;
+  backgroundStarted?: boolean;
+}
+
+interface InstantSplitOptions {
+  nostrTimeoutMs?: number;        // Default: 30000
+  burnProofTimeoutMs?: number;    // Default: 60000
+  mintProofTimeoutMs?: number;    // Default: 60000
+  skipBackground?: boolean;
+  devMode?: boolean;
+  onBurnCompleted?: (burnTxJson: string) => void;
+  onNostrDelivered?: (eventId: string) => void;
+  onBackgroundProgress?: (status: BackgroundProgressStatus) => void;
+  onChangeTokenCreated?: (token: any) => Promise<void>;
+  onStorageSync?: () => Promise<boolean>;
+}
+```
+
+#### `processInstantSplitBundle(bundle: InstantSplitBundle, senderPubkey: string): Promise<InstantSplitProcessResult>`
+
+Process a received instant split bundle (recipient side).
+
+- **V5 bundles**: Saved immediately as unconfirmed (`status: 'submitted'`), proofs resolved lazily via `resolveUnconfirmed()`.
+- **V4 bundles** (dev mode): Processed synchronously — all proofs acquired before returning.
+
+```typescript
+interface InstantSplitProcessResult {
+  success: boolean;
+  token?: any;           // Finalized SDK token (if successful)
+  error?: string;
+  durationMs: number;
+}
+```
+
+#### `isInstantSplitBundle(payload: unknown): payload is InstantSplitBundle`
+
+Type-guard to check if a payload is a valid InstantSplitBundle (V4 or V5).
+
+---
+
+### Methods: Unconfirmed Token Resolution
+
+#### `resolveUnconfirmed(): Promise<UnconfirmedResolutionResult>`
+
+Attempt to resolve unconfirmed (`status: 'submitted'`) tokens by acquiring missing aggregator proofs.
+
+V5 tokens progress through stages:
+
+```
+RECEIVED → MINT_SUBMITTED → MINT_PROVEN → TRANSFER_SUBMITTED → FINALIZED
+```
+
+- Uses 500ms quick-timeouts per proof check (non-blocking).
+- Tokens exceeding 50 failed attempts are marked `'invalid'`.
+- Automatically called (fire-and-forget) by `getBalance()` and `load()`.
+
+```typescript
+interface UnconfirmedResolutionResult {
+  resolved: number;       // Tokens fully confirmed
+  stillPending: number;   // Tokens still waiting for proofs
+  failed: number;         // Tokens that exceeded retry limit
+  details: Array<{
+    tokenId: string;
+    stage: string;        // Current V5FinalizationStage
+    status: 'resolved' | 'pending' | 'failed';
+  }>;
+}
+
+type V5FinalizationStage = 'RECEIVED' | 'MINT_SUBMITTED' | 'MINT_PROVEN' | 'TRANSFER_SUBMITTED' | 'FINALIZED';
+```
+
+---
+
+### Methods: Balance & Token Queries
+
+#### `getBalance(coinId?: string): TokenBalance[]`
+
+Get token balances grouped by coin type. **Synchronous** (no await needed).
+
+Skips tokens with status `'spent'`, `'invalid'`, or `'transferring'`. Fires a non-blocking `resolveUnconfirmed()` call as a side effect.
+
+```typescript
+interface TokenBalance {
+  readonly coinId: string;
+  readonly symbol: string;
+  readonly name: string;
+  readonly totalAmount: string;          // confirmedAmount + unconfirmedAmount
+  readonly confirmedAmount: string;      // Tokens with inclusion proofs
+  readonly unconfirmedAmount: string;    // Tokens pending proof (status: 'submitted')
+  readonly tokenCount: number;           // Total token count
+  readonly confirmedTokenCount: number;
+  readonly unconfirmedTokenCount: number;
+  readonly decimals: number;
+}
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `coinId` | `string?` | Filter to a specific coin type. Omit for all. |
+
+```typescript
+const balances = sphere.payments.getBalance();
+for (const bal of balances) {
+  console.log(`${bal.symbol}: ${bal.confirmedAmount} confirmed, ${bal.unconfirmedAmount} unconfirmed`);
+}
+```
+
+#### `getTokens(filter?): Token[]`
+
+Get all tokens, optionally filtered. **Synchronous**.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filter.coinId` | `string?` | Filter by coin type |
+| `filter.status` | `TokenStatus?` | Filter by status (e.g. `'submitted'` for unconfirmed) |
+
+```typescript
+type TokenStatus = 'pending' | 'submitted' | 'confirmed' | 'transferring' | 'spent' | 'invalid';
+
+interface Token {
+  readonly id: string;
+  readonly coinId: string;
+  readonly symbol: string;
+  readonly name: string;
+  readonly decimals: number;
+  readonly iconUrl?: string;
+  readonly amount: string;
+  status: TokenStatus;
+  readonly createdAt: number;
+  updatedAt: number;
+  readonly sdkData?: string;    // Serialized SDK token JSON
+}
+```
+
+#### `getToken(id: string): Token | undefined`
+
+Get a single token by its local UUID.
+
+#### `getPendingTransfers(): TransferResult[]`
+
+Get all in-progress (pending) outgoing transfers.
+
+---
+
+### Methods: Token CRUD
+
+#### `addToken(token: Token, skipHistory?: boolean): Promise<boolean>`
+
+Add a token to the wallet.
+
+- **Tombstone check**: Rejected if exact `(tokenId, stateHash)` is tombstoned.
+- **Duplicate check**: Rejected if same composite key already exists.
+- **State replacement**: If same `tokenId` with different `stateHash`, archives old state and adds new.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `token` | `Token` | — | Token to add |
+| `skipHistory` | `boolean` | `false` | Skip creating a RECEIVED history entry |
+
+Returns `true` if added, `false` if rejected.
+
+#### `updateToken(token: Token): Promise<void>`
+
+Update an existing token. Matches by genesis tokenId or `token.id`. Falls back to `addToken()` if not found.
+
+#### `removeToken(tokenId: string, recipientNametag?: string, skipHistory?: boolean): Promise<void>`
+
+Remove a token. Archives it first, creates a tombstone `(tokenId, stateHash)`, and optionally adds a SENT history entry.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `tokenId` | `string` | — | Local UUID of the token |
+| `recipientNametag` | `string?` | — | Recipient nametag for history |
+| `skipHistory` | `boolean` | `false` | Skip creating a SENT history entry |
+
+---
+
+### Methods: Tombstones
+
+Tombstones prevent spent tokens from being re-added (e.g. via Nostr re-delivery). Each tombstone is keyed by `(tokenId, stateHash)`.
+
+#### `getTombstones(): TombstoneEntry[]`
+
+Get all tombstone entries.
+
+```typescript
+interface TombstoneEntry {
+  tokenId: string;
+  stateHash: string;
+  timestamp: number;
+}
+```
+
+#### `isStateTombstoned(tokenId: string, stateHash: string): boolean`
+
+Check if a specific `(tokenId, stateHash)` is tombstoned.
+
+#### `mergeTombstones(remoteTombstones: TombstoneEntry[]): Promise<number>`
+
+Merge remote tombstones (union). Removes any local tokens matching remote tombstones. Returns number of local tokens removed.
+
+#### `pruneTombstones(maxAge?: number): Promise<void>`
+
+Remove tombstones older than `maxAge` (default: 30 days) and cap at 100 entries.
+
+---
+
+### Methods: Archives
+
+Archived tokens are spent or superseded token versions kept for recovery and sync.
+
+#### `getArchivedTokens(): Map<string, TxfToken>`
+
+Get all archived tokens. Key is genesis token ID.
+
+#### `getBestArchivedVersion(tokenId: string): TxfToken | null`
+
+Get the version with the most committed transactions from both archives and forks.
+
+#### `mergeArchivedTokens(remoteArchived: Map<string, TxfToken>): Promise<number>`
+
+Merge remote archived tokens. Handles incremental updates and forks. Returns count of tokens updated/added.
+
+#### `pruneArchivedTokens(maxCount?: number): Promise<void>`
+
+Keep at most `maxCount` archived tokens (default: 100).
+
+---
+
+### Methods: Forked Tokens
+
+Forked tokens are alternative histories detected during sync.
+
+#### `getForkedTokens(): Map<string, TxfToken>`
+
+Get all forked tokens. Key is `{tokenId}_{stateHash}`.
+
+#### `storeForkedToken(tokenId: string, stateHash: string, txfToken: TxfToken): Promise<void>`
+
+Store a forked token version. No-op if key already exists.
+
+#### `mergeForkedTokens(remoteForked: Map<string, TxfToken>): Promise<number>`
+
+Merge remote forked tokens (adds missing keys). Returns count added.
+
+#### `pruneForkedTokens(maxCount?: number): Promise<void>`
+
+Keep at most `maxCount` forked tokens (default: 50).
+
+---
+
+### Methods: Transaction History
+
+#### `getHistory(): TransactionHistoryEntry[]`
+
+Get transaction history sorted newest-first.
+
+```typescript
+interface TransactionHistoryEntry {
+  id: string;
+  type: 'SENT' | 'RECEIVED' | 'SPLIT' | 'MINT';
+  amount: string;
+  coinId: string;
+  symbol: string;
+  timestamp: number;
+  recipientNametag?: string;
+  senderPubkey?: string;
+  txHash?: string;
+}
+```
+
+#### `addToHistory(entry: Omit<TransactionHistoryEntry, 'id'>): Promise<void>`
+
+Append a history entry (UUID auto-generated). Persisted immediately.
+
+---
+
+### Methods: Nametag Management
+
+#### `mintNametag(nametag: string): Promise<MintNametagResult>`
+
+Mint a nametag token on-chain. Required for receiving tokens via PROXY addresses.
+
+```typescript
+interface MintNametagResult {
+  success: boolean;
+  token?: Token;
+  nametagData?: NametagData;
   error?: string;
 }
 ```
 
-#### `refresh(): Promise<void>`
+#### `isNametagAvailable(nametag: string): Promise<boolean>`
 
-Refresh token list from storage and network.
+Check if a nametag is available for minting.
 
-#### `validateTransfer(request: TransferRequest): Promise<ValidationResult>`
+#### `setNametag(nametag: NametagData): Promise<void>`
+
+Set nametag data (persists to storage and file).
+
+#### `getNametag(): NametagData | null`
+
+Get current nametag data.
+
+#### `hasNametag(): boolean`
+
+Check if a nametag is set.
+
+#### `clearNametag(): Promise<void>`
+
+Remove nametag data from memory and storage.
+
+---
+
+### Methods: Sync & Validation
+
+#### `sync(): Promise<{ added: number; removed: number }>`
+
+Sync with all configured token storage providers. Emits `sync:started`, `sync:completed`, `sync:error` events.
+
+#### `validate(): Promise<{ valid: Token[]; invalid: Token[] }>`
+
+Validate all tokens against the aggregator. Invalid/spent tokens are marked `'invalid'`.
+
+#### `load(): Promise<void>`
+
+Load all token data from storage providers. Restores pending V5 tokens and triggers `resolveUnconfirmed()`.
+
+#### `destroy(): void`
+
+Cleanup all subscriptions, polling jobs, and pending resolvers.
+
+#### `getConfig(): PaymentsModuleConfig`
+
+Get module configuration with defaults applied.
 
 ```typescript
-interface ValidationResult {
-  valid: boolean;
-  errors: string[];
+interface PaymentsModuleConfig {
+  autoSync?: boolean;      // Default: true
+  autoValidate?: boolean;  // Default: true
+  retryFailed?: boolean;   // Default: true
+  maxRetries?: number;     // Default: 3
+  debug?: boolean;         // Default: false
+  l1?: L1PaymentsModuleConfig;
 }
 ```
+
+#### `updateTokenStorageProviders(providers: Map<string, TokenStorageProvider>): void`
+
+Replace token storage providers at runtime.
 
 ---
 
@@ -561,6 +945,63 @@ interface SphereEventMap {
     nametag?: string;
     addressIndex: number;
   };
+}
+```
+
+### InstantSplitBundleV5
+
+The production bundle format for instant split transfers (~2.3s sender latency).
+
+```typescript
+interface InstantSplitBundleV5 {
+  version: '5.0';
+  type: 'INSTANT_SPLIT';
+  burnTransaction: string;         // Proven burn transaction JSON
+  recipientMintData: string;       // MintTransactionData JSON
+  transferCommitment: string;      // Pre-created TransferCommitment JSON
+  amount: string;                  // Payment amount
+  coinId: string;                  // Coin ID hex
+  tokenTypeHex: string;
+  splitGroupId: string;            // Recovery correlation ID
+  senderPubkey: string;
+  recipientSaltHex: string;
+  transferSaltHex: string;
+  mintedTokenStateJson: string;    // Intermediate minted token state
+  finalRecipientStateJson: string; // Final recipient state after transfer
+  recipientAddressJson: string;    // PROXY or DIRECT address
+  nametagTokenJson?: string;       // Nametag token for PROXY transfers
+}
+```
+
+### PendingV5Finalization
+
+Metadata stored in unconfirmed token's `sdkData` to track finalization progress.
+
+```typescript
+interface PendingV5Finalization {
+  type: 'v5_bundle';
+  stage: V5FinalizationStage;
+  bundleJson: string;
+  senderPubkey: string;
+  savedAt: number;
+  lastAttemptAt?: number;
+  attemptCount: number;
+  mintProofJson?: string;
+}
+```
+
+### PaymentsModuleDependencies
+
+```typescript
+interface PaymentsModuleDependencies {
+  identity: FullIdentity;
+  storage: StorageProvider;
+  tokenStorageProviders?: Map<string, TokenStorageProvider>;
+  transport: TransportProvider;
+  oracle: OracleProvider;
+  emitEvent: (type: SphereEventType, data: SphereEventMap[type]) => void;
+  chainCode?: string;
+  l1Addresses?: string[];
 }
 ```
 

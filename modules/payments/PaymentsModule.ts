@@ -653,7 +653,11 @@ export class PaymentsModule {
     this.l1 = l1Enabled ? new L1PaymentsModule(config?.l1) : null;
   }
 
-  /** Get module configuration */
+  /**
+   * Get the current module configuration (excluding L1 config).
+   *
+   * @returns Resolved configuration with all defaults applied.
+   */
   getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1'> {
     return this.moduleConfig;
   }
@@ -705,7 +709,11 @@ export class PaymentsModule {
   }
 
   /**
-   * Load tokens from storage
+   * Load all token data from storage providers and restore wallet state.
+   *
+   * Loads tokens, nametag data, transaction history, and pending transfers
+   * from configured storage providers. Restores pending V5 tokens and
+   * triggers a fire-and-forget {@link resolveUnconfirmed} call.
    */
   async load(): Promise<void> {
     this.ensureInitialized();
@@ -763,7 +771,10 @@ export class PaymentsModule {
   }
 
   /**
-   * Cleanup resources
+   * Cleanup all subscriptions, polling jobs, and pending resolvers.
+   *
+   * Should be called when the wallet is being shut down or the module is
+   * no longer needed. Also destroys the L1 sub-module if present.
    */
   destroy(): void {
     this.unsubscribeTransfers?.();
@@ -1234,7 +1245,10 @@ export class PaymentsModule {
   }
 
   /**
-   * Check if a payload is an instant split bundle
+   * Type-guard: check whether a payload is a valid {@link InstantSplitBundle} (V4 or V5).
+   *
+   * @param payload - The object to test.
+   * @returns `true` if the payload matches the InstantSplitBundle shape.
    */
   isInstantSplitBundle(payload: unknown): payload is InstantSplitBundle {
     return isInstantSplitBundle(payload);
@@ -1335,14 +1349,21 @@ export class PaymentsModule {
   }
 
   /**
-   * Get pending payment requests count
+   * Get the count of payment requests with status `'pending'`.
+   *
+   * @returns Number of pending incoming payment requests.
    */
   getPendingPaymentRequestsCount(): number {
     return this.paymentRequests.filter((r) => r.status === 'pending').length;
   }
 
   /**
-   * Accept a payment request (marks it as accepted, user should then call send())
+   * Accept a payment request and notify the requester.
+   *
+   * Marks the request as `'accepted'` and sends a response via transport.
+   * The caller should subsequently call {@link send} to fulfill the payment.
+   *
+   * @param requestId - ID of the incoming payment request to accept.
    */
   async acceptPaymentRequest(requestId: string): Promise<void> {
     this.updatePaymentRequestStatus(requestId, 'accepted');
@@ -1350,7 +1371,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Reject a payment request
+   * Reject a payment request and notify the requester.
+   *
+   * @param requestId - ID of the incoming payment request to reject.
    */
   async rejectPaymentRequest(requestId: string): Promise<void> {
     this.updatePaymentRequestStatus(requestId, 'rejected');
@@ -1358,21 +1381,30 @@ export class PaymentsModule {
   }
 
   /**
-   * Mark a payment request as paid (after successful transfer)
+   * Mark a payment request as paid (local status update only).
+   *
+   * Typically called after a successful {@link send} to record that the
+   * request has been fulfilled.
+   *
+   * @param requestId - ID of the incoming payment request to mark as paid.
    */
   markPaymentRequestPaid(requestId: string): void {
     this.updatePaymentRequestStatus(requestId, 'paid');
   }
 
   /**
-   * Clear processed (non-pending) payment requests
+   * Remove all non-pending incoming payment requests from memory.
+   *
+   * Keeps only requests with status `'pending'`.
    */
   clearProcessedPaymentRequests(): void {
     this.paymentRequests = this.paymentRequests.filter((r) => r.status === 'pending');
   }
 
   /**
-   * Remove a specific payment request
+   * Remove a specific incoming payment request by ID.
+   *
+   * @param requestId - ID of the payment request to remove.
    */
   removePaymentRequest(requestId: string): void {
     this.paymentRequests = this.paymentRequests.filter((r) => r.id !== requestId);
@@ -1530,7 +1562,11 @@ export class PaymentsModule {
   }
 
   /**
-   * Cancel waiting for a payment response
+   * Cancel an active {@link waitForPaymentResponse} call.
+   *
+   * The pending promise is rejected with a `'Cancelled'` error.
+   *
+   * @param requestId - The outgoing request ID whose wait should be cancelled.
    */
   cancelWaitForPaymentResponse(requestId: string): void {
     const resolver = this.pendingResponseResolvers.get(requestId);
@@ -1542,7 +1578,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Remove an outgoing payment request
+   * Remove an outgoing payment request and cancel any pending wait.
+   *
+   * @param requestId - ID of the outgoing request to remove.
    */
   removeOutgoingPaymentRequest(requestId: string): void {
     this.outgoingPaymentRequests.delete(requestId);
@@ -1550,7 +1588,7 @@ export class PaymentsModule {
   }
 
   /**
-   * Clear completed/expired outgoing payment requests
+   * Remove all outgoing payment requests that are `'paid'`, `'rejected'`, or `'expired'`.
    */
   clearCompletedOutgoingPaymentRequests(): void {
     for (const [id, request] of this.outgoingPaymentRequests) {
@@ -1652,7 +1690,17 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get balance for coin type
+   * Get token balances grouped by coin type.
+   *
+   * Returns an array of {@link TokenBalance} objects, one per coin type held.
+   * Each entry includes confirmed and unconfirmed breakdowns. Tokens with
+   * status `'spent'`, `'invalid'`, or `'transferring'` are excluded.
+   *
+   * **Side effect:** fires a non-blocking {@link resolveUnconfirmed} call to
+   * advance any pending V5 finalization stages.
+   *
+   * @param coinId - Optional coin ID to filter by (e.g. hex string). When omitted, all coin types are returned.
+   * @returns Array of balance summaries (synchronous — no await needed).
    */
   getBalance(coinId?: string): TokenBalance[] {
     // Fire-and-forget: try to resolve unconfirmed tokens
@@ -1723,7 +1771,12 @@ export class PaymentsModule {
   }
 
   /**
-   * Get all tokens
+   * Get all tokens, optionally filtered by coin type and/or status.
+   *
+   * @param filter - Optional filter criteria.
+   * @param filter.coinId - Return only tokens of this coin type.
+   * @param filter.status - Return only tokens with this status (e.g. `'submitted'` for unconfirmed).
+   * @returns Array of matching {@link Token} objects (synchronous).
    */
   getTokens(filter?: { coinId?: string; status?: TokenStatus }): Token[] {
     let tokens = Array.from(this.tokens.values());
@@ -1739,7 +1792,10 @@ export class PaymentsModule {
   }
 
   /**
-   * Get single token
+   * Get a single token by its local ID.
+   *
+   * @param id - The local UUID assigned when the token was added.
+   * @returns The token, or `undefined` if not found.
    */
   getToken(id: string): Token | undefined {
     return this.tokens.get(id);
@@ -1750,9 +1806,19 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Attempt to resolve unconfirmed tokens by acquiring missing proofs.
-   * Non-blocking: uses 500ms quick-timeouts for proof checks.
-   * Returns summary of resolution progress.
+   * Attempt to resolve unconfirmed (status `'submitted'`) tokens by acquiring
+   * their missing aggregator proofs.
+   *
+   * Each unconfirmed V5 token progresses through stages:
+   * `RECEIVED` → `MINT_SUBMITTED` → `MINT_PROVEN` → `TRANSFER_SUBMITTED` → `FINALIZED`
+   *
+   * Uses 500 ms quick-timeouts per proof check so the call returns quickly even
+   * when proofs are not yet available. Tokens that exceed 50 failed attempts are
+   * marked `'invalid'`.
+   *
+   * Automatically called (fire-and-forget) by {@link getBalance} and {@link load}.
+   *
+   * @returns Summary with counts of resolved, still-pending, and failed tokens plus per-token details.
    */
   async resolveUnconfirmed(): Promise<UnconfirmedResolutionResult> {
     this.ensureInitialized();
@@ -2120,10 +2186,18 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Add a token
-   * Tokens are uniquely identified by (tokenId, stateHash) composite key.
-   * Multiple historic states of the same token can coexist.
-   * @returns false if exact duplicate (same tokenId AND same stateHash)
+   * Add a token to the wallet.
+   *
+   * Tokens are uniquely identified by a `(tokenId, stateHash)` composite key.
+   * Duplicate detection:
+   * - **Tombstoned** — rejected if the exact `(tokenId, stateHash)` pair has a tombstone.
+   * - **Exact duplicate** — rejected if a token with the same composite key already exists.
+   * - **State replacement** — if the same `tokenId` exists with a *different* `stateHash`,
+   *   the old state is archived and replaced with the incoming one.
+   *
+   * @param token - The token to add.
+   * @param skipHistory - When `true`, do not create a `RECEIVED` transaction history entry (default `false`).
+   * @returns `true` if the token was added, `false` if rejected as duplicate or tombstoned.
    */
   async addToken(token: Token, skipHistory: boolean = false): Promise<boolean> {
     this.ensureInitialized();
@@ -2354,7 +2428,12 @@ export class PaymentsModule {
   }
 
   /**
-   * Update an existing token
+   * Update an existing token or add it if not found.
+   *
+   * Looks up the token by genesis `tokenId` (from `sdkData`) first, then by
+   * `token.id`. If no match is found, falls back to {@link addToken}.
+   *
+   * @param token - The token with updated data. Must include a valid `id`.
    */
   async updateToken(token: Token): Promise<void> {
     this.ensureInitialized();
@@ -2387,7 +2466,15 @@ export class PaymentsModule {
   }
 
   /**
-   * Remove a token by ID
+   * Remove a token from the wallet.
+   *
+   * The token is archived first, then a tombstone `(tokenId, stateHash)` is
+   * created to prevent re-addition via Nostr re-delivery. A `SENT` history
+   * entry is created unless `skipHistory` is `true`.
+   *
+   * @param tokenId - Local UUID of the token to remove.
+   * @param recipientNametag - Optional nametag of the transfer recipient (for history).
+   * @param skipHistory - When `true`, skip creating a transaction history entry (default `false`).
    */
   async removeToken(tokenId: string, recipientNametag?: string, skipHistory: boolean = false): Promise<void> {
     this.ensureInitialized();
@@ -2437,14 +2524,23 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get all tombstones
+   * Get all tombstone entries.
+   *
+   * Each tombstone is keyed by `(tokenId, stateHash)` and prevents a spent
+   * token state from being re-added (e.g. via Nostr re-delivery).
+   *
+   * @returns A shallow copy of the tombstone array.
    */
   getTombstones(): TombstoneEntry[] {
     return [...this.tombstones];
   }
 
   /**
-   * Check if token state is tombstoned
+   * Check whether a specific `(tokenId, stateHash)` combination is tombstoned.
+   *
+   * @param tokenId - The genesis token ID.
+   * @param stateHash - The state hash of the token version to check.
+   * @returns `true` if the exact combination has been tombstoned.
    */
   isStateTombstoned(tokenId: string, stateHash: string): boolean {
     return this.tombstones.some(
@@ -2453,8 +2549,13 @@ export class PaymentsModule {
   }
 
   /**
-   * Merge remote tombstones
-   * @returns number of local tokens removed
+   * Merge tombstones received from a remote sync source.
+   *
+   * Any local token whose `(tokenId, stateHash)` matches a remote tombstone is
+   * removed. The remote tombstones are then added to the local set (union merge).
+   *
+   * @param remoteTombstones - Tombstone entries from the remote source.
+   * @returns Number of local tokens that were removed.
    */
   async mergeTombstones(remoteTombstones: TombstoneEntry[]): Promise<number> {
     this.ensureInitialized();
@@ -2500,7 +2601,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Prune old tombstones
+   * Remove tombstones older than `maxAge` and cap the list at 100 entries.
+   *
+   * @param maxAge - Maximum age in milliseconds (default: 30 days).
    */
   async pruneTombstones(maxAge?: number): Promise<void> {
     const originalCount = this.tombstones.length;
@@ -2517,22 +2620,40 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get archived tokens
+   * Get all archived (spent/superseded) tokens in TXF format.
+   *
+   * Archived tokens are kept for recovery and sync purposes. The map key is
+   * the genesis token ID.
+   *
+   * @returns A shallow copy of the archived token map.
    */
   getArchivedTokens(): Map<string, TxfToken> {
     return new Map(this.archivedTokens);
   }
 
   /**
-   * Get best archived version of a token
+   * Get the best (most committed transactions) archived version of a token.
+   *
+   * Searches both archived and forked token maps and returns the version with
+   * the highest number of committed transactions.
+   *
+   * @param tokenId - The genesis token ID to look up.
+   * @returns The best TXF token version, or `null` if not found.
    */
   getBestArchivedVersion(tokenId: string): TxfToken | null {
     return findBestTokenVersion(tokenId, this.archivedTokens, this.forkedTokens);
   }
 
   /**
-   * Merge remote archived tokens
-   * @returns number of tokens updated/added
+   * Merge archived tokens from a remote sync source.
+   *
+   * For each remote token:
+   * - If missing locally, it is added.
+   * - If the remote version is an incremental update of the local, it replaces it.
+   * - If the histories diverge (fork), the remote version is stored via {@link storeForkedToken}.
+   *
+   * @param remoteArchived - Map of genesis token ID → TXF token from remote.
+   * @returns Number of tokens that were updated or added locally.
    */
   async mergeArchivedTokens(remoteArchived: Map<string, TxfToken>): Promise<number> {
     let mergedCount = 0;
@@ -2561,7 +2682,11 @@ export class PaymentsModule {
   }
 
   /**
-   * Prune archived tokens
+   * Prune archived tokens to keep at most `maxCount` entries.
+   *
+   * Oldest entries (by insertion order) are removed first.
+   *
+   * @param maxCount - Maximum number of archived tokens to retain (default: 100).
    */
   async pruneArchivedTokens(maxCount: number = 100): Promise<void> {
     if (this.archivedTokens.size <= maxCount) return;
@@ -2578,14 +2703,25 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get forked tokens
+   * Get all forked token versions.
+   *
+   * Forked tokens represent alternative histories detected during sync.
+   * The map key is `{tokenId}_{stateHash}`.
+   *
+   * @returns A shallow copy of the forked tokens map.
    */
   getForkedTokens(): Map<string, TxfToken> {
     return new Map(this.forkedTokens);
   }
 
   /**
-   * Store a forked token
+   * Store a forked token version (alternative history).
+   *
+   * No-op if the exact `(tokenId, stateHash)` key already exists.
+   *
+   * @param tokenId - Genesis token ID.
+   * @param stateHash - State hash of this forked version.
+   * @param txfToken - The TXF token data to store.
    */
   async storeForkedToken(tokenId: string, stateHash: string, txfToken: TxfToken): Promise<void> {
     const key = `${tokenId}_${stateHash}`;
@@ -2597,8 +2733,10 @@ export class PaymentsModule {
   }
 
   /**
-   * Merge remote forked tokens
-   * @returns number of tokens added
+   * Merge forked tokens from a remote sync source. Only new keys are added.
+   *
+   * @param remoteForked - Map of `{tokenId}_{stateHash}` → TXF token from remote.
+   * @returns Number of new forked tokens added.
    */
   async mergeForkedTokens(remoteForked: Map<string, TxfToken>): Promise<number> {
     let addedCount = 0;
@@ -2618,7 +2756,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Prune forked tokens
+   * Prune forked tokens to keep at most `maxCount` entries.
+   *
+   * @param maxCount - Maximum number of forked tokens to retain (default: 50).
    */
   async pruneForkedTokens(maxCount: number = 50): Promise<void> {
     if (this.forkedTokens.size <= maxCount) return;
@@ -2635,14 +2775,20 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get transaction history
+   * Get the transaction history sorted newest-first.
+   *
+   * @returns Array of {@link TransactionHistoryEntry} objects in descending timestamp order.
    */
   getHistory(): TransactionHistoryEntry[] {
     return [...this.transactionHistory].sort((a, b) => b.timestamp - a.timestamp);
   }
 
   /**
-   * Add to transaction history
+   * Append an entry to the transaction history.
+   *
+   * A unique `id` is auto-generated. The entry is immediately persisted to storage.
+   *
+   * @param entry - History entry fields (without `id`).
    */
   async addToHistory(entry: Omit<TransactionHistoryEntry, 'id'>): Promise<void> {
     this.ensureInitialized();
@@ -2664,7 +2810,11 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Set nametag for current identity
+   * Set the nametag data for the current identity.
+   *
+   * Persists to both key-value storage and file storage (lottery compatibility).
+   *
+   * @param nametag - The nametag data including minted token JSON.
    */
   async setNametag(nametag: NametagData): Promise<void> {
     this.ensureInitialized();
@@ -2676,21 +2826,25 @@ export class PaymentsModule {
   }
 
   /**
-   * Get nametag
+   * Get the current nametag data.
+   *
+   * @returns The nametag data, or `null` if no nametag is set.
    */
   getNametag(): NametagData | null {
     return this.nametag;
   }
 
   /**
-   * Check if has nametag
+   * Check whether a nametag is currently set.
+   *
+   * @returns `true` if nametag data is present.
    */
   hasNametag(): boolean {
     return this.nametag !== null;
   }
 
   /**
-   * Clear nametag
+   * Remove the current nametag data from memory and storage.
    */
   async clearNametag(): Promise<void> {
     this.ensureInitialized();
@@ -2889,8 +3043,13 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Sync with all token storage providers (IPFS, MongoDB, etc.)
-   * Syncs with each provider and merges results
+   * Sync local token state with all configured token storage providers (IPFS, file, etc.).
+   *
+   * For each provider, the local data is packaged into TXF storage format, sent
+   * to the provider's `sync()` method, and the merged result is applied locally.
+   * Emits `sync:started`, `sync:completed`, and `sync:error` events.
+   *
+   * @returns Summary with counts of tokens added and removed during sync.
    */
   async sync(): Promise<{ added: number; removed: number }> {
     this.ensureInitialized();
@@ -2981,7 +3140,11 @@ export class PaymentsModule {
   }
 
   /**
-   * Update token storage providers (called when providers are added/removed dynamically)
+   * Replace the set of token storage providers at runtime.
+   *
+   * Use when providers are added or removed dynamically (e.g. IPFS node started).
+   *
+   * @param providers - New map of provider ID → TokenStorageProvider.
    */
   updateTokenStorageProviders(providers: Map<string, TokenStorageProvider<TxfStorageDataBase>>): void {
     if (this.deps) {
@@ -2990,7 +3153,11 @@ export class PaymentsModule {
   }
 
   /**
-   * Validate tokens with aggregator
+   * Validate all tokens against the aggregator (oracle provider).
+   *
+   * Tokens that fail validation or are detected as spent are marked `'invalid'`.
+   *
+   * @returns Object with arrays of valid and invalid tokens.
    */
   async validate(): Promise<{ valid: Token[]; invalid: Token[] }> {
     this.ensureInitialized();
@@ -3017,7 +3184,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Get pending transfers
+   * Get all in-progress (pending) outgoing transfers.
+   *
+   * @returns Array of {@link TransferResult} objects for transfers that have not yet completed.
    */
   getPendingTransfers(): TransferResult[] {
     return Array.from(this.pendingTransfers.values());
