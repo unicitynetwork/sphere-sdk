@@ -165,9 +165,11 @@ interface TransferRequest {
   readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, or PROXY://
   readonly memo?: string;        // Optional message
   readonly addressMode?: AddressMode;  // 'auto' | 'direct' | 'proxy'
+  readonly transferMode?: TransferMode;  // 'instant' | 'conservative'
 }
 
 type AddressMode = 'auto' | 'direct' | 'proxy';
+type TransferMode = 'instant' | 'conservative';
 
 interface TransferResult {
   readonly id: string;                       // Local transfer UUID
@@ -198,6 +200,21 @@ const result = await sphere.payments.send({
   addressMode: 'auto',
 });
 console.log(result.status); // 'completed'
+```
+
+**Transfer Modes:**
+
+- **`'instant'`** (default) — Sends tokens via Nostr immediately with commitment data. The receiver resolves aggregator proofs in the background. Fastest sender experience (~2-3s for splits).
+- **`'conservative'`** — Collects all aggregator proofs at the sender side before delivering fully finalized tokens (with `{ sourceToken, transferTx }`) via Nostr. Slower for the sender but the receiver gets immediately usable tokens with no background proof resolution needed.
+
+```typescript
+// Conservative transfer — receiver gets fully finalized tokens
+const result = await sphere.payments.send({
+  recipient: '@alice',
+  amount: '1000000',
+  coinId: 'UCT',
+  transferMode: 'conservative',
+});
 ```
 
 #### `processInstantSplitBundle(bundle: InstantSplitBundle, senderPubkey: string): Promise<InstantSplitProcessResult>`

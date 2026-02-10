@@ -11,6 +11,7 @@ import type { Token, FullIdentity, TransferResult, TokenTransferDetail } from '.
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider } from '../../../storage';
+import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 
 // =============================================================================
 // Mock SDK dependencies to avoid network/crypto calls
@@ -30,6 +31,15 @@ vi.mock('../../../modules/payments/InstantSplitExecutor', () => ({
   InstantSplitExecutor: class {
     constructor() {}
     executeSplitInstant = mockExecuteSplitInstant;
+  },
+}));
+
+// Mock TokenSplitExecutor — controls conservative split execution result
+const mockExecuteSplit = vi.fn();
+vi.mock('../../../modules/payments/TokenSplitExecutor', () => ({
+  TokenSplitExecutor: class {
+    constructor() {}
+    executeSplit = mockExecuteSplit;
   },
 }));
 
@@ -75,7 +85,7 @@ vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData',
 }));
 
 vi.mock('@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils', () => ({
-  waitInclusionProof: vi.fn(),
+  waitInclusionProof: vi.fn().mockResolvedValue({ proof: 'mock-proof' }),
 }));
 
 vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof', () => ({
@@ -166,7 +176,7 @@ function createMockOracle(): OracleProvider {
   return {
     validateToken: vi.fn().mockResolvedValue({ valid: true }),
     getStateTransitionClient: vi.fn().mockReturnValue({
-      submitTransferCommitment: vi.fn().mockResolvedValue(undefined),
+      submitTransferCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
     }),
     getTrustBase: vi.fn().mockReturnValue({}),
     isDevMode: vi.fn().mockReturnValue(false),
@@ -207,6 +217,10 @@ function createMockCommitment(requestIdHex: string) {
   return {
     requestId: requestIdBytes,
     toJSON: () => ({ requestId: requestIdHex }),
+    toTransaction: () => ({
+      toJSON: () => ({ requestId: requestIdHex, proof: 'mock' }),
+      data: { requestId: requestIdBytes },
+    }),
   };
 }
 
@@ -674,5 +688,360 @@ describe('TokenTransferDetail type export', () => {
     expect(minimal.requestIdHex).toBeUndefined();
     expect(minimal.splitGroupId).toBeUndefined();
     expect(minimal.nostrEventId).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// Conservative Transfer Mode Tests
+// =============================================================================
+
+describe('TransferResult.tokenTransfers (conservative mode)', () => {
+  let module: ReturnType<typeof createPaymentsModule>;
+  let deps: PaymentsModuleDependencies;
+  let mockTransport: TransportProvider;
+  let mockOracle: OracleProvider;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    module = createPaymentsModule({ debug: false });
+    mockTransport = createMockTransport();
+    mockOracle = createMockOracle();
+
+    deps = {
+      identity: createMockIdentity(),
+      storage: createMockStorage(),
+      transport: mockTransport,
+      oracle: mockOracle,
+      emitEvent: vi.fn(),
+    };
+
+    module.initialize(deps);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mod = module as any;
+    mod.resolveRecipient = vi.fn().mockResolvedValue(FAKE_PUBKEY);
+    mod.resolveRecipientAddress = vi.fn().mockResolvedValue({ scheme: 0 });
+    mod.createSigningService = vi.fn().mockResolvedValue({});
+    mod.save = vi.fn().mockResolvedValue(undefined);
+    mod.saveToOutbox = vi.fn().mockResolvedValue(undefined);
+    mod.removeFromOutbox = vi.fn().mockResolvedValue(undefined);
+    mod.addToHistory = vi.fn().mockResolvedValue(undefined);
+    mod.removeToken = vi.fn().mockResolvedValue(undefined);
+    mod.saveTokenToFileStorage = vi.fn().mockResolvedValue(undefined);
+  });
+
+  describe('conservative direct transfers', () => {
+    it('should wait for proof and send { sourceToken, transferTx } via Nostr', async () => {
+      const token = createMockToken('token-cons-direct', '5000000');
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod = module as any;
+      mod.tokens.set(token.id, token);
+
+      mockCalculateOptimalSplit.mockResolvedValue({
+        tokensToTransferDirectly: [
+          { sdkToken: createMockSdkToken(), amount: 5000000n, uiToken: token },
+        ],
+        tokenToSplit: null,
+        splitAmount: null,
+        remainderAmount: null,
+        totalTransferAmount: 5000000n,
+        coinId: 'UCT',
+        requiresSplit: false,
+      });
+
+      const requestIdHex = 'aa'.repeat(16);
+      const commitment = createMockCommitment(requestIdHex);
+      mod.createSdkCommitment = vi.fn().mockResolvedValue(commitment);
+
+      const result = await module.send({
+        recipient: '@alice',
+        amount: '5000000',
+        coinId: 'UCT',
+        transferMode: 'conservative',
+      });
+
+      // Should have called waitInclusionProof (conservative waits for proof)
+      expect(waitInclusionProof).toHaveBeenCalled();
+
+      // Should send { sourceToken, transferTx } format (not commitmentData)
+      const sendCall = (mockTransport.sendTokenTransfer as ReturnType<typeof vi.fn>).mock.calls[0];
+      const payload = sendCall[1] as Record<string, unknown>;
+      expect(payload).toHaveProperty('sourceToken');
+      expect(payload).toHaveProperty('transferTx');
+      expect(payload).not.toHaveProperty('commitmentData');
+
+      expect(result.tokenTransfers).toHaveLength(1);
+      expect(result.tokenTransfers[0]).toEqual({
+        sourceTokenId: 'token-cons-direct',
+        method: 'direct',
+        requestIdHex,
+      });
+      expect(result.status).toBe('completed');
+    });
+
+    it('should submit commitment to aggregator synchronously', async () => {
+      const token = createMockToken('token-cons-sync', '1000');
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod = module as any;
+      mod.tokens.set(token.id, token);
+
+      const mockSubmit = vi.fn().mockResolvedValue({ status: 'SUCCESS' });
+      (mockOracle.getStateTransitionClient as ReturnType<typeof vi.fn>).mockReturnValue({
+        submitTransferCommitment: mockSubmit,
+      });
+
+      mockCalculateOptimalSplit.mockResolvedValue({
+        tokensToTransferDirectly: [
+          { sdkToken: createMockSdkToken(), amount: 1000n, uiToken: token },
+        ],
+        tokenToSplit: null,
+        splitAmount: null,
+        remainderAmount: null,
+        totalTransferAmount: 1000n,
+        coinId: 'UCT',
+        requiresSplit: false,
+      });
+
+      mod.createSdkCommitment = vi.fn().mockResolvedValue(createMockCommitment('bb'.repeat(16)));
+
+      await module.send({
+        recipient: '@bob',
+        amount: '1000',
+        coinId: 'UCT',
+        transferMode: 'conservative',
+      });
+
+      // Conservative mode submits synchronously (not fire-and-forget)
+      expect(mockSubmit).toHaveBeenCalled();
+    });
+  });
+
+  describe('conservative split transfers', () => {
+    it('should use TokenSplitExecutor instead of InstantSplitExecutor', async () => {
+      const tokenToSplit = createMockToken('token-cons-split', '10000000');
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod = module as any;
+      mod.tokens.set(tokenToSplit.id, tokenToSplit);
+
+      mockCalculateOptimalSplit.mockResolvedValue({
+        tokensToTransferDirectly: [],
+        tokenToSplit: {
+          sdkToken: createMockSdkToken(),
+          amount: 10000000n,
+          uiToken: tokenToSplit,
+        },
+        splitAmount: 3000000n,
+        remainderAmount: 7000000n,
+        totalTransferAmount: 3000000n,
+        coinId: 'UCT',
+        requiresSplit: true,
+      });
+
+      mockExecuteSplit.mockResolvedValue({
+        tokenForRecipient: {
+          toJSON: () => ({ genesis: {}, state: {} }),
+        },
+        tokenForSender: {
+          toJSON: () => ({ genesis: {}, state: {} }),
+        },
+        recipientTransferTx: {
+          toJSON: () => ({ data: {}, inclusionProof: {} }),
+          data: { requestId: new Uint8Array([0xcc, 0xdd]) },
+        },
+      });
+
+      const result = await module.send({
+        recipient: '@carol',
+        amount: '3000000',
+        coinId: 'UCT',
+        transferMode: 'conservative',
+      });
+
+      // TokenSplitExecutor should be used, NOT InstantSplitExecutor
+      expect(mockExecuteSplit).toHaveBeenCalled();
+      expect(mockExecuteSplitInstant).not.toHaveBeenCalled();
+
+      // Should send { sourceToken, transferTx } via Nostr
+      const sendCall = (mockTransport.sendTokenTransfer as ReturnType<typeof vi.fn>).mock.calls[0];
+      const payload = sendCall[1] as Record<string, unknown>;
+      expect(payload).toHaveProperty('sourceToken');
+      expect(payload).toHaveProperty('transferTx');
+      expect(payload).not.toHaveProperty('commitmentData');
+
+      expect(result.tokenTransfers).toHaveLength(1);
+      expect(result.tokenTransfers[0].sourceTokenId).toBe('token-cons-split');
+      expect(result.tokenTransfers[0].method).toBe('split');
+      expect(result.tokenTransfers[0].requestIdHex).toBe('ccdd');
+      // Conservative splits don't have splitGroupId/nostrEventId
+      expect(result.tokenTransfers[0].splitGroupId).toBeUndefined();
+      expect(result.tokenTransfers[0].nostrEventId).toBeUndefined();
+    });
+
+    it('should save change token from conservative split', async () => {
+      const tokenToSplit = createMockToken('token-cons-change', '8000000');
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod = module as any;
+      mod.tokens.set(tokenToSplit.id, tokenToSplit);
+      mod.addToken = vi.fn().mockResolvedValue(undefined);
+
+      mockCalculateOptimalSplit.mockResolvedValue({
+        tokensToTransferDirectly: [],
+        tokenToSplit: {
+          sdkToken: createMockSdkToken(),
+          amount: 8000000n,
+          uiToken: tokenToSplit,
+        },
+        splitAmount: 3000000n,
+        remainderAmount: 5000000n,
+        totalTransferAmount: 3000000n,
+        coinId: 'UCT',
+        requiresSplit: true,
+      });
+
+      mockExecuteSplit.mockResolvedValue({
+        tokenForRecipient: { toJSON: () => ({}) },
+        tokenForSender: { toJSON: () => ({ genesis: {}, state: {} }) },
+        recipientTransferTx: {
+          toJSON: () => ({}),
+          data: { requestId: new Uint8Array([0xee]) },
+        },
+      });
+
+      await module.send({
+        recipient: '@dave',
+        amount: '3000000',
+        coinId: 'UCT',
+        transferMode: 'conservative',
+      });
+
+      // addToken should have been called with the change token
+      expect(mod.addToken).toHaveBeenCalledWith(
+        expect.objectContaining({
+          amount: '5000000',
+          status: 'confirmed',
+        }),
+        true
+      );
+    });
+  });
+
+  describe('default and explicit instant mode', () => {
+    it('should use instant mode when transferMode is omitted', async () => {
+      const token = createMockToken('token-default', '1000');
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod = module as any;
+      mod.tokens.set(token.id, token);
+
+      mockCalculateOptimalSplit.mockResolvedValue({
+        tokensToTransferDirectly: [
+          { sdkToken: createMockSdkToken(), amount: 1000n, uiToken: token },
+        ],
+        tokenToSplit: null,
+        splitAmount: null,
+        remainderAmount: null,
+        totalTransferAmount: 1000n,
+        coinId: 'UCT',
+        requiresSplit: false,
+      });
+
+      mod.createSdkCommitment = vi.fn().mockResolvedValue(createMockCommitment('11'.repeat(16)));
+
+      await module.send({
+        recipient: '@test',
+        amount: '1000',
+        coinId: 'UCT',
+        // transferMode omitted — should default to instant
+      });
+
+      // Should send commitmentData format (instant), not transferTx
+      const sendCall = (mockTransport.sendTokenTransfer as ReturnType<typeof vi.fn>).mock.calls[0];
+      const payload = sendCall[1] as Record<string, unknown>;
+      expect(payload).toHaveProperty('commitmentData');
+      expect(payload).not.toHaveProperty('transferTx');
+
+      // Should NOT call waitInclusionProof (instant mode is fire-and-forget)
+      expect(waitInclusionProof).not.toHaveBeenCalled();
+    });
+
+    it('should use instant mode when transferMode is explicitly instant', async () => {
+      const token = createMockToken('token-explicit-instant', '2000');
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod = module as any;
+      mod.tokens.set(token.id, token);
+
+      mockCalculateOptimalSplit.mockResolvedValue({
+        tokensToTransferDirectly: [
+          { sdkToken: createMockSdkToken(), amount: 2000n, uiToken: token },
+        ],
+        tokenToSplit: null,
+        splitAmount: null,
+        remainderAmount: null,
+        totalTransferAmount: 2000n,
+        coinId: 'UCT',
+        requiresSplit: false,
+      });
+
+      mod.createSdkCommitment = vi.fn().mockResolvedValue(createMockCommitment('22'.repeat(16)));
+
+      await module.send({
+        recipient: '@test',
+        amount: '2000',
+        coinId: 'UCT',
+        transferMode: 'instant',
+      });
+
+      // Should send commitmentData format (instant)
+      const sendCall = (mockTransport.sendTokenTransfer as ReturnType<typeof vi.fn>).mock.calls[0];
+      const payload = sendCall[1] as Record<string, unknown>;
+      expect(payload).toHaveProperty('commitmentData');
+      expect(payload).not.toHaveProperty('transferTx');
+    });
+
+    it('should use InstantSplitExecutor for splits in instant mode', async () => {
+      const tokenToSplit = createMockToken('token-instant-split', '10000000');
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod = module as any;
+      mod.tokens.set(tokenToSplit.id, tokenToSplit);
+
+      mockCalculateOptimalSplit.mockResolvedValue({
+        tokensToTransferDirectly: [],
+        tokenToSplit: {
+          sdkToken: createMockSdkToken(),
+          amount: 10000000n,
+          uiToken: tokenToSplit,
+        },
+        splitAmount: 3000000n,
+        remainderAmount: 7000000n,
+        totalTransferAmount: 3000000n,
+        coinId: 'UCT',
+        requiresSplit: true,
+      });
+
+      mockExecuteSplitInstant.mockResolvedValue({
+        success: true,
+        splitGroupId: 'instant-group',
+        nostrEventId: 'instant-event',
+        criticalPathDurationMs: 2000,
+      });
+
+      await module.send({
+        recipient: '@test',
+        amount: '3000000',
+        coinId: 'UCT',
+        transferMode: 'instant',
+      });
+
+      // Should use InstantSplitExecutor, NOT TokenSplitExecutor
+      expect(mockExecuteSplitInstant).toHaveBeenCalled();
+      expect(mockExecuteSplit).not.toHaveBeenCalled();
+    });
   });
 });

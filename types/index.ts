@@ -101,6 +101,8 @@ export type TransferStatus =
 
 export type AddressMode = 'auto' | 'direct' | 'proxy';
 
+export type TransferMode = 'instant' | 'conservative';
+
 export interface TransferRequest {
   readonly coinId: string;
   readonly amount: string;
@@ -108,6 +110,8 @@ export interface TransferRequest {
   readonly memo?: string;
   /** Address mode: 'auto' (default) uses directAddress if available, 'direct' forces DIRECT, 'proxy' forces PROXY */
   readonly addressMode?: AddressMode;
+  /** Transfer mode: 'instant' (default) sends via Nostr immediately, 'conservative' collects all proofs first */
+  readonly transferMode?: TransferMode;
 }
 
 /**

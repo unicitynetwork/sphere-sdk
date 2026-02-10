@@ -874,89 +874,171 @@ export class PaymentsModule {
 
       const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
 
-      // Handle split if required - use InstantSplitExecutor for fast (~2.3s) splits
+      const transferMode = request.transferMode ?? 'instant';
+
+      // Handle split if required
       if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-        this.log('Executing instant split...');
+        if (transferMode === 'conservative') {
+          // Conservative split: use TokenSplitExecutor — collects all proofs before sending
+          this.log('Executing conservative split...');
+          const splitExecutor = new TokenSplitExecutor({
+            stateTransitionClient: stClient,
+            trustBase,
+            signingService,
+          });
 
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const devMode = (this.deps!.oracle as any).isDevMode?.() ?? false;
-        const executor = new InstantSplitExecutor({
-          stateTransitionClient: stClient,
-          trustBase,
-          signingService,
-          devMode,
-        });
+          const splitResult = await splitExecutor.executeSplit(
+            splitPlan.tokenToSplit.sdkToken,
+            splitPlan.splitAmount!,
+            splitPlan.remainderAmount!,
+            splitPlan.coinId,
+            recipientAddress,
+          );
 
-        const instantResult = await executor.executeSplitInstant(
-          splitPlan.tokenToSplit.sdkToken,
-          splitPlan.splitAmount!,
-          splitPlan.remainderAmount!,
-          splitPlan.coinId,
-          recipientAddress,
-          this.deps!.transport,
-          recipientPubkey,
-          {
-            onChangeTokenCreated: async (changeToken) => {
-              const changeTokenData = changeToken.toJSON();
-              const uiToken: Token = {
-                id: crypto.randomUUID(),
-                coinId: request.coinId,
-                symbol: this.getCoinSymbol(request.coinId),
-                name: this.getCoinName(request.coinId),
-                decimals: this.getCoinDecimals(request.coinId),
-                iconUrl: this.getCoinIconUrl(request.coinId),
-                amount: splitPlan.remainderAmount!.toString(),
-                status: 'confirmed',
-                createdAt: Date.now(),
-                updatedAt: Date.now(),
-                sdkData: JSON.stringify(changeTokenData),
-              };
-              await this.addToken(uiToken, true);
-              this.log(`Change token saved via background: ${uiToken.id}`);
-            },
-            onStorageSync: async () => {
-              await this.save();
-              return true;
-            },
+          // Save change token
+          const changeTokenData = splitResult.tokenForSender.toJSON();
+          const changeUiToken: Token = {
+            id: crypto.randomUUID(),
+            coinId: request.coinId,
+            symbol: this.getCoinSymbol(request.coinId),
+            name: this.getCoinName(request.coinId),
+            decimals: this.getCoinDecimals(request.coinId),
+            iconUrl: this.getCoinIconUrl(request.coinId),
+            amount: splitPlan.remainderAmount!.toString(),
+            status: 'confirmed',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            sdkData: JSON.stringify(changeTokenData),
+          };
+          await this.addToken(changeUiToken, true);
+          this.log(`Conservative split: change token saved: ${changeUiToken.id}`);
+
+          // Send fully finalized { sourceToken, transferTx } via Nostr
+          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+            sourceToken: JSON.stringify(splitResult.tokenForRecipient.toJSON()),
+            transferTx: JSON.stringify(splitResult.recipientTransferTx.toJSON()),
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
+
+          // Get request ID from the transfer commitment for tracking
+          const splitCommitmentRequestId = splitResult.recipientTransferTx?.data?.requestId
+            ?? splitResult.recipientTransferTx?.requestId;
+          const splitRequestIdHex = splitCommitmentRequestId instanceof Uint8Array
+            ? Array.from(splitCommitmentRequestId).map((b: number) => b.toString(16).padStart(2, '0')).join('')
+            : splitCommitmentRequestId ? String(splitCommitmentRequestId) : undefined;
+
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
+          result.tokenTransfers.push({
+            sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
+            method: 'split',
+            requestIdHex: splitRequestIdHex,
+          });
+          this.log(`Conservative split transfer completed`);
+        } else {
+          // Instant split: use InstantSplitExecutor for fast (~2.3s) splits
+          this.log('Executing instant split...');
+
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const devMode = (this.deps!.oracle as any).isDevMode?.() ?? false;
+          const executor = new InstantSplitExecutor({
+            stateTransitionClient: stClient,
+            trustBase,
+            signingService,
+            devMode,
+          });
+
+          const instantResult = await executor.executeSplitInstant(
+            splitPlan.tokenToSplit.sdkToken,
+            splitPlan.splitAmount!,
+            splitPlan.remainderAmount!,
+            splitPlan.coinId,
+            recipientAddress,
+            this.deps!.transport,
+            recipientPubkey,
+            {
+              onChangeTokenCreated: async (changeToken) => {
+                const changeTokenData = changeToken.toJSON();
+                const uiToken: Token = {
+                  id: crypto.randomUUID(),
+                  coinId: request.coinId,
+                  symbol: this.getCoinSymbol(request.coinId),
+                  name: this.getCoinName(request.coinId),
+                  decimals: this.getCoinDecimals(request.coinId),
+                  iconUrl: this.getCoinIconUrl(request.coinId),
+                  amount: splitPlan.remainderAmount!.toString(),
+                  status: 'confirmed',
+                  createdAt: Date.now(),
+                  updatedAt: Date.now(),
+                  sdkData: JSON.stringify(changeTokenData),
+                };
+                await this.addToken(uiToken, true);
+                this.log(`Change token saved via background: ${uiToken.id}`);
+              },
+              onStorageSync: async () => {
+                await this.save();
+                return true;
+              },
+            }
+          );
+
+          if (!instantResult.success) {
+            throw new Error(instantResult.error || 'Instant split failed');
           }
-        );
 
-        if (!instantResult.success) {
-          throw new Error(instantResult.error || 'Instant split failed');
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
+          result.tokenTransfers.push({
+            sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
+            method: 'split',
+            splitGroupId: instantResult.splitGroupId,
+            nostrEventId: instantResult.nostrEventId,
+          });
+          this.log(`Instant split transfer completed`);
         }
-
-        await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
-        result.tokenTransfers.push({
-          sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
-          method: 'split',
-          splitGroupId: instantResult.splitGroupId,
-          nostrEventId: instantResult.nostrEventId,
-        });
-        this.log(`Instant split transfer completed`);
       }
 
-      // Transfer direct tokens (no split needed) - NOSTR-FIRST instant flow
-      // Send commitment + source token via Nostr immediately, submit to aggregator in background.
-      // Receiver handles via handleCommitmentOnlyTransfer() with proof polling.
+      // Transfer direct tokens (no split needed)
       for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
         const token = tokenWithAmount.uiToken;
 
         // Create SDK transfer commitment
         const commitment = await this.createSdkCommitment(token, recipientAddress, signingService);
 
-        // Send commitment + source token via Nostr IMMEDIATELY (no proof wait)
-        console.log(`[Payments] NOSTR-FIRST: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
-        await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-          sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
-          commitmentData: JSON.stringify(commitment.toJSON()),
-          memo: request.memo,
-        } as unknown as import('../../transport').TokenTransferPayload);
-        console.log(`[Payments] NOSTR-FIRST: Direct token sent successfully`);
+        if (transferMode === 'conservative') {
+          // Conservative direct: wait for proof, then send fully finalized transfer
+          console.log(`[Payments] CONSERVATIVE: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
 
-        // Submit commitment to aggregator in background (fire-and-forget)
-        stClient.submitTransferCommitment(commitment).catch(err =>
-          console.error('[Payments] Background commitment submit failed:', err)
-        );
+          // Submit commitment to aggregator and wait for inclusion proof
+          const submitResponse = await stClient.submitTransferCommitment(commitment);
+          if (submitResponse.status !== 'SUCCESS' && submitResponse.status !== 'REQUEST_ID_EXISTS') {
+            throw new Error(`Transfer commitment failed: ${submitResponse.status}`);
+          }
+
+          const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
+          const transferTx = commitment.toTransaction(inclusionProof);
+
+          // Send fully finalized { sourceToken, transferTx } via Nostr
+          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+            sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
+            transferTx: JSON.stringify(transferTx.toJSON()),
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
+          console.log(`[Payments] CONSERVATIVE: Direct token sent successfully`);
+        } else {
+          // Instant direct: NOSTR-FIRST - send commitment + source token via Nostr immediately
+          // Submit to aggregator in background. Receiver handles via handleCommitmentOnlyTransfer().
+          console.log(`[Payments] NOSTR-FIRST: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
+          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+            sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
+            commitmentData: JSON.stringify(commitment.toJSON()),
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
+          console.log(`[Payments] NOSTR-FIRST: Direct token sent successfully`);
+
+          // Submit commitment to aggregator in background (fire-and-forget)
+          stClient.submitTransferCommitment(commitment).catch(err =>
+            console.error('[Payments] Background commitment submit failed:', err)
+          );
+        }
 
         // Get request ID as hex string for tracking
         const requestIdBytes = commitment.requestId;
@@ -970,7 +1052,7 @@ export class PaymentsModule {
           requestIdHex,
         });
 
-        this.log(`Token ${token.id} sent via NOSTR-FIRST, requestId: ${requestIdHex}`);
+        this.log(`Token ${token.id} sent via ${transferMode.toUpperCase()}, requestId: ${requestIdHex}`);
 
         // Remove sent token (creates tombstone)
         await this.removeToken(token.id, recipientNametag);
