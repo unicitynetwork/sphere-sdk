@@ -84,6 +84,83 @@ Get the default address path (`m/44'/0'/0'/0/0`).
 
 Check if wallet has BIP32 master key for HD derivation.
 
+#### `getCurrentAddressIndex(): number`
+
+Get the current active address index.
+
+#### `switchToAddress(index: number): Promise<void>`
+
+Switch the active identity to a different HD-derived address. Automatically tracks the address in the registry.
+
+```typescript
+await sphere.switchToAddress(1);
+console.log(sphere.getCurrentAddressIndex()); // 1
+console.log(sphere.identity!.l1Address);      // alpha1... (address at index 1)
+```
+
+#### `getActiveAddresses(): TrackedAddress[]`
+
+Get all non-hidden tracked addresses, sorted by index.
+
+```typescript
+const addresses = sphere.getActiveAddresses();
+for (const addr of addresses) {
+  console.log(`#${addr.index}: ${addr.l1Address} (${addr.nametag ?? 'no nametag'})`);
+}
+```
+
+#### `getAllTrackedAddresses(): TrackedAddress[]`
+
+Get all tracked addresses including hidden ones, sorted by index.
+
+#### `getTrackedAddress(index: number): TrackedAddress | undefined`
+
+Get a single tracked address by HD index.
+
+#### `setAddressHidden(index: number, hidden: boolean): Promise<void>`
+
+Hide or unhide a tracked address. Hidden addresses are excluded from `getActiveAddresses()`.
+
+```typescript
+await sphere.setAddressHidden(1, true);   // hide
+await sphere.setAddressHidden(1, false);  // unhide
+```
+
+#### `resolve(identifier: string): Promise<PeerInfo | null>`
+
+Resolve any identifier to full peer information. Delegates to the transport provider.
+
+```typescript
+// By nametag
+const peer = await sphere.resolve('@alice');
+
+// By DIRECT address
+const peer = await sphere.resolve('DIRECT://000059756bc9c2e4c...');
+
+// By L1 address
+const peer = await sphere.resolve('alpha1qptag...');
+
+// By chain pubkey (33-byte compressed, 02/03 prefix)
+const peer = await sphere.resolve('025412bda2c5b5a15a891c6...');
+
+// By transport pubkey (32-byte hex)
+const peer = await sphere.resolve('a1b2c3d4e5f6...');
+```
+
+Returns `PeerInfo`:
+
+```typescript
+interface PeerInfo {
+  nametag?: string;        // @name if registered
+  transportPubkey: string; // 32-byte transport key
+  chainPubkey: string;     // 33-byte compressed secp256k1
+  l1Address: string;       // alpha1... L1 address
+  directAddress: string;   // DIRECT://... L3 address
+  proxyAddress?: string;   // PROXY://... (only if nametag registered)
+  timestamp: number;       // Binding event timestamp
+}
+```
+
 ---
 
 ## WalletManager
@@ -106,9 +183,26 @@ Load and decrypt existing wallet.
 
 Import wallet from mnemonic phrase.
 
-#### `clear(): Promise<void>`
+#### `clear(storageOrOptions): Promise<void>`
 
-Delete all wallet data from storage.
+Delete all SDK-owned wallet data from storage. Accepts either a `StorageProvider` directly (legacy) or an options object with optional `tokenStorage`.
+
+```typescript
+// Recommended: clear wallet keys + token data
+await Sphere.clear({
+  storage: providers.storage,
+  tokenStorage: providers.tokenStorage,
+});
+
+// Legacy (backward compatible): clear wallet keys only
+await Sphere.clear(storage);
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `storageOrOptions` | `StorageProvider \| { storage, tokenStorage? }` | Storage provider or options object |
+| `options.storage` | `StorageProvider` | Key-value storage provider |
+| `options.tokenStorage` | `TokenStorageProvider` | Optional token storage to clear |
 
 ---
 
@@ -142,7 +236,73 @@ Path 2 — Instant Split V5 (~2.3s sender latency):
        │                                                      │ finalize
 ```
 
-### Address Modes
+### Methods: Balance & Assets
+
+#### `getFiatBalance(): Promise<number | null>`
+
+Returns total portfolio value in USD. Requires `PriceProvider` to be configured.
+
+```typescript
+const totalUsd = await sphere.payments.getFiatBalance();
+// 1523.45 — total value of all confirmed tokens in USD
+// null    — if PriceProvider is not configured or no prices available
+```
+
+#### `getBalance(coinId?: string): Asset[]`
+
+Returns aggregated assets (tokens grouped by coinId) with confirmed/unconfirmed breakdown. Synchronous.
+
+```typescript
+const balances = sphere.payments.getBalance();
+
+for (const bal of balances) {
+  console.log(`${bal.symbol}:`);
+  console.log(`  Confirmed:   ${bal.confirmedAmount} (${bal.confirmedTokenCount} tokens)`);
+  console.log(`  Unconfirmed: ${bal.unconfirmedAmount} (${bal.unconfirmedTokenCount} tokens)`);
+  console.log(`  Total:       ${bal.totalAmount}`);
+  if (bal.fiatValueUsd !== null) {
+    console.log(`  USD Value:   $${bal.fiatValueUsd.toFixed(2)}`);
+  }
+}
+
+// Filter to a single coin
+const uctBalances = sphere.payments.getBalance('UCT_COIN_ID_HEX');
+```
+
+#### `getAssets(coinId?: string): Promise<Asset[]>`
+
+Returns aggregated assets with price data. Alias for `getBalance()` with async price resolution.
+
+```typescript
+interface Asset {
+  readonly coinId: string;       // Token coin ID
+  readonly symbol: string;       // e.g., 'UCT'
+  readonly name: string;         // e.g., 'Unicity'
+  readonly decimals: number;     // e.g., 18
+  readonly iconUrl?: string;     // Token icon URL
+  readonly totalAmount: string;  // Sum of all token amounts (smallest units)
+  readonly tokenCount: number;   // Number of tokens aggregated
+  readonly confirmedAmount: string;     // Confirmed token amounts
+  readonly unconfirmedAmount: string;   // Unconfirmed token amounts
+  readonly confirmedTokenCount: number; // Number of confirmed tokens
+  readonly unconfirmedTokenCount: number; // Number of unconfirmed tokens
+  readonly priceUsd: number | null;     // Price per unit in USD
+  readonly priceEur: number | null;     // Price per unit in EUR
+  readonly change24h: number | null;    // 24h price change %
+  readonly fiatValueUsd: number | null; // totalAmount * priceUsd (in human units)
+  readonly fiatValueEur: number | null; // totalAmount * priceEur (in human units)
+}
+
+// All assets
+const assets = await sphere.payments.getAssets();
+
+// Filter by coinId
+const uctAssets = await sphere.payments.getAssets('0xabc...');
+```
+
+> **Note:** Price fields are `null` when `PriceProvider` is not configured. The SDK works fully without it — prices are optional.
+
+#### `getTokens(): Promise<Token[]>`
 
 | Mode | Description |
 |------|-------------|
@@ -162,7 +322,7 @@ Send tokens to a recipient. Automatically splits tokens when the exact amount is
 interface TransferRequest {
   readonly coinId: string;       // Coin type (hex string)
   readonly amount: string;       // Amount in smallest units
-  readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, or PROXY://
+  readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, PROXY://, or alpha1... address
   readonly memo?: string;        // Optional message
   readonly addressMode?: AddressMode;  // 'auto' | 'direct' | 'proxy'
   readonly transferMode?: TransferMode;  // 'instant' | 'conservative'
@@ -594,7 +754,7 @@ interface PaymentRequest {
   amount: string;           // Amount in smallest units
   coinId: string;           // Token type (e.g., 'ALPHA')
   message?: string;         // Optional message
-  recipientNametag?: string; // Who should pay
+  recipientNametag?: string; // Where tokens should be sent
   metadata?: Record<string, unknown>;
 }
 
@@ -628,10 +788,11 @@ interface IncomingPaymentRequest {
   coinId: string;              // Token type
   symbol: string;              // Token symbol for display
   message?: string;            // Request message
-  recipientNametag?: string;   // Our nametag (if specified)
+  recipientNametag?: string;   // Requester's nametag (where to send tokens)
   requestId: string;           // Original request ID
   timestamp: number;           // Request timestamp
   status: PaymentRequestStatus;
+  metadata?: Record<string, unknown>; // Custom metadata
 }
 
 // Example
@@ -926,6 +1087,33 @@ interface AddressInfo {
 
 Note: `AddressInfo.publicKey` is the same format as `Identity.chainPubkey` (33-byte compressed secp256k1).
 
+### TrackedAddressEntry
+
+Minimal data stored in persistent storage for a tracked address.
+
+```typescript
+interface TrackedAddressEntry {
+  readonly index: number;      // HD derivation index
+  hidden: boolean;             // Whether hidden from UI
+  readonly createdAt: number;  // Timestamp (ms) when first activated
+  updatedAt: number;           // Timestamp (ms) of last modification
+}
+```
+
+### TrackedAddress
+
+Full tracked address with derived fields (available in memory via `getActiveAddresses()`, etc.).
+
+```typescript
+interface TrackedAddress extends TrackedAddressEntry {
+  readonly addressId: string;      // Short ID (e.g., "DIRECT_abc123_xyz789")
+  readonly l1Address: string;      // L1 bech32 address (alpha1...)
+  readonly directAddress: string;  // L3 DIRECT address (DIRECT://...)
+  readonly chainPubkey: string;    // 33-byte compressed secp256k1
+  readonly nametag?: string;       // Primary nametag (without @ prefix)
+}
+```
+
 ### ProviderStatus
 
 ```typescript
@@ -955,8 +1143,11 @@ type SphereEventType =
   | 'sync:error'
   | 'connection:changed'
   | 'nametag:registered'
-  | 'nametag:recovered'   // New: emitted when nametag is recovered from Nostr
-  | 'identity:changed';   // Emitted when switching addresses
+  | 'nametag:recovered'
+  | 'identity:changed'
+  | 'address:activated'   // Emitted when address first tracked
+  | 'address:hidden'      // Emitted when address hidden
+  | 'address:unhidden';   // Emitted when address unhidden
 ```
 
 ### SphereEventMap
@@ -973,6 +1164,9 @@ interface SphereEventMap {
     nametag?: string;
     addressIndex: number;
   };
+  'address:activated': { address: TrackedAddress };
+  'address:hidden': { index: number; addressId: string };
+  'address:unhidden': { index: number; addressId: string };
 }
 ```
 
@@ -1442,3 +1636,108 @@ interface AggregatorClient {
   isTokenStateSpent?(trustBase: unknown, token: unknown, pubKey: Buffer): Promise<boolean>;
 }
 ```
+
+---
+
+## PriceProvider
+
+Optional provider for fetching token market prices. Enables `getBalance()` (total USD value) and price enrichment in `getAssets()`.
+
+### Configuration
+
+```typescript
+// Via createBrowserProviders / createNodeProviders
+const providers = createBrowserProviders({
+  network: 'testnet',
+  price: {
+    platform: 'coingecko',       // Currently supported: 'coingecko'
+    apiKey: 'CG-xxx',            // Optional (free tier works without key)
+    baseUrl: '/api/coingecko',   // Optional: custom base URL (e.g., CORS proxy)
+    cacheTtlMs: 60000,           // Cache TTL (default: 60s)
+    timeout: 10000,              // Request timeout (default: 10s)
+    debug: false,                // Enable debug logging
+  },
+});
+
+// Or set after initialization
+import { createPriceProvider } from '@unicitylabs/sphere-sdk';
+
+sphere.setPriceProvider(createPriceProvider({
+  platform: 'coingecko',
+  apiKey: 'CG-xxx',
+}));
+```
+
+### PriceProvider Interface
+
+```typescript
+type PricePlatform = 'coingecko';
+
+interface TokenPrice {
+  readonly tokenName: string;    // CoinGecko ID (e.g., "bitcoin")
+  readonly priceUsd: number;
+  readonly priceEur?: number;
+  readonly change24h?: number;
+  readonly timestamp: number;
+}
+
+interface PriceProvider {
+  readonly platform: PricePlatform;
+  getPrices(tokenNames: string[]): Promise<Map<string, TokenPrice>>;
+  getPrice(tokenName: string): Promise<TokenPrice | null>;
+  clearCache(): void;
+}
+```
+
+### PriceProviderConfig
+
+```typescript
+interface PriceProviderConfig {
+  platform: PricePlatform;     // 'coingecko'
+  apiKey?: string;             // API key (optional for free tier)
+  baseUrl?: string;            // Custom base URL (e.g., for CORS proxy)
+  cacheTtlMs?: number;        // Cache TTL in ms (default: 60000)
+  timeout?: number;            // Request timeout in ms (default: 10000)
+  debug?: boolean;             // Enable debug logging
+}
+```
+
+### CoinGeckoPriceProvider
+
+- **Free tier**: `api.coingecko.com` (no API key needed, rate-limited)
+- **Pro tier**: `pro-api.coingecko.com` (requires API key via `x-cg-pro-api-key` header)
+- **Custom URL**: `baseUrl` overrides the default API endpoint (useful for CORS proxy in browser)
+- Internal cache with configurable TTL (default 60s)
+- **Negative cache**: tokens not found on CoinGecko are cached as "not found" for the TTL duration, preventing repeated API requests for project-specific tokens
+- Partial fetch: only requests uncached tokens from API
+- Stale-on-error: returns cached data on API failure instead of throwing
+
+### CORS Proxy (Browser)
+
+CoinGecko's free API does not include CORS headers, so browser requests will be blocked. Solutions:
+
+1. **Development**: Use a dev server proxy (e.g., Vite):
+   ```typescript
+   // vite.config.ts
+   export default defineConfig({
+     server: {
+       proxy: {
+         '/api/coingecko': {
+           target: 'https://api.coingecko.com/api/v3',
+           changeOrigin: true,
+           rewrite: (path) => path.replace(/^\/api\/coingecko/, ''),
+         },
+       },
+     },
+   });
+
+   // SDK config
+   const providers = createBrowserProviders({
+     network: 'testnet',
+     price: { platform: 'coingecko', baseUrl: '/api/coingecko' },
+   });
+   ```
+
+2. **Production**: Use a reverse proxy (Nginx, Cloudflare Worker, etc.) or the CoinGecko Pro API which supports CORS natively.
+
+3. **Node.js**: No proxy needed — server-side requests are not subject to CORS.

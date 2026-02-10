@@ -12,8 +12,8 @@
  */
 
 import type {
+  Asset,
   Token,
-  TokenBalance,
   TokenStatus,
   TransferRequest,
   TransferResult,
@@ -35,6 +35,7 @@ import { NametagMinter, type MintNametagResult } from './NametagMinter';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type {
   TransportProvider,
+  PeerInfo,
   IncomingTokenTransfer,
   PaymentRequestPayload,
   PaymentRequestResponsePayload,
@@ -42,6 +43,7 @@ import type {
   IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
 import type { OracleProvider } from '../../oracle';
+import type { PriceProvider } from '../../price';
 import type {
   PaymentRequest,
   IncomingPaymentRequest,
@@ -68,6 +70,8 @@ import type {
   InstantSplitBundle,
   InstantSplitBundleV5,
   InstantSplitProcessResult,
+  InstantSplitOptions,
+  InstantSplitResult,
   PendingV5Finalization,
   UnconfirmedResolutionResult,
 } from '../../types/instant-split';
@@ -191,7 +195,7 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 
       // Try to get token ID
       if (sdkToken.id) {
-        defaultInfo.tokenId = sdkToken.id.toString();
+        defaultInfo.tokenId = sdkToken.id.toJSON();
       }
 
       // Extract coinId from SDK token's coins structure (lottery-compatible)
@@ -578,8 +582,8 @@ export interface PaymentsModuleConfig {
   maxRetries?: number;
   /** Enable debug logging */
   debug?: boolean;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1PaymentsModuleConfig;
+  /** L1 (ALPHA blockchain) configuration. Set to null to explicitly disable L1. */
+  l1?: L1PaymentsModuleConfig | null;
 }
 
 // =============================================================================
@@ -618,6 +622,8 @@ export interface PaymentsModuleDependencies {
   chainCode?: string;
   /** Additional L1 addresses to watch */
   l1Addresses?: string[];
+  /** Price provider (optional — enables fiat value display) */
+  price?: PriceProvider;
 }
 
 // =============================================================================
@@ -675,9 +681,9 @@ export class PaymentsModule {
       debug: config?.debug ?? false,
     };
 
-    // Initialize L1 sub-module only if electrumUrl is provided
-    const l1Enabled = config?.l1?.electrumUrl && config.l1.electrumUrl.length > 0;
-    this.l1 = l1Enabled ? new L1PaymentsModule(config?.l1) : null;
+    // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
+    // Only skip if l1 is explicitly set to null.
+    this.l1 = config?.l1 === null ? null : new L1PaymentsModule(config?.l1);
   }
 
   /**
@@ -688,6 +694,9 @@ export class PaymentsModule {
   getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1'> {
     return this.moduleConfig;
   }
+
+  /** Price provider (optional) */
+  private priceProvider: PriceProvider | null = null;
 
   private log(...args: unknown[]): void {
     if (this.moduleConfig.debug) {
@@ -703,7 +712,25 @@ export class PaymentsModule {
    * Initialize module with dependencies
    */
   initialize(deps: PaymentsModuleDependencies): void {
+    // Clean up previous subscriptions before re-initializing
+    this.unsubscribeTransfers?.();
+    this.unsubscribeTransfers = null;
+    this.unsubscribePaymentRequests?.();
+    this.unsubscribePaymentRequests = null;
+    this.unsubscribePaymentRequestResponses?.();
+    this.unsubscribePaymentRequestResponses = null;
+
+    // Reset per-address state (will be re-populated by load())
+    this.tokens.clear();
+    this.pendingTransfers.clear();
+    this.tombstones = [];
+    this.archivedTokens.clear();
+    this.forkedTokens.clear();
+    this.transactionHistory = [];
+    this.nametag = null;
+
     this.deps = deps;
+    this.priceProvider = deps.price ?? null;
 
     // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
     if (this.l1) {
@@ -745,14 +772,15 @@ export class PaymentsModule {
   async load(): Promise<void> {
     this.ensureInitialized();
 
-    // Load from TokenStorageProviders (IndexedDB/files)
+    // Load metadata from TokenStorageProviders (archived, tombstones, forked)
+    // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
     const providers = this.getTokenStorageProviders();
     for (const [id, provider] of providers) {
       try {
         const result = await provider.load();
         if (result.success && result.data) {
           this.loadFromStorageData(result.data);
-          this.log(`Loaded from provider ${id}: ${this.tokens.size} tokens`);
+          this.log(`Loaded metadata from provider ${id}`);
           break; // Use first successful provider
         }
       } catch (err) {
@@ -760,15 +788,13 @@ export class PaymentsModule {
       }
     }
 
-    // Restore pending V5 tokens BEFORE legacy file loading
+    // Restore pending V5 tokens BEFORE file storage loading
     // (must come first because loadTokensFromFileStorage calls save() which
     // would overwrite pending V5 data if the tokens aren't in memory yet)
     await this.loadPendingV5Tokens();
 
-    // Legacy: Load tokens from file storage (lottery compatibility)
-    if (this.tokens.size === 0) {
-      await this.loadTokensFromFileStorage();
-    }
+    // Load active tokens from token-xxx files (primary storage for tokens)
+    await this.loadTokensFromFileStorage();
 
     // Load nametag from file storage (nametag-{name}.json)
     // This is the primary source for nametag data now
@@ -849,11 +875,10 @@ export class PaymentsModule {
     };
 
     try {
-      // Resolve recipient pubkey for Nostr delivery
-      const recipientPubkey = await this.resolveRecipient(request.recipient);
-
-      // Resolve recipient address for on-chain transfer
-      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode);
+      // Resolve recipient once — single network query
+      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
       // Create signing service
       const signingService = await this.createSigningService();
@@ -955,7 +980,8 @@ export class PaymentsModule {
             ? Array.from(splitCommitmentRequestId).map((b: number) => b.toString(16).padStart(2, '0')).join('')
             : splitCommitmentRequestId ? String(splitCommitmentRequestId) : undefined;
 
-          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
+          // Remove the original token that was split — skipHistory because we record below
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag, true);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
             method: 'split',
@@ -1082,8 +1108,8 @@ export class PaymentsModule {
 
         this.log(`Token ${token.id} sent via ${transferMode.toUpperCase()}, requestId: ${requestIdHex}`);
 
-        // Remove sent token (creates tombstone)
-        await this.removeToken(token.id, recipientNametag);
+        // Remove sent token (creates tombstone) — skipHistory because we record below
+        await this.removeToken(token.id, recipientNametag, true);
       }
 
       result.status = 'delivered';
@@ -1153,6 +1179,160 @@ export class PaymentsModule {
   // ===========================================================================
   // Public API - Instant Split (V5 Optimized)
   // ===========================================================================
+
+  /**
+   * Send tokens using INSTANT_SPLIT V5 optimized flow.
+   *
+   * This achieves ~2.3s critical path latency instead of ~42s by:
+   * 1. Waiting only for burn proof (required)
+   * 2. Creating transfer commitment from mint data (no mint proof needed)
+   * 3. Sending bundle via Nostr immediately
+   * 4. Processing mints in background
+   *
+   * @param request - Transfer request with recipient, amount, and coinId
+   * @param options - Optional instant split configuration
+   * @returns InstantSplitResult with timing info
+   */
+  async sendInstant(
+    request: TransferRequest,
+    options?: InstantSplitOptions
+  ): Promise<InstantSplitResult> {
+    this.ensureInitialized();
+
+    const startTime = performance.now();
+
+    try {
+      // Resolve recipient once — single network query
+      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
+
+      // Create signing service
+      const signingService = await this.createSigningService();
+
+      // Get state transition client and trust base
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      if (!stClient) {
+        throw new Error('State transition client not available');
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+      if (!trustBase) {
+        throw new Error('Trust base not available');
+      }
+
+      // Calculate optimal split plan
+      const calculator = new TokenSplitCalculator();
+      const availableTokens = Array.from(this.tokens.values());
+      const splitPlan = await calculator.calculateOptimalSplit(
+        availableTokens,
+        BigInt(request.amount),
+        request.coinId
+      );
+
+      if (!splitPlan) {
+        throw new Error('Insufficient balance');
+      }
+
+      if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
+        // For direct transfers without split, fall back to standard flow
+        this.log('No split required, falling back to standard send()');
+        const result = await this.send(request);
+        return {
+          success: result.status === 'completed',
+          criticalPathDurationMs: performance.now() - startTime,
+          error: result.error,
+        };
+      }
+
+      this.log(`InstantSplit: amount=${splitPlan.splitAmount}, remainder=${splitPlan.remainderAmount}`);
+
+      // Mark token as transferring
+      const tokenToSplit = splitPlan.tokenToSplit.uiToken;
+      tokenToSplit.status = 'transferring';
+      this.tokens.set(tokenToSplit.id, tokenToSplit);
+
+      // Check if dev mode
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const devMode = options?.devMode ?? (this.deps!.oracle as any).isDevMode?.() ?? false;
+
+      // Create instant split executor
+      const executor = new InstantSplitExecutor({
+        stateTransitionClient: stClient,
+        trustBase,
+        signingService,
+        devMode,
+      });
+
+      // Execute instant split
+      const result = await executor.executeSplitInstant(
+        splitPlan.tokenToSplit.sdkToken,
+        splitPlan.splitAmount!,
+        splitPlan.remainderAmount!,
+        splitPlan.coinId,
+        recipientAddress,
+        this.deps!.transport,
+        recipientPubkey,
+        {
+          ...options,
+          onChangeTokenCreated: async (changeToken) => {
+            // Save change token when background completes
+            const changeTokenData = changeToken.toJSON();
+            const uiToken: Token = {
+              id: crypto.randomUUID(),
+              coinId: request.coinId,
+              symbol: this.getCoinSymbol(request.coinId),
+              name: this.getCoinName(request.coinId),
+              decimals: this.getCoinDecimals(request.coinId),
+              iconUrl: this.getCoinIconUrl(request.coinId),
+              amount: splitPlan.remainderAmount!.toString(),
+              status: 'confirmed',
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              sdkData: JSON.stringify(changeTokenData),
+            };
+            await this.addToken(uiToken, true);
+            this.log(`Change token saved via background: ${uiToken.id}`);
+          },
+          onStorageSync: async () => {
+            await this.save();
+            return true;
+          },
+        }
+      );
+
+      if (result.success) {
+        // Remove the original token — skipHistory because we record below
+        const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
+        await this.removeToken(tokenToSplit.id, recipientNametag, true);
+
+        // Add to transaction history (single entry for the actual sent amount)
+        await this.addToHistory({
+          type: 'SENT',
+          amount: request.amount,
+          coinId: request.coinId,
+          symbol: this.getCoinSymbol(request.coinId),
+          timestamp: Date.now(),
+          recipientNametag,
+        });
+
+        await this.save();
+      } else {
+        // Restore token on failure
+        tokenToSplit.status = 'confirmed';
+        this.tokens.set(tokenToSplit.id, tokenToSplit);
+      }
+
+      return result;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        success: false,
+        criticalPathDurationMs: performance.now() - startTime,
+        error: errorMessage,
+      };
+    }
+  }
 
   /**
    * Process a received INSTANT_SPLIT bundle.
@@ -1378,8 +1558,9 @@ export class PaymentsModule {
     }
 
     try {
-      // Resolve recipient pubkey
-      const recipientPubkey = await this.resolveRecipient(recipientPubkeyOrNametag);
+      // Resolve recipient
+      const peerInfo = await this.deps!.transport.resolve?.(recipientPubkeyOrNametag) ?? null;
+      const recipientPubkey = this.resolveTransportPubkey(recipientPubkeyOrNametag, peerInfo);
 
       // Build payload
       const payload: PaymentRequestPayload = {
@@ -1570,12 +1751,17 @@ export class PaymentsModule {
     }
 
     // Convert transport request to IncomingPaymentRequest
+    const coinId = transportRequest.request.coinId;
+    const registry = TokenRegistry.getInstance();
+    const coinDef = registry.getDefinition(coinId);
+
     const request: IncomingPaymentRequest = {
       id: transportRequest.id,
       senderPubkey: transportRequest.senderTransportPubkey,
+      senderNametag: transportRequest.senderNametag,
       amount: transportRequest.request.amount,
-      coinId: transportRequest.request.coinId,
-      symbol: transportRequest.request.coinId, // Use coinId as symbol for now
+      coinId,
+      symbol: coinDef?.symbol || coinId.slice(0, 8),
       message: transportRequest.request.message,
       recipientNametag: transportRequest.request.recipientNametag,
       requestId: transportRequest.request.requestId,
@@ -1887,79 +2073,187 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
+   * Set or update price provider
+   */
+  setPriceProvider(provider: PriceProvider): void {
+    this.priceProvider = provider;
+  }
+
+  /**
+   * Get total portfolio value in USD.
+   * Returns null if PriceProvider is not configured.
+   */
+  async getFiatBalance(): Promise<number | null> {
+    const assets = await this.getAssets();
+
+    if (!this.priceProvider) {
+      return null;
+    }
+
+    let total = 0;
+    let hasAnyPrice = false;
+
+    for (const asset of assets) {
+      if (asset.fiatValueUsd != null) {
+        total += asset.fiatValueUsd;
+        hasAnyPrice = true;
+      }
+    }
+
+    return hasAnyPrice ? total : null;
+  }
+
+  /**
    * Get token balances grouped by coin type.
    *
-   * Returns an array of {@link TokenBalance} objects, one per coin type held.
+   * Returns an array of {@link Asset} objects, one per coin type held.
    * Each entry includes confirmed and unconfirmed breakdowns. Tokens with
    * status `'spent'`, `'invalid'`, or `'transferring'` are excluded.
+   *
+   * This is synchronous — no price data is included. Use {@link getAssets}
+   * for the async version with fiat pricing.
    *
    * @param coinId - Optional coin ID to filter by (e.g. hex string). When omitted, all coin types are returned.
    * @returns Array of balance summaries (synchronous — no await needed).
    */
-  getBalance(coinId?: string): TokenBalance[] {
+  getBalance(coinId?: string): Asset[] {
+    return this.aggregateTokens(coinId);
+  }
 
-    const balances = new Map<string, {
+  /**
+   * Get aggregated assets (tokens grouped by coinId) with price data.
+   * Includes both confirmed and unconfirmed tokens with breakdown.
+   */
+  async getAssets(coinId?: string): Promise<Asset[]> {
+    const rawAssets = this.aggregateTokens(coinId);
+
+    // Fetch prices if provider is available
+    if (!this.priceProvider || rawAssets.length === 0) {
+      return rawAssets;
+    }
+
+    try {
+      const registry = TokenRegistry.getInstance();
+      const nameToCoins = new Map<string, string[]>(); // tokenName -> coinIds[]
+
+      for (const asset of rawAssets) {
+        const def = registry.getDefinition(asset.coinId);
+        if (def?.name) {
+          const existing = nameToCoins.get(def.name);
+          if (existing) {
+            existing.push(asset.coinId);
+          } else {
+            nameToCoins.set(def.name, [asset.coinId]);
+          }
+        }
+      }
+
+      if (nameToCoins.size > 0) {
+        const tokenNames = Array.from(nameToCoins.keys());
+        const prices = await this.priceProvider.getPrices(tokenNames);
+
+        return rawAssets.map((raw) => {
+          const def = registry.getDefinition(raw.coinId);
+          const price = def?.name ? prices.get(def.name) : undefined;
+          let fiatValueUsd: number | null = null;
+          let fiatValueEur: number | null = null;
+
+          if (price) {
+            const humanAmount = Number(raw.totalAmount) / Math.pow(10, raw.decimals);
+            fiatValueUsd = humanAmount * price.priceUsd;
+            if (price.priceEur != null) {
+              fiatValueEur = humanAmount * price.priceEur;
+            }
+          }
+
+          return {
+            ...raw,
+            priceUsd: price?.priceUsd ?? null,
+            priceEur: price?.priceEur ?? null,
+            change24h: price?.change24h ?? null,
+            fiatValueUsd,
+            fiatValueEur,
+          };
+        });
+      }
+    } catch (error) {
+      console.warn('[Payments] Failed to fetch prices, returning assets without price data:', error);
+    }
+
+    return rawAssets;
+  }
+
+  /**
+   * Aggregate tokens by coinId with confirmed/unconfirmed breakdown.
+   * Excludes tokens with status 'spent', 'invalid', or 'transferring'.
+   */
+  private aggregateTokens(coinId?: string): Asset[] {
+    const assetsMap = new Map<string, {
       coinId: string;
       symbol: string;
       name: string;
       decimals: number;
+      iconUrl?: string;
       confirmedAmount: bigint;
       unconfirmedAmount: bigint;
       confirmedTokenCount: number;
       unconfirmedTokenCount: number;
     }>();
-    const registry = TokenRegistry.getInstance();
 
     for (const token of this.tokens.values()) {
-      // Skip tokens that are spent, invalid, or in active transfer
-      if (token.status === 'spent' || token.status === 'invalid' || token.status === 'transferring') {
-        continue;
-      }
+      // Skip spent, invalid, and transferring tokens
+      if (token.status === 'spent' || token.status === 'invalid' || token.status === 'transferring') continue;
       if (coinId && token.coinId !== coinId) continue;
 
       const key = token.coinId;
       const amount = BigInt(token.amount);
       const isConfirmed = token.status === 'confirmed';
-      const isUnconfirmed = token.status === 'submitted' || token.status === 'pending';
+      const existing = assetsMap.get(key);
 
-      const existing = balances.get(key);
       if (existing) {
         if (isConfirmed) {
           existing.confirmedAmount += amount;
           existing.confirmedTokenCount++;
-        } else if (isUnconfirmed) {
+        } else {
           existing.unconfirmedAmount += amount;
           existing.unconfirmedTokenCount++;
         }
       } else {
-        // Look up token metadata from registry (more reliable than stored values)
-        const def = registry.getDefinition(token.coinId);
-        balances.set(key, {
+        assetsMap.set(key, {
           coinId: token.coinId,
-          symbol: def?.symbol || token.symbol,
-          name: def?.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : token.name,
-          decimals: def?.decimals ?? token.decimals ?? 8,
+          symbol: token.symbol,
+          name: token.name,
+          decimals: token.decimals,
+          iconUrl: token.iconUrl,
           confirmedAmount: isConfirmed ? amount : 0n,
-          unconfirmedAmount: isUnconfirmed ? amount : 0n,
+          unconfirmedAmount: isConfirmed ? 0n : amount,
           confirmedTokenCount: isConfirmed ? 1 : 0,
-          unconfirmedTokenCount: isUnconfirmed ? 1 : 0,
+          unconfirmedTokenCount: isConfirmed ? 0 : 1,
         });
       }
     }
 
-    // Convert to TokenBalance interface
-    return Array.from(balances.values()).map(bal => ({
-      coinId: bal.coinId,
-      symbol: bal.symbol,
-      name: bal.name,
-      decimals: bal.decimals,
-      totalAmount: (bal.confirmedAmount + bal.unconfirmedAmount).toString(),
-      confirmedAmount: bal.confirmedAmount.toString(),
-      unconfirmedAmount: bal.unconfirmedAmount.toString(),
-      tokenCount: bal.confirmedTokenCount + bal.unconfirmedTokenCount,
-      confirmedTokenCount: bal.confirmedTokenCount,
-      unconfirmedTokenCount: bal.unconfirmedTokenCount,
-    }));
+    return Array.from(assetsMap.values()).map((raw) => {
+      const totalAmount = (raw.confirmedAmount + raw.unconfirmedAmount).toString();
+      return {
+        coinId: raw.coinId,
+        symbol: raw.symbol,
+        name: raw.name,
+        decimals: raw.decimals,
+        iconUrl: raw.iconUrl,
+        totalAmount,
+        tokenCount: raw.confirmedTokenCount + raw.unconfirmedTokenCount,
+        confirmedAmount: raw.confirmedAmount.toString(),
+        unconfirmedAmount: raw.unconfirmedAmount.toString(),
+        confirmedTokenCount: raw.confirmedTokenCount,
+        unconfirmedTokenCount: raw.unconfirmedTokenCount,
+        priceUsd: null,
+        priceEur: null,
+        change24h: null,
+        fiatValueUsd: null,
+        fiatValueEur: null,
+      };
+    });
   }
 
   /**
@@ -2541,7 +2835,9 @@ export class PaymentsModule {
       if (!provider.listTokenIds || !provider.getToken) continue;
 
       try {
-        const tokenIds = await provider.listTokenIds();
+        const allIds = await provider.listTokenIds();
+        // Only load token-xxx entries (not archived-, nametag-, or raw hex IDs)
+        const tokenIds = allIds.filter(id => id.startsWith('token-'));
         this.log(`Found ${tokenIds.length} token files in ${providerId}`);
 
         for (const tokenId of tokenIds) {
@@ -2601,6 +2897,14 @@ export class PaymentsModule {
                 : JSON.stringify(tokenJson),
             };
 
+            // Check if this token is tombstoned (was previously removed/sent)
+            const loadedTokenId = extractTokenIdFromSdkData(token.sdkData);
+            const loadedStateHash = extractStateHashFromSdkData(token.sdkData);
+            if (loadedTokenId && loadedStateHash && this.isStateTombstoned(loadedTokenId, loadedStateHash)) {
+              this.log(`Skipping tombstoned token file ${tokenId} (${loadedTokenId.slice(0, 8)}...)`);
+              continue;
+            }
+
             // Add to in-memory storage (skip file save since it's already in file)
             this.tokens.set(token.id, token);
             this.log(`Loaded token from file: ${tokenId}`);
@@ -2613,10 +2917,7 @@ export class PaymentsModule {
       }
     }
 
-    // Save to key-value storage to sync
-    if (this.tokens.size > 0) {
-      await this.save();
-    }
+    this.log(`Loaded ${this.tokens.size} tokens from file storage`);
   }
 
   /**
@@ -2696,6 +2997,9 @@ export class PaymentsModule {
     // Remove from active tokens
     this.tokens.delete(tokenId);
 
+    // Delete physical token file(s) from storage providers
+    await this.deleteTokenFiles(token);
+
     // Add to transaction history
     if (!skipHistory && token.coinId && token.amount) {
       await this.addToHistory({
@@ -2709,6 +3013,34 @@ export class PaymentsModule {
     }
 
     await this.save();
+  }
+
+  /**
+   * Delete physical token file(s) from all storage providers.
+   * Finds files by matching the SDK token ID prefix in the filename.
+   */
+  private async deleteTokenFiles(token: Token): Promise<void> {
+    const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
+    if (!sdkTokenId) return;
+
+    const tokenIdPrefix = sdkTokenId.slice(0, 16);
+    const providers = this.getTokenStorageProviders();
+
+    for (const [providerId, provider] of providers) {
+      if (!provider.listTokenIds || !provider.deleteToken) continue;
+      try {
+        const allIds = await provider.listTokenIds();
+        const matchingFiles = allIds.filter(id =>
+          id.startsWith(`token-${tokenIdPrefix}`)
+        );
+        for (const fileId of matchingFiles) {
+          await provider.deleteToken(fileId);
+          this.log(`Deleted token file ${fileId} from ${providerId}`);
+        }
+      } catch (error) {
+        console.warn(`[Payments] Failed to delete token files from ${providerId}:`, error);
+      }
+    }
   }
 
   // ===========================================================================
@@ -3392,51 +3724,28 @@ export class PaymentsModule {
    * Detect if a string is an L3 address (not a nametag)
    * Returns true for: hex pubkeys (64+ chars), PROXY:, DIRECT: prefixed addresses
    */
-  private isL3Address(value: string): boolean {
-    // PROXY: or DIRECT: prefixed addresses
-    if (value.startsWith('PROXY:') || value.startsWith('DIRECT:')) {
-      return true;
-    }
-    // Hex pubkey (64+ hex chars)
-    if (value.length >= 64 && /^[0-9a-fA-F]+$/.test(value)) {
-      return true;
-    }
-    return false;
-  }
-
   /**
-   * Resolve recipient to Nostr pubkey for messaging
-   * Supports: nametag (with or without @), hex pubkey
+   * Resolve recipient to transport pubkey for messaging.
+   * Uses pre-resolved PeerInfo if available, otherwise resolves via transport.
    */
-  private async resolveRecipient(recipient: string): Promise<string> {
-    // Explicit nametag with @
-    if (recipient.startsWith('@')) {
-      const nametag = recipient.slice(1);
-      const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
-      if (!pubkey) {
-        throw new Error(`Nametag not found: ${nametag}`);
-      }
-      return pubkey;
+  private resolveTransportPubkey(recipient: string, peerInfo?: PeerInfo | null): string {
+    // If we have PeerInfo, use it
+    if (peerInfo?.transportPubkey) {
+      return peerInfo.transportPubkey;
     }
 
-    // If it looks like an L3 address, return as-is (it's a pubkey)
-    if (this.isL3Address(recipient)) {
+    // Hex pubkey (64+ hex chars) — use as transport pubkey directly
+    if (recipient.length >= 64 && /^[0-9a-fA-F]+$/.test(recipient)) {
+      // 66-char with 02/03 prefix — strip to 32-byte x-only
+      if (recipient.length === 66 && (recipient.startsWith('02') || recipient.startsWith('03'))) {
+        return recipient.slice(2);
+      }
       return recipient;
     }
 
-    // Smart detection: try as nametag first
-    if (this.deps?.transport.resolveNametag) {
-      const pubkey = await this.deps.transport.resolveNametag(recipient);
-      if (pubkey) {
-        this.log(`Resolved "${recipient}" as nametag to pubkey`);
-        return pubkey;
-      }
-    }
-
-    // If not found as nametag and doesn't look like an address, throw error
     throw new Error(
-      `Recipient "${recipient}" is not a valid nametag or address. ` +
-      `Use @nametag for explicit nametag or a valid hex pubkey/PROXY:/DIRECT: address.`
+      `Cannot resolve transport pubkey for "${recipient}". ` +
+      `No binding event found. The recipient must publish their identity first.`
     );
   }
 
@@ -3510,123 +3819,64 @@ export class PaymentsModule {
   }
 
   /**
-   * Resolve nametag to 33-byte compressed public key using resolveNametagInfo
-   * Returns null if nametag not found
-   *
-   * NOTE: Legacy nametags without chainPubkey CANNOT be used for transfers.
-   * The transportPubkey (Nostr pubkey) is a different key from the L3 chainPubkey,
-   * so deriving one from the other is impossible. Legacy nametags must be re-registered
-   * with the new SDK format that includes chainPubkey.
+   * Resolve recipient to IAddress for L3 transfers.
+   * Uses pre-resolved PeerInfo when available to avoid redundant network queries.
    */
-  private async resolveNametagToPublicKey(nametag: string): Promise<string | null> {
-    if (!this.deps?.transport.resolveNametagInfo) {
-      this.log('resolveNametagInfo not available on transport');
-      return null;
-    }
-
-    const info = await this.deps.transport.resolveNametagInfo(nametag);
-    if (!info) {
-      this.log(`Nametag "${nametag}" not found`);
-      return null;
-    }
-
-    // Use chainPubkey if available (required for correct address derivation)
-    if (info.chainPubkey) {
-      return info.chainPubkey;
-    }
-
-    // Legacy nametag without chainPubkey - PROXY fallback will be used in resolveRecipientAddress
-    this.log(`Nametag "${nametag}" has no chainPubkey - will use PROXY address fallback`);
-    return null;
-  }
-
-  /**
-   * Resolve recipient to IAddress for L3 transfers
-   * Supports: nametag (with or without @), PROXY:, DIRECT:, hex pubkey
-   */
-  private async resolveRecipientAddress(recipient: string, addressMode: 'auto' | 'direct' | 'proxy' = 'auto'): Promise<IAddress> {
+  private async resolveRecipientAddress(
+    recipient: string,
+    addressMode: 'auto' | 'direct' | 'proxy' = 'auto',
+    peerInfo?: PeerInfo | null,
+  ): Promise<IAddress> {
     const { AddressFactory } = await import('@unicitylabs/state-transition-sdk/lib/address/AddressFactory');
     const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
 
-    // Explicit nametag with @
-    if (recipient.startsWith('@')) {
-      const nametag = recipient.slice(1);
-      const info = await this.deps?.transport.resolveNametagInfo?.(nametag);
-      if (!info) {
-        throw new Error(`Nametag "@${nametag}" not found`);
-      }
-
-      // Force PROXY mode
-      if (addressMode === 'proxy') {
-        console.log(`[Payments] Using PROXY address for @${nametag} (forced)`);
-        return ProxyAddress.fromNameTag(nametag);
-      }
-
-      // Force DIRECT mode - requires directAddress to be available
-      if (addressMode === 'direct') {
-        if (!info.directAddress) {
-          throw new Error(`Nametag "@${nametag}" has no DirectAddress stored. It may be a legacy registration.`);
-        }
-        console.log(`[Payments] Using DirectAddress for @${nametag} (forced): ${info.directAddress.slice(0, 30)}...`);
-        return AddressFactory.createAddress(info.directAddress);
-      }
-
-      // AUTO mode: NEW nametags have directAddress stored, LEGACY use PROXY
-      if (info.directAddress) {
-        console.log(`[Payments] Using stored DirectAddress for @${nametag}: ${info.directAddress.slice(0, 30)}...`);
-        return AddressFactory.createAddress(info.directAddress);
-      }
-
-      // LEGACY nametags don't have directAddress - use PROXY address
-      this.log(`Using PROXY address for legacy nametag @${nametag}`);
-      return ProxyAddress.fromNameTag(nametag);
-    }
-
-    // PROXY: or DIRECT: prefixed - parse using AddressFactory (explicit address overrides mode)
+    // PROXY: or DIRECT: prefixed — parse directly (explicit address overrides mode)
     if (recipient.startsWith('PROXY:') || recipient.startsWith('DIRECT:')) {
       return AddressFactory.createAddress(recipient);
     }
 
-    // If it looks like a hex pubkey (66 chars = 33 bytes compressed), create DirectAddress
+    // 66-char hex (33-byte compressed pubkey) — create DirectAddress
     if (recipient.length === 66 && /^[0-9a-fA-F]+$/.test(recipient)) {
       this.log(`Creating DirectAddress from 33-byte compressed pubkey`);
       return this.createDirectAddressFromPubkey(recipient);
     }
 
-    // Smart detection: try as nametag
-    const info = await this.deps?.transport.resolveNametagInfo?.(recipient);
-    if (info) {
-      // Force PROXY mode
-      if (addressMode === 'proxy') {
-        console.log(`[Payments] Using PROXY address for "${recipient}" (forced)`);
-        return ProxyAddress.fromNameTag(recipient);
-      }
-
-      // Force DIRECT mode
-      if (addressMode === 'direct') {
-        if (!info.directAddress) {
-          throw new Error(`Nametag "${recipient}" has no DirectAddress stored. It may be a legacy registration.`);
-        }
-        console.log(`[Payments] Using DirectAddress for "${recipient}" (forced): ${info.directAddress.slice(0, 30)}...`);
-        return AddressFactory.createAddress(info.directAddress);
-      }
-
-      // AUTO mode: NEW nametags have directAddress - use it
-      if (info.directAddress) {
-        this.log(`Using stored DirectAddress for nametag "${recipient}"`);
-        return AddressFactory.createAddress(info.directAddress);
-      }
-
-      // LEGACY nametags - use PROXY
-      this.log(`Using PROXY address for legacy nametag "${recipient}"`);
-      return ProxyAddress.fromNameTag(recipient);
+    // For nametag-based recipients, use PeerInfo (pre-resolved or resolve now)
+    const info = peerInfo ?? await this.deps?.transport.resolve?.(recipient) ?? null;
+    if (!info) {
+      throw new Error(
+        `Recipient "${recipient}" not found. ` +
+        `Use @nametag, a valid PROXY:/DIRECT: address, or a 33-byte hex pubkey.`
+      );
     }
 
-    // Not found as nametag and doesn't look like an address
-    throw new Error(
-      `Recipient "${recipient}" is not a valid nametag or L3 address. ` +
-      `Use @nametag for explicit nametag or a valid 33-byte hex pubkey/PROXY:/DIRECT: address.`
-    );
+    // Determine nametag for PROXY address derivation
+    const nametag = recipient.startsWith('@') ? recipient.slice(1)
+      : info.nametag || recipient;
+
+    // Force PROXY mode
+    if (addressMode === 'proxy') {
+      console.log(`[Payments] Using PROXY address for "${nametag}" (forced)`);
+      return ProxyAddress.fromNameTag(nametag);
+    }
+
+    // Force DIRECT mode
+    if (addressMode === 'direct') {
+      if (!info.directAddress) {
+        throw new Error(`"${nametag}" has no DirectAddress stored. It may be a legacy registration.`);
+      }
+      console.log(`[Payments] Using DirectAddress for "${nametag}" (forced): ${info.directAddress.slice(0, 30)}...`);
+      return AddressFactory.createAddress(info.directAddress);
+    }
+
+    // AUTO mode: prefer directAddress, fallback to PROXY for legacy
+    if (info.directAddress) {
+      this.log(`Using DirectAddress for "${nametag}": ${info.directAddress.slice(0, 30)}...`);
+      return AddressFactory.createAddress(info.directAddress);
+    }
+
+    this.log(`Using PROXY address for legacy nametag "${nametag}"`);
+    return ProxyAddress.fromNameTag(nametag);
   }
 
   /**
@@ -4169,12 +4419,13 @@ export class PaymentsModule {
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
-    const tokens = Array.from(this.tokens.values());
-
-    // Note: nametag is NOT passed here - it's saved separately via saveNametagToFileStorage()
+    // Active tokens are NOT stored in TXF format - they are saved as individual
+    // token-xxx files via saveTokenToFileStorage() to avoid duplication.
+    // TXF storage is only used for metadata: archived, tombstones, forked, outbox.
+    // Note: nametag is also saved separately via saveNametagToFileStorage()
     // as nametag-{name}.json to avoid duplication in storage
     return await buildTxfStorageData(
-      tokens,
+      [], // Empty - active tokens stored as token-xxx files
       {
         version: 1,
         address: this.deps!.identity.l1Address,
@@ -4213,7 +4464,12 @@ export class PaymentsModule {
     // Load other data
     this.archivedTokens = parsed.archivedTokens;
     this.forkedTokens = parsed.forkedTokens;
-    this.nametag = parsed.nametag;
+    // Only overwrite nametag if TXF data explicitly includes one.
+    // Nametag is stored separately as nametag-{name} files (not in TXF),
+    // so parsed.nametag is normally null and must not erase the existing value.
+    if (parsed.nametag !== null) {
+      this.nametag = parsed.nametag;
+    }
   }
 
   // ===========================================================================

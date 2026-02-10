@@ -105,11 +105,22 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         data._meta = meta;
       }
 
-      // Load all tokens
+      // Load all tokens from store
       const tokens = await this.getAllFromStore<{ id: string; data: unknown }>(STORE_TOKENS);
       for (const token of tokens) {
-        const key = `_${token.id}` as `_${string}`;
-        data[key] = token.data;
+        // Skip file-format entries (token-, nametag-) - they are loaded via loadTokensFromFileStorage
+        if (token.id.startsWith('token-') || token.id.startsWith('nametag-')) {
+          continue;
+        }
+
+        if (token.id.startsWith('archived-')) {
+          // Archived tokens: keep as-is (archived-tokenId key)
+          data[token.id as keyof TxfStorageDataBase] = token.data;
+        } else {
+          // Other entries: add _ prefix for TXF format
+          const key = `_${token.id}` as `_${string}`;
+          data[key] = token.data;
+        }
       }
 
       // Load tombstones
@@ -179,11 +190,18 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         await this.putToStore(STORE_META, 'invalid', data._invalid);
       }
 
-      // Save each token
+      // Save each token (active tokens start with _, archived with archived-)
+      const reservedKeys = ['_meta', '_tombstones', '_outbox', '_sent', '_invalid'];
       for (const [key, value] of Object.entries(data)) {
-        if (key.startsWith('_') && key !== '_meta' && key !== '_tombstones' && key !== '_outbox' && key !== '_sent' && key !== '_invalid') {
+        if (reservedKeys.includes(key)) continue;
+
+        if (key.startsWith('_')) {
+          // Active token: _tokenId -> tokenId
           const tokenId = key.slice(1);
           await this.putToStore(STORE_TOKENS, tokenId, { id: tokenId, data: value });
+        } else if (key.startsWith('archived-')) {
+          // Archived token: archived-tokenId -> archived-tokenId (keep prefix)
+          await this.putToStore(STORE_TOKENS, key, { id: key, data: value });
         }
       }
 
@@ -227,10 +245,34 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   async clear(): Promise<boolean> {
-    if (!this.db) return false;
+    // Close the open connection so deleteDatabase isn't blocked
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
+    this.status = 'disconnected';
+
+    const deleteDb = (name: string) =>
+      new Promise<void>((resolve) => {
+        const req = indexedDB.deleteDatabase(name);
+        req.onsuccess = () => resolve();
+        req.onerror = () => resolve();
+        req.onblocked = () => resolve();
+      });
+
     try {
-      await this.clearStore(STORE_TOKENS);
-      await this.clearStore(STORE_META);
+      // Delete all databases matching our prefix (covers all addresses)
+      if (typeof indexedDB.databases === 'function') {
+        const dbs = await indexedDB.databases();
+        await Promise.all(
+          dbs
+            .filter(db => db.name?.startsWith(this.dbNamePrefix))
+            .map(db => deleteDb(db.name!)),
+        );
+      } else {
+        // Fallback: delete only the current database
+        await deleteDb(this.dbName);
+      }
       return true;
     } catch {
       return false;

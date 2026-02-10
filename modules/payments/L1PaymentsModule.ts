@@ -26,7 +26,6 @@ import {
   VESTING_THRESHOLD,
   type UTXO,
   type Wallet,
-  type TransactionHistoryItem,
   type TransactionDetail,
 } from '../../l1';
 
@@ -124,14 +123,13 @@ export class L1PaymentsModule {
   private _initialized = false;
   private _config: L1PaymentsModuleConfig;
   private _identity?: FullIdentity;
-  private _chainCode?: string;
   private _addresses: string[] = [];
   private _wallet?: Wallet;
   private _transport?: TransportProvider;
 
   constructor(config?: L1PaymentsModuleConfig) {
     this._config = {
-      electrumUrl: config?.electrumUrl ?? 'wss://fulcrum.alpha.unicity.network:50004',
+      electrumUrl: config?.electrumUrl ?? 'wss://fulcrum.unicity.network:50004',
       network: config?.network ?? 'mainnet',
       defaultFeeRate: config?.defaultFeeRate ?? 10,
       enableVesting: config?.enableVesting ?? true,
@@ -140,7 +138,6 @@ export class L1PaymentsModule {
 
   async initialize(deps: L1PaymentsModuleDependencies): Promise<void> {
     this._identity = deps.identity;
-    this._chainCode = deps.chainCode;
     this._addresses = deps.addresses ?? [];
     this._transport = deps.transport;
 
@@ -170,12 +167,22 @@ export class L1PaymentsModule {
       }
     }
 
-    // Connect to Fulcrum WebSocket
-    if (this._config.electrumUrl) {
-      await l1Connect(this._config.electrumUrl);
-    }
+    // NOTE: We do NOT connect to Fulcrum here. Connection is deferred to
+    // first use (ensureConnected) so that import + scan flows are not
+    // disrupted by an early L1 WebSocket connection on the global singleton.
 
     this._initialized = true;
+  }
+
+  /**
+   * Ensure the Fulcrum WebSocket is connected. Called lazily before any
+   * operation that needs the network. If the singleton is already connected
+   * (e.g. by the address scanner), this is a no-op.
+   */
+  private async ensureConnected(): Promise<void> {
+    if (!isWebSocketConnected() && this._config.electrumUrl) {
+      await l1Connect(this._config.electrumUrl);
+    }
   }
 
   destroy(): void {
@@ -184,7 +191,6 @@ export class L1PaymentsModule {
     }
     this._initialized = false;
     this._identity = undefined;
-    this._chainCode = undefined;
     this._addresses = [];
     this._wallet = undefined;
   }
@@ -228,11 +234,11 @@ export class L1PaymentsModule {
    * Resolve nametag to L1 address using transport provider
    */
   private async resolveNametagToL1Address(nametag: string): Promise<string> {
-    if (!this._transport?.resolveNametagInfo) {
-      throw new Error('Transport provider does not support nametag resolution');
+    if (!this._transport?.resolve) {
+      throw new Error('Transport provider does not support resolution');
     }
 
-    const info = await this._transport.resolveNametagInfo(nametag);
+    const info = await this._transport.resolve(nametag);
     if (!info) {
       throw new Error(`Nametag not found: ${nametag}`);
     }
@@ -249,6 +255,7 @@ export class L1PaymentsModule {
 
   async send(request: L1SendRequest): Promise<L1SendResult> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     if (!this._wallet || !this._identity) {
       return { success: false, error: 'No wallet available' };
@@ -292,6 +299,7 @@ export class L1PaymentsModule {
 
   async getBalance(): Promise<L1Balance> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     const addresses = this._getWatchedAddresses();
     let totalAlpha = 0;
@@ -331,6 +339,7 @@ export class L1PaymentsModule {
 
   async getUtxos(): Promise<L1Utxo[]> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     const result: L1Utxo[] = [];
     const currentHeight = await getCurrentBlockHeight();
@@ -375,6 +384,7 @@ export class L1PaymentsModule {
   }
 
   async getHistory(limit?: number): Promise<L1Transaction[]> {
+    await this.ensureConnected();
     this.ensureInitialized();
 
     const addresses = this._getWatchedAddresses();
@@ -435,6 +445,7 @@ export class L1PaymentsModule {
 
   async getTransaction(txid: string): Promise<L1Transaction | null> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     const tx = (await l1GetTransaction(txid)) as TransactionDetail | null;
     if (!tx) return null;
@@ -480,6 +491,7 @@ export class L1PaymentsModule {
     amount: string
   ): Promise<{ fee: string; feeRate: number }> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     if (!this._wallet) {
       return { fee: '0', feeRate: this._config.defaultFeeRate ?? 10 };

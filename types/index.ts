@@ -74,17 +74,32 @@ export interface Token {
   readonly sdkData?: string;
 }
 
-export interface TokenBalance {
+export interface Asset {
   readonly coinId: string;
   readonly symbol: string;
   readonly name: string;
-  readonly totalAmount: string;
-  readonly confirmedAmount: string;     // Amount with inclusion proofs
-  readonly unconfirmedAmount: string;   // Amount pending proof (NOSTR-FIRST)
-  readonly tokenCount: number;
-  readonly confirmedTokenCount: number;   // Tokens with proofs
-  readonly unconfirmedTokenCount: number; // Tokens pending proof
   readonly decimals: number;
+  readonly iconUrl?: string;
+  readonly totalAmount: string;
+  readonly tokenCount: number;
+  /** Sum of confirmed token amounts (smallest units) */
+  readonly confirmedAmount: string;
+  /** Sum of unconfirmed (submitted/pending) token amounts (smallest units) */
+  readonly unconfirmedAmount: string;
+  /** Number of confirmed tokens aggregated */
+  readonly confirmedTokenCount: number;
+  /** Number of unconfirmed tokens aggregated */
+  readonly unconfirmedTokenCount: number;
+  /** Price per whole unit in USD (null if PriceProvider not configured) */
+  readonly priceUsd: number | null;
+  /** Price per whole unit in EUR (null if PriceProvider not configured) */
+  readonly priceEur: number | null;
+  /** 24h price change percentage (null if unavailable) */
+  readonly change24h: number | null;
+  /** Total fiat value in USD: (totalAmount / 10^decimals) * priceUsd */
+  readonly fiatValueUsd: number | null;
+  /** Total fiat value in EUR */
+  readonly fiatValueEur: number | null;
 }
 
 // =============================================================================
@@ -167,7 +182,7 @@ export interface PaymentRequest {
   readonly coinId: string;
   /** Optional message/memo */
   readonly message?: string;
-  /** Recipient nametag (who should pay) */
+  /** Where tokens should be sent */
   readonly recipientNametag?: string;
   /** Custom metadata */
   readonly metadata?: Record<string, unknown>;
@@ -195,7 +210,7 @@ export interface IncomingPaymentRequest {
   readonly symbol: string;
   /** Message from sender */
   readonly message?: string;
-  /** Who this request is for (our nametag) */
+  /** Requester's nametag (where tokens should be sent) */
   readonly recipientNametag?: string;
   /** Original request ID from sender */
   readonly requestId: string;
@@ -305,6 +320,42 @@ export interface BroadcastMessage {
 }
 
 // =============================================================================
+// Tracked Addresses
+// =============================================================================
+
+/**
+ * Minimal data stored in persistent storage for a tracked address.
+ * Only contains user state — derived fields are computed on load.
+ */
+export interface TrackedAddressEntry {
+  /** HD derivation index (0, 1, 2, ...) */
+  readonly index: number;
+  /** Whether this address is hidden from UI display */
+  hidden: boolean;
+  /** Timestamp (ms) when this address was first activated */
+  readonly createdAt: number;
+  /** Timestamp (ms) of last modification */
+  updatedAt: number;
+}
+
+/**
+ * Full tracked address with derived fields and nametag (available in memory).
+ * Returned by Sphere.getActiveAddresses() / getAllTrackedAddresses().
+ */
+export interface TrackedAddress extends TrackedAddressEntry {
+  /** Short address identifier (e.g., "DIRECT_abc123_xyz789") */
+  readonly addressId: string;
+  /** L1 bech32 address (alpha1...) */
+  readonly l1Address: string;
+  /** L3 DIRECT address (DIRECT://...) */
+  readonly directAddress: string;
+  /** 33-byte compressed secp256k1 public key */
+  readonly chainPubkey: string;
+  /** Primary nametag (from nametag cache, without @ prefix) */
+  readonly nametag?: string;
+}
+
+// =============================================================================
 // Event Types
 // =============================================================================
 
@@ -326,7 +377,10 @@ export type SphereEventType =
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
-  | 'identity:changed';
+  | 'identity:changed'
+  | 'address:activated'
+  | 'address:hidden'
+  | 'address:unhidden';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -347,6 +401,9 @@ export interface SphereEventMap {
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': { l1Address: string; directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
+  'address:activated': { address: TrackedAddress };
+  'address:hidden': { index: number; addressId: string };
+  'address:unhidden': { index: number; addressId: string };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (

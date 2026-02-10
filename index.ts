@@ -54,6 +54,10 @@ export type {
   SphereLoadOptions,
   SphereInitOptions,
   SphereInitResult,
+  ScanAddressProgress,
+  ScannedAddressResult,
+  ScanAddressesOptions,
+  ScanAddressesResult,
 } from './core';
 
 // =============================================================================
@@ -131,6 +135,7 @@ export type {
 export type {
   // Transport
   TransportProvider,
+  PeerInfo,
   MessageHandler,
   TokenTransferHandler,
   BroadcastHandler,
@@ -177,6 +182,7 @@ export type {
   PaymentsModuleDependencies,
   ReceiveOptions,
   ReceiveResult,
+  TransactionHistoryEntry,
 } from './modules/payments';
 
 export {
@@ -352,3 +358,19 @@ export type {
   TokenIcon,
   RegistryNetwork,
 } from './registry';
+
+// =============================================================================
+// Price Provider
+// =============================================================================
+
+export type {
+  PriceProvider,
+  PriceProviderConfig,
+  PricePlatform,
+  TokenPrice,
+} from './price';
+
+export {
+  CoinGeckoPriceProvider,
+  createPriceProvider,
+} from './price';

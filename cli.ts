@@ -195,6 +195,7 @@ WALLET MANAGEMENT:
   init [--network <net>]            Create new wallet (mainnet|testnet|dev)
   init --mnemonic "<words>"         Import wallet from mnemonic
   status                            Show wallet status and identity
+  clear                             Delete all wallet data (keys + tokens)
   config                            Show current configuration
   config set <key> <value>          Set configuration (network, dataDir, tokensDir)
 
@@ -228,6 +229,12 @@ TRANSFERS:
   receive [--finalize]              Check for incoming transfers
                                     --finalize: wait for unconfirmed tokens to be finalized
   history [limit]                   Show transaction history
+
+ADDRESSES:
+  addresses                         List all tracked addresses
+  switch <index>                    Switch to address at HD index
+  hide <index>                      Hide address from active list
+  unhide <index>                    Unhide address
 
 NAMETAGS:
   nametag <name>                    Register a nametag (@name)
@@ -406,6 +413,26 @@ async function main() {
           console.log('\nCurrent Configuration:');
           console.log(JSON.stringify(config, null, 2));
         }
+        break;
+      }
+
+      case 'clear': {
+        const config = loadConfig();
+        const providers = createNodeProviders({
+          network: config.network,
+          dataDir: config.dataDir,
+          tokensDir: config.tokensDir,
+        });
+
+        await providers.storage.connect();
+        await providers.tokenStorage.initialize();
+
+        console.log('Clearing all wallet data...');
+        await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
+        console.log('All wallet data cleared.');
+
+        await providers.storage.disconnect();
+        await providers.tokenStorage.shutdown();
         break;
       }
 
@@ -597,8 +624,8 @@ async function main() {
           finalize,
           onProgress: (resolution) => {
             if (resolution.stillPending > 0) {
-              const balances = sphere.payments.getBalance();
-              for (const bal of balances) {
+              const currentBalances = sphere.payments.getBalance();
+              for (const bal of currentBalances) {
                 if (BigInt(bal.unconfirmedAmount) > 0n) {
                   console.log(`  ${bal.symbol}: ${bal.unconfirmedTokenCount} token(s) still unconfirmed...`);
                 }
@@ -617,28 +644,37 @@ async function main() {
           }
         }
 
-        const balances = sphere.payments.getBalance();
+        const assets = sphere.payments.getBalance();
+        const totalUsd = await sphere.payments.getFiatBalance();
 
         console.log('\nL3 Balance:');
         console.log('─'.repeat(50));
 
-        if (balances.length === 0) {
+        if (assets.length === 0) {
           console.log('No tokens found.');
         } else {
-          for (const bal of balances) {
-            const decimals = bal.decimals ?? 8;
-            const confirmedFormatted = toHumanReadable(bal.confirmedAmount, decimals);
-            const unconfirmedBigInt = BigInt(bal.unconfirmedAmount);
+          for (const asset of assets) {
+            const decimals = asset.decimals ?? 8;
+            const confirmedFormatted = toHumanReadable(asset.confirmedAmount, decimals);
+            const unconfirmedBigInt = BigInt(asset.unconfirmedAmount);
 
+            let line = `${asset.symbol}: ${confirmedFormatted}`;
             if (unconfirmedBigInt > 0n) {
-              const unconfirmedFormatted = toHumanReadable(bal.unconfirmedAmount, decimals);
-              console.log(`${bal.symbol}: ${confirmedFormatted} (+ ${unconfirmedFormatted} unconfirmed) [${bal.confirmedTokenCount}+${bal.unconfirmedTokenCount} tokens]`);
+              const unconfirmedFormatted = toHumanReadable(asset.unconfirmedAmount, decimals);
+              line += ` (+ ${unconfirmedFormatted} unconfirmed) [${asset.confirmedTokenCount}+${asset.unconfirmedTokenCount} tokens]`;
             } else {
-              console.log(`${bal.symbol}: ${confirmedFormatted} (${bal.tokenCount} tokens)`);
+              line += ` (${asset.tokenCount} token${asset.tokenCount !== 1 ? 's' : ''})`;
             }
+            if (asset.fiatValueUsd != null) {
+              line += ` ≈ $${asset.fiatValueUsd.toFixed(2)}`;
+            }
+            console.log(line);
           }
         }
         console.log('─'.repeat(50));
+        if (totalUsd != null) {
+          console.log(`Total: $${totalUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+        }
 
         await closeSphere();
         break;
@@ -991,6 +1027,87 @@ async function main() {
         }
         console.log('─'.repeat(60));
 
+        await closeSphere();
+        break;
+      }
+
+      // === ADDRESSES ===
+      case 'addresses': {
+        const sphere = await getSphere();
+        const all = sphere.getAllTrackedAddresses();
+        const currentIndex = sphere.getCurrentAddressIndex();
+
+        console.log('\nTracked Addresses:');
+        console.log('─'.repeat(70));
+
+        if (all.length === 0) {
+          console.log('No tracked addresses.');
+        } else {
+          for (const addr of all) {
+            const marker = addr.index === currentIndex ? '→ ' : '  ';
+            const hidden = addr.hidden ? ' [hidden]' : '';
+            const tag = addr.nametag ? ` @${addr.nametag}` : '';
+            console.log(`${marker}#${addr.index}: ${addr.l1Address}${tag}${hidden}`);
+            console.log(`    DIRECT: ${addr.directAddress}`);
+          }
+        }
+
+        console.log('─'.repeat(70));
+        await closeSphere();
+        break;
+      }
+
+      case 'switch': {
+        const [, indexStr] = args;
+        if (!indexStr) {
+          console.error('Usage: switch <index>');
+          console.error('  index: HD address index (0, 1, 2, ...)');
+          process.exit(1);
+        }
+
+        const index = parseInt(indexStr);
+        if (isNaN(index) || index < 0) {
+          console.error('Invalid index. Must be a non-negative integer.');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await sphere.switchToAddress(index);
+
+        const identity = sphere.identity;
+        console.log(`\nSwitched to address #${index}`);
+        console.log(`  L1:      ${identity?.l1Address}`);
+        console.log(`  DIRECT:  ${identity?.directAddress}`);
+        console.log(`  Nametag: ${identity?.nametag || '(not set)'}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'hide': {
+        const [, indexStr] = args;
+        if (!indexStr) {
+          console.error('Usage: hide <index>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await sphere.setAddressHidden(parseInt(indexStr), true);
+        console.log(`Address #${indexStr} hidden.`);
+        await closeSphere();
+        break;
+      }
+
+      case 'unhide': {
+        const [, indexStr] = args;
+        if (!indexStr) {
+          console.error('Usage: unhide <index>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await sphere.setAddressHidden(parseInt(indexStr), false);
+        console.log(`Address #${indexStr} unhidden.`);
         await closeSphere();
         break;
       }

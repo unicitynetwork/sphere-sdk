@@ -159,6 +159,11 @@ function createMockTransport(): TransportProvider {
     onTokenTransfer: vi.fn().mockReturnValue(() => {}),
     onPaymentRequest: vi.fn().mockReturnValue(() => {}),
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
+    resolve: vi.fn().mockResolvedValue({
+      chainPubkey: FAKE_PUBKEY,
+      transportPubkey: 'transport-pub',
+      directAddress: 'DIRECT://testaddr',
+    }),
     resolveNametagInfo: vi.fn().mockResolvedValue({
       chainPubkey: FAKE_PUBKEY,
       transportPubkey: 'transport-pub',
