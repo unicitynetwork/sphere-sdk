@@ -117,11 +117,37 @@ describe('IPFS Sync E2E', () => {
   }, 30000);
 
   it('should recover full inventory from IPFS after local storage wipe', async () => {
-    // Step 1: Save a multi-token inventory with Provider A
+    // Use a FRESH private key so this IPNS name has no prior routing history
+    // on the gateway — avoids stale-cache issues from earlier tests.
+    const freshKey = randomHex(32);
+    const freshIdentity: FullIdentity = {
+      privateKey: freshKey,
+      chainPubkey: '03' + randomHex(32),
+      l1Address: 'alpha1recovery' + randomHex(10),
+      directAddress: 'DIRECT://recovery' + randomHex(10),
+    };
+
+    const providerConfig = {
+      gateways,
+      debug: true,
+      fetchTimeoutMs: 30000,
+      resolveTimeoutMs: 15000,
+      publishTimeoutMs: 60000,
+    };
+
+    // --- Provider A: save inventory ---
+    const providerA = new IpfsStorageProvider(
+      providerConfig,
+      new InMemoryIpfsStatePersistence(),
+    );
+    providerA.setIdentity(freshIdentity);
+    expect(await providerA.initialize()).toBe(true);
+    console.log(`Recovery test: IPNS name = ${providerA.getIpnsName()}`);
+
     const inventory: TxfStorageDataBase = {
       _meta: {
-        version: 10,
-        address: testIdentity.directAddress!,
+        version: 1,
+        address: freshIdentity.directAddress!,
         formatVersion: '2.0',
         updatedAt: Date.now(),
       },
@@ -130,42 +156,47 @@ describe('IPFS Sync E2E', () => {
       _tokenCharlie: { id: 'tokenCharlie', coinId: 'GEMA', amount: '100' },
     };
 
-    const saveResult = await provider.save(inventory);
+    const saveResult = await providerA.save(inventory);
     expect(saveResult.success).toBe(true);
     expect(saveResult.cid).toBeTruthy();
+    console.log(`Saved CID=${saveResult.cid}, seq=${providerA.getSequenceNumber()}`);
 
-    // Step 2: Destroy Provider A — simulates local storage wipe
-    await provider.shutdown();
+    // Destroy Provider A — simulates full local storage wipe
+    await providerA.shutdown();
 
-    // Step 3: Create Provider B from scratch with the SAME private key
-    // but a completely fresh state persistence (no cached CID, no sequence)
-    const freshPersistence = new InMemoryIpfsStatePersistence();
+    // Wait for IPNS propagation (first-ever record for this name)
+    console.log('Waiting for IPNS propagation...');
+    await new Promise((r) => setTimeout(r, 5000));
+
+    // --- Provider B: fresh instance, same key, NO persisted state ---
     const providerB = new IpfsStorageProvider(
-      {
-        gateways,
-        debug: true,
-        fetchTimeoutMs: 30000,
-        resolveTimeoutMs: 15000,
-        publishTimeoutMs: 60000,
-      },
-      freshPersistence,
+      providerConfig,
+      new InMemoryIpfsStatePersistence(),
     );
+    providerB.setIdentity(freshIdentity);
+    expect(await providerB.initialize()).toBe(true);
 
-    providerB.setIdentity(testIdentity);
-    const initOk = await providerB.initialize();
-    expect(initOk).toBe(true);
-
-    // Verify Provider B has no local state
+    // Verify Provider B has zero local state
     expect(providerB.getLastCid()).toBeNull();
     expect(providerB.getSequenceNumber()).toBe(0n);
 
-    // Step 4: Load from IPFS via IPNS resolution (the recovery path)
-    const recovered = await providerB.load();
-    expect(recovered.success).toBe(true);
-    expect(recovered.data).toBeTruthy();
+    // Recovery: load via IPNS resolution (retry up to 60s for propagation)
+    let recovered;
+    for (let attempt = 1; attempt <= 12; attempt++) {
+      recovered = await providerB.load();
+      if (recovered.success && recovered.data) {
+        console.log(`IPNS resolved on attempt ${attempt}`);
+        break;
+      }
+      console.log(`Attempt ${attempt}: ${recovered.error} — retrying in 5s...`);
+      await new Promise((r) => setTimeout(r, 5000));
+    }
 
-    // Step 5: Verify the recovered inventory matches what was saved
-    const data = recovered.data as any;
+    expect(recovered!.success).toBe(true);
+    expect(recovered!.data).toBeTruthy();
+
+    // Verify the recovered inventory matches what was saved
+    const data = recovered!.data as any;
     expect(data._tokenAlpha?.coinId).toBe('UCT');
     expect(data._tokenAlpha?.amount).toBe('5000000');
     expect(data._tokenBravo?.coinId).toBe('UCT');
@@ -173,9 +204,7 @@ describe('IPFS Sync E2E', () => {
     expect(data._tokenCharlie?.coinId).toBe('GEMA');
     expect(data._tokenCharlie?.amount).toBe('100');
 
+    console.log('Recovery test PASSED: all tokens recovered from IPFS');
     await providerB.shutdown();
-
-    // Re-init the original provider for afterAll cleanup
-    provider = providerB;
-  }, 120000);
+  }, 180000);
 });
