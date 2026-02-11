@@ -1,0 +1,281 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { IpfsStorageProvider } from '../../../../../impl/shared/ipfs/ipfs-storage-provider';
+import { InMemoryIpfsStatePersistence } from '../../../../../impl/shared/ipfs/ipfs-state-persistence';
+import type { FullIdentity } from '../../../../../types';
+
+// Mock the dynamic import dependencies
+vi.mock('../../../../../impl/shared/ipfs/ipns-key-derivation', () => ({
+  deriveIpnsIdentity: vi.fn().mockResolvedValue({
+    keyPair: { type: 'Ed25519', raw: new Uint8Array(32) },
+    ipnsName: '12D3KooWTestPeerId',
+  }),
+  deriveIpnsName: vi.fn().mockResolvedValue('12D3KooWTestPeerId'),
+  deriveEd25519KeyMaterial: vi.fn().mockReturnValue(new Uint8Array(32)),
+  IPNS_HKDF_INFO: 'ipfs-storage-ed25519-v1',
+}));
+
+vi.mock('../../../../../impl/shared/ipfs/ipns-record-manager', () => ({
+  createSignedRecord: vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3])),
+  parseRoutingApiResponse: vi.fn(),
+  verifySequenceProgression: vi.fn().mockReturnValue(true),
+}));
+
+describe('IpfsStorageProvider', () => {
+  let provider: IpfsStorageProvider;
+  let statePersistence: InMemoryIpfsStatePersistence;
+  const testIdentity: FullIdentity = {
+    privateKey: 'e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35',
+    chainPubkey: '0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2',
+    l1Address: 'alpha1test',
+    directAddress: 'DIRECT://test',
+  };
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+    statePersistence = new InMemoryIpfsStatePersistence();
+    provider = new IpfsStorageProvider(
+      { gateways: ['https://gw1.example.com'] },
+      statePersistence,
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  describe('lifecycle', () => {
+    it('should start disconnected', () => {
+      expect(provider.getStatus()).toBe('disconnected');
+      expect(provider.isConnected()).toBe(false);
+    });
+
+    it('should have correct provider metadata', () => {
+      expect(provider.id).toBe('ipfs');
+      expect(provider.name).toBe('IPFS Storage');
+      expect(provider.type).toBe('p2p');
+    });
+
+    it('should fail to initialize without identity', async () => {
+      const result = await provider.initialize();
+      expect(result).toBe(false);
+    });
+
+    it('should initialize successfully with identity', async () => {
+      // Mock the connectivity test
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+
+      provider.setIdentity(testIdentity);
+      const result = await provider.initialize();
+      expect(result).toBe(true);
+      expect(provider.isConnected()).toBe(true);
+      expect(provider.getIpnsName()).toBe('12D3KooWTestPeerId');
+    });
+
+    it('should load persisted state on initialize', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+
+      await statePersistence.save('12D3KooWTestPeerId', {
+        sequenceNumber: '5',
+        lastCid: 'bafyexisting',
+        version: 3,
+      });
+
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      expect(provider.getSequenceNumber()).toBe(5n);
+      expect(provider.getLastCid()).toBe('bafyexisting');
+    });
+
+    it('should shutdown and reset status', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+      await provider.shutdown();
+
+      expect(provider.isConnected()).toBe(false);
+      expect(provider.getStatus()).toBe('disconnected');
+    });
+  });
+
+  describe('save', () => {
+    const testData = {
+      _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
+      _abc123: { some: 'token' },
+    };
+
+    beforeEach(async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+    });
+
+    it('should upload and publish successfully', async () => {
+      // Upload response
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ Hash: 'bafynew123' }), { status: 200 }),
+        )
+        // Publish response
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      const result = await provider.save(testData as any);
+      expect(result.success).toBe(true);
+      expect(result.cid).toBe('bafynew123');
+      expect(provider.getLastCid()).toBe('bafynew123');
+      expect(provider.getSequenceNumber()).toBe(1n);
+    });
+
+    it('should persist state after save', async () => {
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ Hash: 'bafynew123' }), { status: 200 }),
+        )
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      await provider.save(testData as any);
+
+      const persisted = await statePersistence.load('12D3KooWTestPeerId');
+      expect(persisted).not.toBeNull();
+      expect(persisted!.sequenceNumber).toBe('1');
+      expect(persisted!.lastCid).toBe('bafynew123');
+    });
+
+    it('should fail when not initialized', async () => {
+      const uninitProvider = new IpfsStorageProvider(
+        { gateways: ['https://gw1.example.com'] },
+        statePersistence,
+      );
+
+      const result = await uninitProvider.save(testData as any);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Not initialized');
+    });
+
+    it('should return failure when publish fails', async () => {
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ Hash: 'bafynew123' }), { status: 200 }),
+        )
+        // All publish attempts fail
+        .mockRejectedValue(new TypeError('Failed'));
+
+      const result = await provider.save(testData as any);
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('load', () => {
+    beforeEach(async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+    });
+
+    it('should fail when not initialized', async () => {
+      const uninitProvider = new IpfsStorageProvider(
+        { gateways: ['https://gw1.example.com'] },
+        statePersistence,
+      );
+
+      const result = await uninitProvider.load();
+      expect(result.success).toBe(false);
+    });
+
+    it('should return not found for new wallet', async () => {
+      // IPNS resolution returns 500 routing not found
+      vi.mocked(fetch).mockResolvedValue(
+        new Response('routing: not found', { status: 500 }),
+      );
+
+      const result = await provider.load();
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('sync', () => {
+    const localData = {
+      _meta: { version: 1, address: 'test', formatVersion: '2.0', updatedAt: 1000 },
+      _token1: { id: 'token1' },
+    };
+
+    beforeEach(async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+    });
+
+    it('should upload local data when no remote exists', async () => {
+      // IPNS resolution fails (no remote)
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response('routing: not found', { status: 500 }))
+        // Upload
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ Hash: 'bafynew' }), { status: 200 }),
+        )
+        // Publish
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      const result = await provider.sync(localData as any);
+      expect(result.success).toBe(true);
+      expect(result.added).toBe(0);
+      expect(result.removed).toBe(0);
+      expect(result.conflicts).toBe(0);
+    });
+  });
+
+  describe('events', () => {
+    it('should emit events via onEvent', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+
+      const events: any[] = [];
+      const unsub = provider.onEvent!((event) => events.push(event));
+
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      expect(events.some((e) => e.type === 'storage:loading')).toBe(true);
+      expect(events.some((e) => e.type === 'storage:loaded')).toBe(true);
+
+      unsub();
+    });
+
+    it('should stop emitting after unsubscribe', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+
+      const events: any[] = [];
+      const unsub = provider.onEvent!((event) => events.push(event));
+      unsub();
+
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      expect(events.length).toBe(0);
+    });
+  });
+
+  describe('exists', () => {
+    it('should return false when not initialized', async () => {
+      const result = await provider.exists!();
+      expect(result).toBe(false);
+    });
+  });
+});
