@@ -167,6 +167,21 @@ async function closeSphere(): Promise<void> {
   }
 }
 
+async function syncIfEnabled(sphere: Sphere, skip: boolean): Promise<void> {
+  if (skip) return;
+  try {
+    console.log('Syncing with IPFS...');
+    const result = await sphere.payments.sync();
+    if (result.added > 0 || result.removed > 0) {
+      console.log(`  Synced: +${result.added} added, -${result.removed} removed`);
+    } else {
+      console.log('  Up to date.');
+    }
+  } catch (err) {
+    console.warn(`  Sync warning: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
 // =============================================================================
 // Interactive Input
 // =============================================================================
@@ -207,9 +222,10 @@ WALLET PROFILES:
   wallet current                    Show current wallet profile
 
 BALANCE & TOKENS:
-  balance [--finalize]              Show L3 token balance
+  balance [--finalize] [--no-sync]  Show L3 token balance
                                     --finalize: wait for unconfirmed tokens to be finalized
-  tokens                            List all tokens with details
+                                    --no-sync: skip IPFS sync before showing balance
+  tokens [--no-sync]                List all tokens with details
   l1-balance                        Show L1 (ALPHA) balance
   topup [coin] [amount]             Request test tokens from faucet
                                     Without args: requests all supported coins
@@ -218,6 +234,7 @@ BALANCE & TOKENS:
                                     Detects spent tokens not removed from storage
                                     --remove: Remove spent tokens from storage
                                     -v/--verbose: Show all tokens, not just spent
+  sync                              Sync tokens with IPFS remote storage
 
 TRANSFERS:
   send <to> <amount> [options]      Send tokens (to: @nametag or address)
@@ -226,8 +243,10 @@ TRANSFERS:
                                     --proxy          Force PROXY address transfer
                                     --instant        Send immediately via Nostr (default)
                                     --conservative   Collect all proofs first, then send
-  receive [--finalize]              Check for incoming transfers
+                                    --no-sync        Skip IPFS sync after sending
+  receive [--finalize] [--no-sync]  Check for incoming transfers
                                     --finalize: wait for unconfirmed tokens to be finalized
+                                    --no-sync: skip IPFS sync after receiving
   history [limit]                   Show transaction history
 
 ADDRESSES:
@@ -617,7 +636,10 @@ async function main() {
       // === BALANCE & TOKENS ===
       case 'balance': {
         const finalize = args.includes('--finalize');
+        const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
+
+        await syncIfEnabled(sphere, noSync);
 
         console.log(finalize ? '\nFetching and finalizing tokens...' : '\nFetching tokens...');
         const result = await sphere.payments.receive({
@@ -681,7 +703,11 @@ async function main() {
       }
 
       case 'tokens': {
+        const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
+
+        await syncIfEnabled(sphere, noSync);
+
         const tokens = sphere.payments.getTokens();
         const registry = TokenRegistry.getInstance();
 
@@ -862,6 +888,13 @@ async function main() {
         break;
       }
 
+      case 'sync': {
+        const sphere = await getSphere();
+        await syncIfEnabled(sphere, false);
+        await closeSphere();
+        break;
+      }
+
       // === TRANSFERS ===
       case 'send': {
         const [, recipient, amountStr] = args;
@@ -937,12 +970,15 @@ async function main() {
 
         // Wait for background tasks (e.g., change token creation from instant split)
         await sphere.payments.waitForPendingOperations();
+        const noSyncSend = args.includes('--no-sync');
+        await syncIfEnabled(sphere, noSyncSend);
         await closeSphere();
         break;
       }
 
       case 'receive': {
         const finalize = args.includes('--finalize');
+        const noSyncRecv = args.includes('--no-sync');
         const sphere = await getSphere();
         const identity = sphere.identity;
 
@@ -995,6 +1031,7 @@ async function main() {
           console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
         }
 
+        await syncIfEnabled(sphere, noSyncRecv);
         await closeSphere();
         break;
       }
