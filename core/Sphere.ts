@@ -65,7 +65,6 @@ import {
   STORAGE_KEYS_ADDRESS,
   getAddressId,
   DEFAULT_BASE_PATH,
-  LIMITS,
   DEFAULT_ENCRYPTION_KEY,
   type NetworkType,
 } from '../constants';
@@ -2149,10 +2148,11 @@ export class Sphere {
 
     // Transport metadata: relay details
     let transportMeta: Record<string, unknown> | undefined;
-    if (typeof (this._transport as any).getRelays === 'function') {
-      const total = ((this._transport as any).getRelays() as string[]).length;
-      const connected = typeof (this._transport as any).getConnectedRelays === 'function'
-        ? ((this._transport as any).getConnectedRelays() as string[]).length
+    const transport = this._transport as unknown as Record<string, unknown>;
+    if (typeof transport.getRelays === 'function') {
+      const total = (transport.getRelays as () => string[])().length;
+      const connected = typeof transport.getConnectedRelays === 'function'
+        ? (transport.getConnectedRelays as () => string[])().length
         : 0;
       transportMeta = { relays: { total, connected } };
     }
@@ -2176,12 +2176,12 @@ export class Sphere {
     const priceProviders: ProviderStatusInfo[] = [];
     if (this._priceProvider) {
       priceProviders.push({
-        id: (this._priceProvider as any).id ?? 'price',
+        id: this._priceProviderId,
         name: this._priceProvider.platform ?? 'Price',
         role: 'price',
         status: 'connected',
         connected: true,
-        enabled: !this._disabledProviders.has((this._priceProvider as any).id ?? 'price'),
+        enabled: !this._disabledProviders.has(this._priceProviderId),
       });
     }
 
@@ -2226,10 +2226,16 @@ export class Sphere {
     this._disabledProviders.add(providerId);
 
     try {
-      if ('shutdown' in provider && typeof provider.shutdown === 'function') {
+      if ('disable' in provider && typeof provider.disable === 'function') {
+        // L1PaymentsModule — dedicated disable that disconnects + blocks operations
+        provider.disable();
+      } else if ('shutdown' in provider && typeof provider.shutdown === 'function') {
         await provider.shutdown();
       } else if ('disconnect' in provider && typeof provider.disconnect === 'function') {
         await provider.disconnect();
+      } else if ('clearCache' in provider && typeof provider.clearCache === 'function') {
+        // Stateless providers (e.g. PriceProvider) — just clear cache
+        provider.clearCache();
       }
     } catch {
       // Provider disconnect may fail — still mark as disabled
@@ -2256,21 +2262,39 @@ export class Sphere {
 
     this._disabledProviders.delete(providerId);
 
-    try {
-      if ('initialize' in provider && typeof provider.initialize === 'function') {
-        await provider.initialize();
-      } else if ('connect' in provider && typeof provider.connect === 'function') {
-        await provider.connect();
-      }
-    } catch (err) {
+    // L1 — dedicated enable(), reconnects lazily on next operation
+    if ('enable' in provider && typeof provider.enable === 'function') {
+      provider.enable();
       this.emitEvent('connection:changed', {
         provider: providerId,
         connected: false,
-        status: 'error',
+        status: 'disconnected',
         enabled: true,
-        error: err instanceof Error ? err.message : String(err),
       });
-      return false;
+      return true;
+    }
+
+    // Stateless providers (PriceProvider) — no connect needed
+    const hasLifecycle = ('connect' in provider && typeof provider.connect === 'function')
+      || ('initialize' in provider && typeof provider.initialize === 'function');
+
+    if (hasLifecycle) {
+      try {
+        if ('connect' in provider && typeof provider.connect === 'function') {
+          await provider.connect();
+        } else if ('initialize' in provider && typeof provider.initialize === 'function') {
+          await provider.initialize();
+        }
+      } catch (err) {
+        this.emitEvent('connection:changed', {
+          provider: providerId,
+          connected: false,
+          status: 'error',
+          enabled: true,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return false;
+      }
     }
 
     this.emitEvent('connection:changed', {
@@ -2297,6 +2321,13 @@ export class Sphere {
     return this._disabledProviders;
   }
 
+  /** Get the price provider's ID (implementation detail — not on PriceProvider interface) */
+  private get _priceProviderId(): string {
+    if (!this._priceProvider) return 'price';
+    const p = this._priceProvider as unknown as Record<string, unknown>;
+    return typeof p.id === 'string' ? p.id : 'price';
+  }
+
   /**
    * Find a provider by ID across all provider collections
    */
@@ -2308,7 +2339,7 @@ export class Sphere {
     if (this._tokenStorageProviders.has(providerId)) {
       return this._tokenStorageProviders.get(providerId)!;
     }
-    if (this._priceProvider && ((this._priceProvider as any).id ?? 'price') === providerId) {
+    if (this._priceProvider && this._priceProviderId === providerId) {
       return this._priceProvider;
     }
     if (providerId === 'l1-alpha' && this._payments.l1) {

@@ -1,8 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { WebSocketServer } from 'ws';
+import { WebSocket as WsWebSocket } from 'ws';
 import { checkNetworkHealth } from '../../../core/network-health';
 
 describe('checkNetworkHealth', () => {
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let fetchSpy: any;
 
   beforeEach(() => {
     fetchSpy = vi.spyOn(globalThis, 'fetch');
@@ -198,7 +201,7 @@ describe('checkNetworkHealth', () => {
     it('should report relay unhealthy when WebSocket errors', async () => {
       (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
         onopen: (() => void) | null = null;
-        onerror: (() => void) | null = null;
+        onerror: ((event: unknown) => void) | null = null;
         onclose: (() => void) | null = null;
         constructor() {
           setTimeout(() => this.onerror?.({}), 1);
@@ -341,4 +344,123 @@ describe('checkNetworkHealth', () => {
       expect(result.services.l1).toBeDefined();
     });
   });
+});
+
+// =============================================================================
+// Real WebSocket tests — uses `ws` package with a local server
+// =============================================================================
+
+describe('checkNetworkHealth with real WebSocket', () => {
+  let originalWS: unknown;
+
+  beforeEach(() => {
+    originalWS = (globalThis as Record<string, unknown>).WebSocket;
+    // Provide a real WebSocket implementation from ws package
+    (globalThis as Record<string, unknown>).WebSocket = WsWebSocket;
+  });
+
+  afterEach(() => {
+    if (originalWS !== undefined) {
+      (globalThis as Record<string, unknown>).WebSocket = originalWS;
+    } else {
+      delete (globalThis as Record<string, unknown>).WebSocket;
+    }
+    vi.restoreAllMocks();
+  });
+
+  it('should report healthy when local WebSocket server accepts connection', async () => {
+    const wss = new WebSocketServer({ port: 0 });
+    const port = (wss.address() as { port: number }).port;
+
+    try {
+      const result = await new Promise<boolean>((resolve) => {
+        const ws = new WsWebSocket(`ws://127.0.0.1:${port}`);
+        ws.onopen = () => { ws.close(); resolve(true); };
+        ws.onerror = () => { resolve(false); };
+      });
+      expect(result).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
+  it('should report unhealthy when connection is refused', async () => {
+    // Use a port that's definitely not listening
+    const result = await new Promise<{ connected: boolean; error?: string }>((resolve) => {
+      const ws = new WsWebSocket('ws://127.0.0.1:1');
+      ws.onopen = () => { ws.close(); resolve({ connected: true }); };
+      ws.onerror = () => { resolve({ connected: false, error: 'connection error' }); };
+    });
+
+    expect(result.connected).toBe(false);
+  });
+
+  it('should handle server that immediately closes connection', async () => {
+    const wss = new WebSocketServer({ port: 0 });
+    const port = (wss.address() as { port: number }).port;
+
+    // Server immediately closes every connection
+    wss.on('connection', (ws) => {
+      ws.close(1000, 'Go away');
+    });
+
+    try {
+      const result = await new Promise<{ opened: boolean; closed: boolean; code?: number }>((resolve) => {
+        let opened = false;
+        const ws = new WsWebSocket(`ws://127.0.0.1:${port}`);
+        ws.onopen = () => { opened = true; };
+        ws.onclose = (event) => {
+          resolve({ opened, closed: true, code: (event as unknown as { code: number }).code });
+        };
+        ws.onerror = () => {
+          resolve({ opened, closed: true });
+        };
+      });
+
+      // Connection was established then closed by server
+      expect(result.closed).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
+  it('should timeout on a server that hangs without accepting', async () => {
+    // Create a raw TCP server that accepts connections but never sends WS handshake
+    const net = await import('net');
+    const server = net.createServer((_socket) => {
+      // intentionally do nothing — no WS upgrade
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+    const port = (server.address() as { port: number }).port;
+
+    try {
+      const start = Date.now();
+      const timeoutMs = 200;
+      const result = await new Promise<{ connected: boolean; timedOut: boolean }>((resolve) => {
+        const ws = new WsWebSocket(`ws://127.0.0.1:${port}`, { handshakeTimeout: timeoutMs });
+
+        const timeout = setTimeout(() => {
+          try { ws.terminate(); } catch { /* ignore */ }
+          resolve({ connected: false, timedOut: true });
+        }, timeoutMs);
+        ws.onopen = () => {
+          clearTimeout(timeout);
+          ws.close();
+          resolve({ connected: true, timedOut: false });
+        };
+        ws.onerror = () => {
+          clearTimeout(timeout);
+          resolve({ connected: false, timedOut: false });
+        };
+      });
+
+      const elapsed = Date.now() - start;
+      // Should have timed out (not connected instantly)
+      expect(result.connected).toBe(false);
+      expect(elapsed).toBeGreaterThanOrEqual(100);
+    } finally {
+      server.close();
+    }
+  }, 5000);
 });

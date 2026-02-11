@@ -642,6 +642,123 @@ describe('Sphere Status & Provider Management', () => {
   });
 
   // ===========================================================================
+  // L1 disable/enable
+  // ===========================================================================
+
+  describe('L1 disable/enable', () => {
+    it('should disable L1 provider', async () => {
+      const sphere = await initSphere({
+        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
+      });
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const result = await sphere.disableProvider('l1-alpha');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('l1-alpha')).toBe(false);
+
+      const status = sphere.getStatus();
+      expect(status.l1[0].enabled).toBe(false);
+
+      // Should emit connection:changed
+      expect(events).toHaveLength(1);
+      expect(events[0].provider).toBe('l1-alpha');
+      expect(events[0].enabled).toBe(false);
+    });
+
+    it('should re-enable L1 provider with lazy reconnect', async () => {
+      const sphere = await initSphere({
+        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
+      });
+
+      await sphere.disableProvider('l1-alpha');
+      expect(sphere.isProviderEnabled('l1-alpha')).toBe(false);
+
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const result = await sphere.enableProvider('l1-alpha');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('l1-alpha')).toBe(true);
+
+      // L1 re-enable emits disconnected status (lazy — will connect on first use)
+      expect(events).toHaveLength(1);
+      expect(events[0].provider).toBe('l1-alpha');
+      expect(events[0].enabled).toBe(true);
+      expect(events[0].connected).toBe(false);
+      expect(events[0].status).toBe('disconnected');
+    });
+
+    it('should block L1 operations while disabled', async () => {
+      const sphere = await initSphere({
+        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
+      });
+
+      await sphere.disableProvider('l1-alpha');
+
+      // L1 getBalance should throw because ensureConnected checks _disabled
+      await expect(sphere.payments.l1!.getBalance()).rejects.toThrow('L1 provider is disabled');
+    });
+
+    it('should allow L1 operations after re-enable', async () => {
+      const sphere = await initSphere({
+        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
+      });
+
+      await sphere.disableProvider('l1-alpha');
+      await sphere.enableProvider('l1-alpha');
+
+      // L1 disabled flag should be cleared — ensureConnected won't throw
+      expect(sphere.payments.l1!.disabled).toBe(false);
+    });
+  });
+
+  // ===========================================================================
+  // Price disable/enable
+  // ===========================================================================
+
+  describe('Price disable/enable', () => {
+    it('should disable price provider', async () => {
+      const sphere = await initSphere({ price: { platform: 'coingecko' } });
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const result = await sphere.disableProvider('price');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('price')).toBe(false);
+
+      const status = sphere.getStatus();
+      expect(status.price[0].enabled).toBe(false);
+
+      expect(events).toHaveLength(1);
+      expect(events[0].provider).toBe('price');
+      expect(events[0].enabled).toBe(false);
+    });
+
+    it('should re-enable price provider', async () => {
+      const sphere = await initSphere({ price: { platform: 'coingecko' } });
+
+      await sphere.disableProvider('price');
+      const result = await sphere.enableProvider('price');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('price')).toBe(true);
+
+      const status = sphere.getStatus();
+      expect(status.price[0].enabled).toBe(true);
+    });
+
+    it('should return null fiat balance when price is disabled', async () => {
+      const sphere = await initSphere({ price: { platform: 'coingecko' } });
+
+      await sphere.disableProvider('price');
+
+      // getFiatBalance should return null when price is disabled
+      const fiat = await sphere.payments.getFiatBalance();
+      expect(fiat).toBeNull();
+    });
+  });
+
+  // ===========================================================================
   // reconnect() without manual event emit
   // ===========================================================================
 

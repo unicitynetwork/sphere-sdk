@@ -2110,7 +2110,7 @@ export class PaymentsModule {
   async getFiatBalance(): Promise<number | null> {
     const assets = await this.getAssets();
 
-    if (!this.priceProvider) {
+    if (!this.priceProvider || this.isPriceDisabled()) {
       return null;
     }
 
@@ -2152,7 +2152,7 @@ export class PaymentsModule {
     const rawAssets = this.aggregateTokens(coinId);
 
     // Fetch prices if provider is available
-    if (!this.priceProvider || rawAssets.length === 0) {
+    if (!this.priceProvider || this.isPriceDisabled() || rawAssets.length === 0) {
       return rawAssets;
     }
 
@@ -3698,6 +3698,16 @@ export class PaymentsModule {
     }
 
     return providers;
+  }
+
+  /**
+   * Check if the price provider is disabled via the disabled providers set.
+   */
+  private isPriceDisabled(): boolean {
+    const disabled = this.deps?.disabledProviderIds;
+    if (!disabled || disabled.size === 0) return false;
+    const priceId = (this.priceProvider as Record<string, unknown> | null)?.id as string | undefined ?? 'price';
+    return disabled.has(priceId);
   }
 
   /**

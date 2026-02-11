@@ -121,6 +121,7 @@ export interface L1PaymentsModuleDependencies {
  */
 export class L1PaymentsModule {
   private _initialized = false;
+  private _disabled = false;
   private _config: L1PaymentsModuleConfig;
   private _identity?: FullIdentity;
   private _addresses: string[] = [];
@@ -180,6 +181,9 @@ export class L1PaymentsModule {
    * (e.g. by the address scanner), this is a no-op.
    */
   private async ensureConnected(): Promise<void> {
+    if (this._disabled) {
+      throw new Error('L1 provider is disabled');
+    }
     if (!isWebSocketConnected() && this._config.electrumUrl) {
       await l1Connect(this._config.electrumUrl);
     }
@@ -193,6 +197,27 @@ export class L1PaymentsModule {
     this._identity = undefined;
     this._addresses = [];
     this._wallet = undefined;
+  }
+
+  /**
+   * Disable this module — disconnect WebSocket and block operations until re-enabled.
+   */
+  disable(): void {
+    this._disabled = true;
+    if (isWebSocketConnected()) {
+      l1Disconnect();
+    }
+  }
+
+  /**
+   * Re-enable this module. Connection will be established lazily on next operation.
+   */
+  enable(): void {
+    this._disabled = false;
+  }
+
+  get disabled(): boolean {
+    return this._disabled;
   }
 
   /**
