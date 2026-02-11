@@ -206,7 +206,7 @@ export class L1PaymentsModule {
    * Resolve recipient to L1 address
    * Supports: L1 address (alpha1...), nametag (with or without @)
    */
-  private async resolveL1Address(recipient: string): Promise<string> {
+  async resolveL1Address(recipient: string): Promise<string> {
     // Explicit nametag with @
     if (recipient.startsWith('@')) {
       const nametag = recipient.slice(1);
