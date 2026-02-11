@@ -61,6 +61,10 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   private readonly debug: boolean;
   private readonly ipnsLifetimeMs: number;
 
+  /** In-memory buffer for individual token save/delete calls, flushed on save() */
+  private tokenBuffer: Map<string, unknown> = new Map();
+  private deletedTokenIds: Set<string> = new Set();
+
   constructor(
     config?: IpfsStorageConfig,
     statePersistence?: IpfsStatePersistence,
@@ -199,7 +203,18 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         metaUpdate.lastCid = this.remoteCid;
       }
       // Bootstrap (remoteCid is null): do NOT include lastCid field at all
-      const updatedData = { ...data, _meta: metaUpdate };
+      const updatedData = { ...data, _meta: metaUpdate } as unknown as Record<string, unknown>;
+
+      // Inject buffered tokens into TXF data
+      for (const [tokenId, tokenData] of this.tokenBuffer) {
+        if (!this.deletedTokenIds.has(tokenId)) {
+          updatedData[tokenId] = tokenData;
+        }
+      }
+      // Remove deleted tokens from the payload
+      for (const tokenId of this.deletedTokenIds) {
+        delete updatedData[tokenId];
+      }
 
       // Upload to IPFS
       const { cid } = await this.httpClient.upload(updatedData);
@@ -247,7 +262,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         sequence: newSeq,
         gateway: 'local',
       });
-      this.cache.setContent(cid, updatedData);
+      this.cache.setContent(cid, updatedData as unknown as TxfStorageDataBase);
       this.cache.markIpnsFresh(this.ipnsName);
 
       // Persist state
@@ -256,6 +271,9 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         lastCid: cid,
         version: this.dataVersion,
       });
+
+      // Clear deleted set — deletions have been persisted
+      this.deletedTokenIds.clear();
 
       this.emitEvent({
         type: 'storage:saved',
@@ -350,6 +368,9 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       if (typeof remoteVersion === 'number' && remoteVersion > this.dataVersion) {
         this.dataVersion = remoteVersion;
       }
+
+      // Populate token buffer from loaded data
+      this.populateTokenBuffer(data as TxfStorageDataBase);
 
       this.emitEvent({
         type: 'storage:loaded',
@@ -504,6 +525,8 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     const result = await this.save(emptyData);
     if (result.success) {
       this.cache.clear();
+      this.tokenBuffer.clear();
+      this.deletedTokenIds.clear();
       await this.statePersistence.clear(this.ipnsName);
     }
     return result.success;
@@ -514,6 +537,27 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     return () => {
       this.eventCallbacks.delete(callback);
     };
+  }
+
+  async saveToken(tokenId: string, tokenData: unknown): Promise<void> {
+    this.tokenBuffer.set(tokenId, tokenData);
+    this.deletedTokenIds.delete(tokenId);
+  }
+
+  async getToken(tokenId: string): Promise<unknown | null> {
+    if (this.deletedTokenIds.has(tokenId)) return null;
+    return this.tokenBuffer.get(tokenId) ?? null;
+  }
+
+  async listTokenIds(): Promise<string[]> {
+    return Array.from(this.tokenBuffer.keys()).filter(
+      (id) => !this.deletedTokenIds.has(id),
+    );
+  }
+
+  async deleteToken(tokenId: string): Promise<void> {
+    this.tokenBuffer.delete(tokenId);
+    this.deletedTokenIds.add(tokenId);
   }
 
   // ---------------------------------------------------------------------------
@@ -557,6 +601,18 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   private log(message: string): void {
     if (this.debug) {
       console.log(`[IPFS-Storage] ${message}`);
+    }
+  }
+
+  private readonly META_KEYS = new Set(['_meta', '_tombstones', '_outbox', '_sent', '_invalid']);
+
+  private populateTokenBuffer(data: TxfStorageDataBase): void {
+    this.tokenBuffer.clear();
+    this.deletedTokenIds.clear();
+    for (const key of Object.keys(data)) {
+      if (!this.META_KEYS.has(key)) {
+        this.tokenBuffer.set(key, (data as unknown as Record<string, unknown>)[key]);
+      }
     }
   }
 }
