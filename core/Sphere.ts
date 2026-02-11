@@ -678,6 +678,11 @@ export class Sphere {
     const storage = 'get' in storageOrOptions ? storageOrOptions as StorageProvider : storageOrOptions.storage;
     const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
 
+    // Ensure storage is connected (may have been disconnected by a previous destroy() cycle)
+    if (!storage.isConnected()) {
+      await storage.connect();
+    }
+
     // Clear global wallet data
     console.log('[Sphere.clear] Removing storage keys...');
     await storage.remove(STORAGE_KEYS_GLOBAL.MNEMONIC);
