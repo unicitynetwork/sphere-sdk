@@ -102,7 +102,12 @@ import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/Signi
 import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
 import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
-import { normalizeNametag, isValidNametag } from '@unicitylabs/nostr-js-sdk';
+import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
+
+function isValidNametag(nametag: string): boolean {
+  if (isPhoneNumber(nametag)) return true;
+  return /^[a-z0-9_-]{3,20}$/.test(nametag);
+}
 
 import type {
   LegacyFileType,
