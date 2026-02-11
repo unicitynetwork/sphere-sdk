@@ -3,7 +3,7 @@
  *
  * Verifies that:
  * - Uppercase input is normalized to lowercase before registration
- * - Phone numbers are accepted
+ * - @unicity suffix is stripped
  * - Invalid nametags are rejected with proper error messages
  * - switchToAddress normalizes nametags too
  */
