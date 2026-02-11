@@ -264,26 +264,25 @@ async function requestFaucet(
 // Mnemonic Extraction
 // =============================================================================
 
-function getMnemonic(profile: string): string {
-  const { stdout } = cli('status', profile);
-  const match = stdout.match(/Mnemonic:\s+(.+)/);
-  if (match) return match[1].trim();
-
-  // Fallback: read from wallet file directly
-  const profilesData = readFileSync(PROFILES_FILE, 'utf8');
-  const profiles = JSON.parse(profilesData) as {
-    profiles: Array<{ name: string; dataDir: string }>;
-  };
-  const prof = profiles.profiles.find((p) => p.name === profile);
-  if (!prof) throw new Error(`Profile "${profile}" not found`);
-
-  const walletFile = `${prof.dataDir}/wallet.json`;
-  if (!existsSync(walletFile)) throw new Error(`Wallet file not found: ${walletFile}`);
-
-  const wallet = JSON.parse(readFileSync(walletFile, 'utf8'));
-  if (wallet.mnemonic) return wallet.mnemonic;
-
-  throw new Error('Could not extract mnemonic from wallet');
+/**
+ * Extract mnemonic from `init` command output.
+ * The init command prints the mnemonic between two ─ separator lines:
+ *   ─────...
+ *   word1 word2 word3 ... word24
+ *   ─────...
+ */
+function extractMnemonicFromInitOutput(initStdout: string): string | null {
+  const lines = initStdout.split('\n');
+  for (let i = 0; i < lines.length - 2; i++) {
+    if (lines[i].includes('─') && lines[i + 2].includes('─')) {
+      const candidate = lines[i + 1].trim();
+      // Mnemonic is 12 or 24 space-separated words
+      if (candidate.split(/\s+/).length >= 12) {
+        return candidate;
+      }
+    }
+  }
+  return null;
 }
 
 // =============================================================================
@@ -356,8 +355,10 @@ async function main(): Promise<void> {
         const { stdout: initOut } = cli(`init --nametag ${nametag}`, deviceAProfile);
         console.log(`  Init: ${initOut.split('\n').find((l) => l.includes('initialized') || l.includes('Wallet')) || 'OK'}`);
 
-        // Save mnemonic
-        savedMnemonic = getMnemonic(deviceAProfile);
+        // Extract mnemonic from init output (shown between ─ separator lines)
+        const extracted = extractMnemonicFromInitOutput(initOut);
+        assert(extracted !== null, 'Could not extract mnemonic from init output');
+        savedMnemonic = extracted!;
         assert(savedMnemonic.split(' ').length >= 12, `Expected 12+ word mnemonic, got: ${savedMnemonic.split(' ').length} words`);
         console.log(`  Mnemonic saved (${savedMnemonic.split(' ').length} words)`);
 
