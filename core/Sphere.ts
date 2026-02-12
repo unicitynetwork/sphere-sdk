@@ -2549,6 +2549,44 @@ export class Sphere {
     }
 
     try {
+      // Check if a binding already exists via transport.resolve(directAddress).
+      // If yes — skip publish. Only registerNametag() should modify bindings.
+      // Uses _transport.resolve directly because this runs before _initialized = true.
+      if (this._identity?.directAddress && this._transport.resolve) {
+        try {
+          const existing = await this._transport.resolve(this._identity.directAddress);
+          if (existing) {
+            // If existing binding has nametag but local state doesn't — recover it
+            if (existing.nametag && !this._identity.nametag) {
+              (this._identity as MutableFullIdentity).nametag = existing.nametag;
+              await this._updateCachedProxyAddress();
+
+              const entry = await this.ensureAddressTracked(this._currentAddressIndex);
+              let nametags = this._addressNametags.get(entry.addressId);
+              if (!nametags) {
+                nametags = new Map();
+                this._addressNametags.set(entry.addressId, nametags);
+              }
+              if (!nametags.has(0)) {
+                nametags.set(0, existing.nametag);
+                await this.persistAddressNametags();
+              }
+
+              this.emitEvent('nametag:recovered', { nametag: existing.nametag });
+            }
+            console.log('[Sphere] Existing binding found, skipping re-publish');
+            return;
+          }
+        } catch (e) {
+          // resolve failed — do NOT fall through to publish, as it could
+          // overwrite an existing binding (with nametag) with one without.
+          // Next reload will retry.
+          console.warn('[Sphere] resolve() failed, skipping publish to avoid overwrite', e);
+          return;
+        }
+      }
+
+      // No existing binding — publish for the first time
       const nametag = this._identity?.nametag;
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
