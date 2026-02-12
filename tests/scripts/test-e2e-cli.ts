@@ -7,7 +7,7 @@
  * Mirrors the test matrix from test-e2e-transfers.ts.
  *
  * Usage:
- *   npx tsx test-e2e-cli.ts [--cleanup]
+ *   npx tsx tests/scripts/test-e2e-cli.ts [--cleanup]
  */
 
 import { execSync } from 'node:child_process';
@@ -20,7 +20,7 @@ import * as path from 'node:path';
 // =============================================================================
 
 const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
-const CLI_CMD = 'npx tsx cli.ts';
+const CLI_CMD = 'npx tsx cli/index.ts';
 const CONFIG_FILE = '.sphere-cli/config.json';
 const PROFILES_FILE = '.sphere-cli/profiles.json';
 const TRANSFER_TIMEOUT_MS = 120_000;

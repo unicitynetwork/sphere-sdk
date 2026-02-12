@@ -18,7 +18,7 @@
  *   - Erase ALL profile data between devices (not just switch profiles)
  *
  * Usage:
- *   npx tsx test-e2e-cli-ipfs-sync.ts [--cleanup]
+ *   npx tsx tests/scripts/test-e2e-cli-ipfs-sync.ts [--cleanup]
  */
 
 import { execSync } from 'node:child_process';
@@ -39,9 +39,9 @@ import { fileURLToPath } from 'node:url';
 // =============================================================================
 
 const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
-// Absolute path to cli.ts so it works from any cwd
+// Absolute path to cli/index.ts so it works from any cwd
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
-const CLI_TS_PATH = resolve(SCRIPT_DIR, 'cli.ts');
+const CLI_TS_PATH = resolve(SCRIPT_DIR, '../../cli/index.ts');
 const CLI_CMD = `npx tsx ${CLI_TS_PATH}`;
 
 // Isolated working directory — all .sphere-cli* paths are relative to this

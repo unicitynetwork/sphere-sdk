@@ -7,13 +7,13 @@
  * balance conservation, tombstones, and spent token handling.
  *
  * Usage:
- *   npx tsx test-e2e-transfers.ts [--cleanup]
+ *   npx tsx tests/scripts/test-e2e-transfers.ts [--cleanup]
  */
 
-import { Sphere } from './core/Sphere';
-import { createNodeProviders } from './impl/nodejs';
-import { TokenRegistry } from './registry/TokenRegistry';
-import { TransferMode } from './types';
+import { Sphere } from '../../core/Sphere';
+import { createNodeProviders } from '../../impl/nodejs';
+import { TokenRegistry } from '../../registry/TokenRegistry';
+import { TransferMode } from '../../types';
 import { randomBytes } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 

@@ -11,12 +11,12 @@
  * timings without modifying SDK source code.
  *
  * Usage:
- *   npx tsx test-perf-transfers.ts [--cleanup] [--runs N]
+ *   npx tsx tests/scripts/test-perf-transfers.ts [--cleanup] [--runs N]
  */
 
-import { Sphere } from './core/Sphere';
-import { createNodeProviders } from './impl/nodejs';
-import { TokenRegistry } from './registry/TokenRegistry';
+import { Sphere } from '../../core/Sphere';
+import { createNodeProviders } from '../../impl/nodejs';
+import { TokenRegistry } from '../../registry/TokenRegistry';
 import { randomBytes } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 

@@ -1,28 +1,28 @@
 #!/usr/bin/env npx tsx
 /**
  * Sphere SDK CLI
- * Usage: npx tsx cli.ts <command> [args...]
+ * Usage: npx tsx cli/index.ts <command> [args...]
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
-import { encrypt, decrypt, generateRandomKey } from './core/encryption';
-import { parseWalletText, isTextWalletEncrypted, parseAndDecryptWalletText } from './serialization/wallet-text';
-import { parseWalletDat, isSQLiteDatabase, isWalletDatEncrypted } from './serialization/wallet-dat';
-import { isValidPrivateKey, base58Encode, base58Decode } from './core/utils';
-import { hexToWIF, generatePrivateKey } from './l1/crypto';
-import { toSmallestUnit, toHumanReadable, formatAmount } from './core/currency';
-import { getPublicKey } from './core/crypto';
-import { generateAddressFromMasterKey } from './l1/address';
-import { Sphere } from './core/Sphere';
-import { createNodeProviders } from './impl/nodejs';
-import { TokenRegistry } from './registry/TokenRegistry';
-import { TokenValidator } from './validation/token-validator';
-import { tokenToTxf, getCurrentStateHash } from './serialization/txf-serializer';
-import type { NetworkType } from './constants';
-import type { TransportProvider } from './transport/transport-provider';
-import type { ProviderStatus } from './types';
+import { encrypt, decrypt, generateRandomKey } from '../core/encryption';
+import { parseWalletText, isTextWalletEncrypted, parseAndDecryptWalletText } from '../serialization/wallet-text';
+import { parseWalletDat, isSQLiteDatabase, isWalletDatEncrypted } from '../serialization/wallet-dat';
+import { isValidPrivateKey, base58Encode, base58Decode } from '../core/utils';
+import { hexToWIF, generatePrivateKey } from '../l1/crypto';
+import { toSmallestUnit, toHumanReadable, formatAmount } from '../core/currency';
+import { getPublicKey } from '../core/crypto';
+import { generateAddressFromMasterKey } from '../l1/address';
+import { Sphere } from '../core/Sphere';
+import { createNodeProviders } from '../impl/nodejs';
+import { TokenRegistry } from '../registry/TokenRegistry';
+import { TokenValidator } from '../validation/token-validator';
+import { tokenToTxf, getCurrentStateHash } from '../serialization/txf-serializer';
+import type { NetworkType } from '../constants';
+import type { TransportProvider } from '../transport/transport-provider';
+import type { ProviderStatus } from '../types';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -241,7 +241,7 @@ function printUsage() {
 Sphere SDK CLI v0.2.2
 
 Usage: npm run cli -- <command> [args...]
-   or: npx tsx cli.ts <command> [args...]
+   or: npx tsx cli/index.ts <command> [args...]
 
 WALLET MANAGEMENT:
   init [--network <net>]            Create new wallet (mainnet|testnet|dev)

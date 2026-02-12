@@ -71,7 +71,7 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit",
-    "cli": "npx tsx cli.ts"
+    "cli": "npx tsx cli/index.ts"
   },
   "keywords": [
     "unicity",
