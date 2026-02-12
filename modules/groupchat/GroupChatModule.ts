@@ -846,13 +846,6 @@ export class GroupChatModule {
 
       this.groups.set(group.id, group);
 
-      this.saveMemberToMemory({
-        pubkey: creatorPubkey,
-        groupId: group.id,
-        role: GroupRoleEnum.ADMIN,
-        joinedAt: Date.now(),
-      });
-
       this.subscribeToGroup(group.id);
 
       this.client!.createAndPublishEvent({
@@ -861,7 +854,16 @@ export class GroupChatModule {
         content: '',
       }).catch(() => {});
 
-      this.fetchAndSaveMembers(group.id).catch(() => {});
+      // Fetch member/admin lists, then ensure creator is always admin.
+      // The fetch can return incomplete data if the relay hasn't indexed
+      // the admin event yet, so we re-assert after.
+      await this.fetchAndSaveMembers(group.id).catch(() => {});
+      this.saveMemberToMemory({
+        pubkey: creatorPubkey,
+        groupId: group.id,
+        role: GroupRoleEnum.ADMIN,
+        joinedAt: Date.now(),
+      });
 
       this.deps!.emitEvent('groupchat:joined', { groupId: group.id, groupName: group.name });
       this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
