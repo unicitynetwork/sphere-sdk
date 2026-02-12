@@ -48,7 +48,7 @@
 // Core
 // =============================================================================
 
-export { Sphere, createSphere, loadSphere, initSphere, getSphere, sphereExists } from './core';
+export { Sphere, createSphere, loadSphere, initSphere, getSphere, sphereExists, checkNetworkHealth } from './core';
 export type {
   SphereCreateOptions,
   SphereLoadOptions,
@@ -58,6 +58,7 @@ export type {
   ScannedAddressResult,
   ScanAddressesOptions,
   ScanAddressesResult,
+  CheckNetworkHealthOptions,
 } from './core';
 
 // =============================================================================
@@ -194,6 +195,21 @@ export type {
   CommunicationsModuleDependencies,
 } from './modules/communications';
 
+export {
+  GroupChatModule,
+  createGroupChatModule,
+  GroupRole,
+  GroupVisibility,
+} from './modules/groupchat';
+export type {
+  GroupChatModuleConfig,
+  GroupChatModuleDependencies,
+  GroupData,
+  GroupMessageData,
+  GroupMemberData,
+  CreateGroupOptions,
+} from './modules/groupchat';
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -206,6 +222,8 @@ export {
   DEFAULT_NOSTR_RELAYS,
   TEST_NOSTR_RELAYS,
   NOSTR_EVENT_KINDS,
+  NIP29_KINDS,
+  DEFAULT_GROUP_RELAYS,
   // Aggregator
   DEFAULT_AGGREGATOR_URL,
   DEV_AGGREGATOR_URL,
