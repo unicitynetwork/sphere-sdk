@@ -342,6 +342,7 @@ async function main(): Promise<void> {
 
   const deviceAProfile = `ipfs_sync_${testRunId}_devA`;
   const deviceBProfile = `ipfs_sync_${testRunId}_devB`;
+  const deviceCProfile = `ipfs_sync_${testRunId}_devC`;
   const nametag = `sync${testRunId}`;
   const decimals = COIN_DECIMALS['UCT'];
 
@@ -356,6 +357,7 @@ async function main(): Promise<void> {
   console.log(`  Work dir:      ${WORK_DIR}`);
   console.log(`  Device A:      profile=${deviceAProfile}, nametag=@${nametag}`);
   console.log(`  Device B:      profile=${deviceBProfile} (recovery from mnemonic)`);
+  console.log(`  Device C:      profile=${deviceCProfile} (IPFS-only recovery, no Nostr)`);
   console.log(`  Cleanup:       ${doCleanup ? 'yes' : 'no (use --cleanup to remove dirs after)'}`);
   console.log('');
 
@@ -544,6 +546,86 @@ async function main(): Promise<void> {
         );
 
         console.log('  Both devices converged to identical balance');
+      },
+    );
+
+    // =========================================================================
+    // Test 4: IPFS-ONLY recovery — prove tokens come from IPFS, not Nostr
+    //
+    // This is the strongest proof: --no-nostr disables Nostr transport entirely,
+    // so tokens can ONLY be recovered via IPFS sync.
+    // =========================================================================
+    await runTest(
+      '4. IPFS-only recovery (--no-nostr): tokens recovered exclusively from IPFS',
+      async () => {
+        assert(savedMnemonic.length > 0, 'No saved mnemonic from Test 1');
+        assert(deviceATokenCount > 0, 'No token count from Test 1');
+
+        // Create Device C profile (simulates fresh device with NO Nostr)
+        console.log(`  Creating IPFS-only profile: ${deviceCProfile}`);
+        cli(`wallet create ${deviceCProfile}`);
+
+        // Import from mnemonic WITH --no-nostr (Nostr transport disabled)
+        console.log(`  Importing wallet with --no-nostr (Nostr disabled)...`);
+        cli(`init --mnemonic "${savedMnemonic}" --no-nostr`, deviceCProfile);
+
+        // Check balance BEFORE sync — must be 0 (no Nostr to deliver tokens)
+        // NOTE: no --finalize (requires Nostr transport for fetchPendingEvents)
+        const { stdout: preSyncOut } = cli('balance --no-sync --no-nostr', deviceCProfile);
+        const preSyncBal = parseBalanceOutput(preSyncOut, 'UCT');
+        const preSyncTotal = preSyncBal ? totalBalance(preSyncBal, decimals) : 0n;
+        console.log(`  Pre-sync balance (no Nostr): ${preSyncBal?.confirmed ?? '0'} UCT (${preSyncBal?.tokens ?? 0} tokens)`);
+        assert(preSyncTotal === 0n, `Expected 0 UCT before IPFS sync (no Nostr), got ${preSyncTotal}`);
+
+        // Sync from IPFS — this is the ONLY way tokens can arrive
+        console.log('  Syncing from IPFS (IPFS-only, no Nostr)...');
+        let totalSyncAdded = 0;
+        let finalBal: ParsedBalance | null = null;
+        let finalTotal = 0n;
+        const startPoll = performance.now();
+
+        while (performance.now() - startPoll < SYNC_PROPAGATION_TIMEOUT_MS) {
+          const result = cliSoft('sync --no-nostr', deviceCProfile);
+          if (result.exitCode === 0) {
+            const syncCounts = parseSyncOutput(result.stdout);
+            totalSyncAdded += syncCounts.added;
+            // Show full sync output for debugging
+            const syncLines = result.stdout.trim().split('\n').filter((l) => l.trim());
+            for (const line of syncLines) console.log(`    [sync] ${line.trim()}`);
+          } else {
+            console.log(`    [sync] exit=${result.exitCode}: ${result.stderr.trim().split('\n')[0]}`);
+          }
+
+          // Check balance (still with --no-nostr, no --finalize)
+          const balResult = cliSoft('balance --no-sync --no-nostr', deviceCProfile);
+          if (balResult.exitCode === 0) {
+            finalBal = parseBalanceOutput(balResult.stdout, 'UCT');
+            if (finalBal) {
+              finalTotal = totalBalance(finalBal, decimals);
+              if (finalTotal > 0n) break;
+            }
+          }
+
+          console.log('  No tokens yet (IPFS-only), retrying in 5s...');
+          sleepSync(POLL_INTERVAL_MS);
+        }
+
+        console.log(`  IPFS-only recovery: ${finalBal?.confirmed ?? '0'} UCT (${finalBal?.tokens ?? 0} tokens), syncAdded=${totalSyncAdded}`);
+
+        // CRITICAL: tokens MUST come from IPFS (syncAdded > 0 proves it)
+        assert(finalTotal > 0n, 'IPFS-only recovery failed: 0 UCT after sync timeout');
+        assert(totalSyncAdded > 0, `syncAdded must be > 0 to prove IPFS delivered tokens, got ${totalSyncAdded}`);
+        assert(
+          finalTotal === deviceATotal,
+          `Balance mismatch: Device A had ${deviceATotal}, Device C (IPFS-only) recovered ${finalTotal}`,
+        );
+        assert(
+          finalBal!.tokens === deviceATokenCount,
+          `Token count mismatch: Device A had ${deviceATokenCount}, Device C recovered ${finalBal!.tokens}`,
+        );
+
+        console.log(`  Device C recovered EXCLUSIVELY from IPFS: ${finalBal!.confirmed} UCT (${finalBal!.tokens} tokens)`);
+        console.log(`  syncAdded=${totalSyncAdded} proves tokens came from IPFS, not Nostr`);
       },
     );
 

@@ -21,6 +21,8 @@ import { TokenRegistry } from './registry/TokenRegistry';
 import { TokenValidator } from './validation/token-validator';
 import { tokenToTxf, getCurrentStateHash } from './serialization/txf-serializer';
 import type { NetworkType } from './constants';
+import type { TransportProvider } from './transport/transport-provider';
+import type { ProviderStatus } from './types';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -138,6 +140,30 @@ function switchToProfile(name: string): boolean {
 // =============================================================================
 
 let sphereInstance: Sphere | null = null;
+let noNostrGlobal = false;
+
+/**
+ * Create a no-op transport that does nothing.
+ * Used with --no-nostr to prove IPFS-only recovery.
+ */
+function createNoopTransport(): TransportProvider {
+  return {
+    id: 'noop-transport',
+    name: 'No-Op Transport',
+    type: 'p2p' as const,
+    description: 'No-op transport (Nostr disabled)',
+    setIdentity: () => {},
+    connect: async () => {},
+    disconnect: async () => {},
+    isConnected: () => false,
+    getStatus: () => 'disconnected' as ProviderStatus,
+    sendMessage: async () => '',
+    onMessage: () => () => {},
+    sendTokenTransfer: async () => '',
+    onTokenTransfer: () => () => {},
+    fetchPendingEvents: async () => {},
+  };
+}
 
 async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; nametag?: string }): Promise<Sphere> {
   if (sphereInstance) return sphereInstance;
@@ -147,16 +173,27 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     network: config.network,
     dataDir: config.dataDir,
     tokensDir: config.tokensDir,
+    tokenSync: { ipfs: { enabled: true } },
   });
 
+  const initProviders = noNostrGlobal
+    ? { ...providers, transport: createNoopTransport() }
+    : providers;
+
   const result = await Sphere.init({
-    ...providers,
+    ...initProviders,
     autoGenerate: options?.autoGenerate,
     mnemonic: options?.mnemonic,
     nametag: options?.nametag,
   });
 
   sphereInstance = result.sphere;
+
+  // Attach IPFS storage provider for sync if available
+  if (providers.ipfsTokenStorage) {
+    await sphereInstance.addTokenStorageProvider(providers.ipfsTokenStorage);
+  }
+
   return sphereInstance;
 }
 
@@ -308,6 +345,9 @@ Wallet Profile Examples:
 }
 
 async function main() {
+  // Global flag: --no-nostr disables Nostr transport (uses no-op)
+  noNostrGlobal = args.includes('--no-nostr');
+
   if (!command || command === 'help' || command === '--help' || command === '-h') {
     printUsage();
     process.exit(0);
@@ -342,6 +382,7 @@ async function main() {
         saveConfig(config);
 
         console.log(`Initializing wallet on ${network}...`);
+        if (noNostrGlobal) console.log('  (Nostr transport disabled)');
 
         const sphere = await getSphere({
           autoGenerate: !mnemonic,

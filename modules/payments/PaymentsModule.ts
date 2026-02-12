@@ -3681,6 +3681,11 @@ export class PaymentsModule {
         }
       }
 
+      // Persist merged state to primary storage so it survives process restarts
+      if (totalAdded > 0 || totalRemoved > 0) {
+        await this.save();
+      }
+
       this.deps!.emitEvent('sync:completed', {
         source: 'payments',
         count: this.tokens.size,
@@ -4543,13 +4548,14 @@ export class PaymentsModule {
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
-    // Active tokens are NOT stored in TXF format - they are saved as individual
-    // token-xxx files via saveTokenToFileStorage() to avoid duplication.
-    // TXF storage is only used for metadata: archived, tombstones, forked, outbox.
-    // Note: nametag is also saved separately via saveNametagToFileStorage()
+    // Include active tokens in TXF data so IPFS sync can propagate them
+    // to other devices. File-based storage also saves tokens individually
+    // via saveTokenToFileStorage(), but the TXF format is needed for
+    // cross-device sync (IPFS merge operates on TXF data).
+    // Note: nametag is saved separately via saveNametagToFileStorage()
     // as nametag-{name}.json to avoid duplication in storage
     return await buildTxfStorageData(
-      [], // Empty - active tokens stored as token-xxx files
+      Array.from(this.tokens.values()),
       {
         version: 1,
         address: this.deps!.identity.l1Address,
