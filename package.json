@@ -103,7 +103,7 @@
     "@libp2p/crypto": "^5.1.13",
     "@libp2p/peer-id": "^6.0.4",
     "helia": "^6.0.11",
-    "ipns": "^9.1.0",
+    "ipns": "^10.0.0",
     "multiformats": "^13.4.2"
   },
   "devDependencies": {
@@ -133,7 +133,7 @@
     "@libp2p/crypto": ">=5.0.0",
     "@libp2p/peer-id": ">=6.0.0",
     "helia": ">=6.0.0",
-    "ipns": ">=9.0.0",
+    "ipns": ">=10.0.0",
     "multiformats": ">=13.0.0"
   },
   "peerDependenciesMeta": {
