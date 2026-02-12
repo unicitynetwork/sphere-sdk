@@ -5,7 +5,7 @@
  * Requires Docker to be available on the host machine.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { GenericContainer, type StartedTestContainer, Wait } from 'testcontainers';
+import { GenericContainer, Network, type StartedTestContainer, type StartedNetwork, Wait } from 'testcontainers';
 import { NostrKeyManager } from '@unicitylabs/nostr-js-sdk';
 
 import { GroupChatModule } from '../../modules/groupchat/GroupChatModule';
@@ -20,8 +20,8 @@ import type { FullIdentity, SphereEventType, SphereEventMap, TrackedAddressEntry
 
 const RELAY_IMAGE = 'ghcr.io/unicitynetwork/unicity-relay:sha-cb0f95e';
 const RELAY_PORT = 3334;
-// Fixed host port so RELAY_HOST matches the Host header sent by WebSocket clients
-const HOST_PORT = 19735;
+const PROXY_PORT = 80;
+const RELAY_ALIAS = 'relay'; // Docker network alias for the relay container
 
 const RELAY_SECRET = '0000000000000000000000000000000000000000000000000000000000000099';
 const USER_A_PRIVATE_KEY = '0000000000000000000000000000000000000000000000000000000000000001';
@@ -160,7 +160,9 @@ function createTestModule(privateKeyHex: string, relayUrl: string): TestModule {
 // =============================================================================
 
 describe('GroupChatModule Relay Integration', () => {
-  let container: StartedTestContainer;
+  let network: StartedNetwork;
+  let relayContainer: StartedTestContainer;
+  let proxyContainer: StartedTestContainer;
   let relayUrl: string;
 
   let userA: TestModule;
@@ -175,12 +177,48 @@ describe('GroupChatModule Relay Integration', () => {
     const userAPubkey = getXOnlyPubkey(USER_A_PRIVATE_KEY);
     const relayPubkey = getXOnlyPubkey(RELAY_SECRET);
 
-    // Zooid routes by Host header, so RELAY_HOST must match "localhost:<port>"
-    container = await new GenericContainer(RELAY_IMAGE)
+    // Docker network lets the proxy reach the relay by hostname.
+    network = await new Network().start();
+
+    // 1. Start the proxy first to learn the random host port.
+    //    Uses nginx resolver + variable proxy_pass so the upstream hostname
+    //    ("relay") is resolved lazily at request time via Docker DNS (127.0.0.11),
+    //    not at startup — avoiding the "host not found" crash.
+    const nginxConf = [
+      'server {',
+      `  listen ${PROXY_PORT};`,
+      '  resolver 127.0.0.11 valid=1s;',
+      '  location / {',
+      `    set $backend http://${RELAY_ALIAS}:${RELAY_PORT};`,
+      '    proxy_pass $backend;',
+      '    proxy_http_version 1.1;',
+      '    proxy_set_header Upgrade $http_upgrade;',
+      '    proxy_set_header Connection "upgrade";',
+      '    proxy_set_header Host $http_host;',
+      '  }',
+      '}',
+    ].join('\n');
+
+    proxyContainer = await new GenericContainer('nginx:alpine')
+      .withNetwork(network)
+      .withCopyContentToContainer([{
+        content: nginxConf,
+        target: '/etc/nginx/conf.d/default.conf',
+      }])
+      .withExposedPorts(PROXY_PORT)
+      .start();
+
+    const mappedPort = proxyContainer.getMappedPort(PROXY_PORT);
+
+    // 2. Start the relay with RELAY_HOST matching the public URL that clients
+    //    connect to (localhost:<mappedPort>). This ensures the Host header and
+    //    the NIP-42 AUTH relay URL tag both match what the relay expects.
+    relayContainer = await new GenericContainer(RELAY_IMAGE)
       .withPlatform('linux/amd64')
-      .withExposedPorts({ container: RELAY_PORT, host: HOST_PORT })
+      .withNetwork(network)
+      .withNetworkAliases(RELAY_ALIAS)
       .withEnvironment({
-        RELAY_HOST: `localhost:${HOST_PORT}`,
+        RELAY_HOST: `localhost:${mappedPort}`,
         RELAY_SECRET: RELAY_SECRET,
         RELAY_PUBKEY: relayPubkey,
         ADMIN_PUBKEYS: `"${userAPubkey}"`,
@@ -193,7 +231,7 @@ describe('GroupChatModule Relay Integration', () => {
       .withStartupTimeout(60000)
       .start();
 
-    relayUrl = `ws://localhost:${HOST_PORT}`;
+    relayUrl = `ws://localhost:${mappedPort}`;
     await waitForWebSocket(relayUrl, 30000);
 
     // Create modules and connect
@@ -202,8 +240,9 @@ describe('GroupChatModule Relay Integration', () => {
     await connectWithRetry(userA.module);
     await connectWithRetry(userB.module);
 
-    // Allow NIP-42 AUTH handshake to complete before publishing events
-    await sleep(500);
+    // Allow NIP-42 AUTH handshake to complete before publishing events.
+    // The proxy adds latency so we need a generous delay.
+    await sleep(1500);
 
     // Create groups via SDK API
     const publicGroup = await userA.module.createGroup({
@@ -233,7 +272,9 @@ describe('GroupChatModule Relay Integration', () => {
   afterAll(async () => {
     userA?.module.destroy();
     userB?.module.destroy();
-    await container?.stop();
+    await proxyContainer?.stop();
+    await relayContainer?.stop();
+    await network?.stop();
   });
 
   // ===========================================================================
