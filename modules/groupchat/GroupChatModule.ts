@@ -793,9 +793,6 @@ export class GroupChatModule {
     const creatorPubkey = this.getMyPublicKey();
     if (!creatorPubkey) return null;
 
-    const isAdmin = await this.isCurrentUserRelayAdmin();
-    if (!isAdmin) return null;
-
     const proposedGroupId = options.name
       .toLowerCase()
       .replace(/[^a-z0-9]/g, '')
@@ -892,11 +889,12 @@ export class GroupChatModule {
     await this.ensureConnected();
     if (!this.client) return false;
 
-    const isAdmin = await this.isCurrentUserRelayAdmin();
-    if (!isAdmin) return false;
-
     const group = this.groups.get(groupId);
     if (!group) return false;
+
+    // Relay admins can delete public groups; group admins can delete their own groups
+    const canDelete = await this.canModerateGroup(groupId);
+    if (!canDelete) return false;
 
     try {
       const eventId = await this.client.createAndPublishEvent({
@@ -1116,7 +1114,8 @@ export class GroupChatModule {
     await this.ensureConnected();
     if (!this.client) return false;
 
-    if (!this.isCurrentUserAdmin(groupId)) return false;
+    const canModerate = await this.canModerateGroup(groupId);
+    if (!canModerate) return false;
 
     const myPubkey = this.getMyPublicKey();
     if (myPubkey === userPubkey) return false;
@@ -1145,7 +1144,8 @@ export class GroupChatModule {
     await this.ensureConnected();
     if (!this.client) return false;
 
-    if (!this.isCurrentUserModerator(groupId)) return false;
+    const canModerate = await this.canModerateGroup(groupId);
+    if (!canModerate) return false;
 
     try {
       const eventId = await this.client.createAndPublishEvent({
@@ -1181,6 +1181,22 @@ export class GroupChatModule {
 
     const member = this.getMember(groupId, myPubkey);
     return member?.role === GroupRoleEnum.ADMIN || member?.role === GroupRoleEnum.MODERATOR;
+  }
+
+  /**
+   * Check if current user can moderate a group:
+   * - Group admin/moderator can always moderate their group
+   * - Relay admins can moderate public groups
+   */
+  async canModerateGroup(groupId: string): Promise<boolean> {
+    if (this.isCurrentUserAdmin(groupId) || this.isCurrentUserModerator(groupId)) {
+      return true;
+    }
+    const group = this.groups.get(groupId);
+    if (group && group.visibility === GroupVisibilityEnum.PUBLIC) {
+      return this.isCurrentUserRelayAdmin();
+    }
+    return false;
   }
 
   async isCurrentUserRelayAdmin(): Promise<boolean> {
