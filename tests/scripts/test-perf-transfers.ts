@@ -520,6 +520,13 @@ async function main(): Promise<void> {
       amount: '1', coinSymbol: 'UCT', mode: 'direct', type: 'whole',
     }));
 
+    // Brief pause between whole-token tests to let Nostr relay settle.
+    // Test 5's proof polling runs in background and can interfere with
+    // Nostr message delivery for Test 6.
+    await new Promise(r => setTimeout(r, 3_000));
+    await alice.payments.receive();
+    await bob.payments.load();
+
     // Test 6: Whole + PROXY (bob -> alice, 1 UCT)
     console.log('--- TEST 6: Whole + PROXY ---');
     measurements.push(await measureTransfer({
