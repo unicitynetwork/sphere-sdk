@@ -416,7 +416,7 @@ describe('parseTxfStorageData()', () => {
 
     expect(parsed.meta?.version).toBe(2);
     // Backwards compatibility: old storage with _nametag should still be parsed
-    expect(parsed.nametag?.name).toBe('bob');
+    expect(parsed.nametags[0]?.name).toBe('bob');
   });
 
   it('should extract tombstones', async () => {
