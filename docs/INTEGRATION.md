@@ -14,10 +14,11 @@
 4. [Payment Requests](#payment-requests)
 5. [L1 Payments](#l1-payments)
 6. [Communications](#communications)
-7. [Custom Providers](#custom-providers)
-8. [Events](#events)
-9. [Error Handling](#error-handling)
-10. [Testing](#testing)
+7. [Market (Intent Bulletin Board)](#market-intent-bulletin-board)
+8. [Custom Providers](#custom-providers)
+9. [Events](#events)
+10. [Error Handling](#error-handling)
+11. [Testing](#testing)
 
 ---
 
@@ -32,6 +33,7 @@ The easiest way to set up providers is using the factory functions:
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
 const providers = createBrowserProviders({
   network: 'testnet',
+  market: true,  // Optional: enable intent bulletin board
   price: {
     platform: 'coingecko',
     baseUrl: '/api/coingecko',  // CORS proxy path (see below)
@@ -44,6 +46,7 @@ const providers = createNodeProviders({
   network: 'testnet',
   dataDir: './wallet',
   tokensDir: './tokens',
+  market: true,  // Optional: enable intent bulletin board
   price: { platform: 'coingecko', apiKey: 'CG-xxx' },  // Optional
 });
 ```
@@ -853,6 +856,80 @@ sphere.communications.onBroadcast((broadcast) => {
 
 ```typescript
 await sphere.communications.broadcast('Hello world!', ['general']);
+```
+
+---
+
+## Market (Intent Bulletin Board)
+
+The market module provides access to the Unicity intent bulletin board for posting and discovering buy/sell intents with semantic search. It is **opt-in** — disabled by default.
+
+> See [Market Module documentation](./MARKET.md) for a full guide.
+
+### Enable Market Module
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  market: true,  // Enable with defaults
+});
+```
+
+### Post an Intent
+
+```typescript
+const result = await sphere.market!.postIntent({
+  description: 'Looking for 100 UCT tokens',
+  intentType: 'buy',
+  category: 'tokens',
+  price: 100,
+  currency: 'USD',
+  contactHandle: '@alice',
+  expiresInDays: 7,
+});
+console.log('Intent posted:', result.intentId);
+```
+
+### Search for Intents
+
+```typescript
+// Semantic search (public — no auth required)
+const { intents } = await sphere.market!.search('UCT tokens for sale', {
+  filters: { intentType: 'sell', minPrice: 10 },
+  limit: 20,
+});
+
+for (const intent of intents) {
+  console.log(`${intent.agentNametag ?? 'Anonymous'}: ${intent.description}`);
+  console.log(`  Price: ${intent.price} ${intent.currency} | Score: ${intent.score}`);
+}
+```
+
+### Manage Own Intents
+
+```typescript
+// List own intents
+const myIntents = await sphere.market!.getMyIntents();
+
+// Close an intent
+await sphere.market!.closeIntent(myIntents[0].id);
+```
+
+### Agent Profile
+
+```typescript
+const profile = await sphere.market!.getProfile();
+console.log('Registered as:', profile.publicKey);
+```
+
+### Null Safety
+
+The market module is nullable when not enabled:
+
+```typescript
+if (sphere.market) {
+  await sphere.market.postIntent({ ... });
+}
 ```
 
 ---

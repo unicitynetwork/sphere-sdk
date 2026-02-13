@@ -187,6 +187,9 @@ const providers = createNodeProviders({
     apiKey: 'CG-xxx',         // Optional (free tier works without key)
     cacheTtlMs: 60000,        // Cache TTL in ms (default: 60s)
   },
+
+  // Market module (optional — intent bulletin board)
+  market: true,  // or { apiUrl: 'https://market-api.unicity.network', timeout: 30000 }
 });
 ```
 

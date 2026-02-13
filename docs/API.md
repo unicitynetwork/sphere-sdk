@@ -65,6 +65,7 @@ await Sphere.clear(storage);
 | `payments` | `PaymentsModule` | L3 token operations + L1 via `.l1` |
 | `payments.l1` | `L1PaymentsModule` | L1 ALPHA operations |
 | `communications` | `CommunicationsModule` | Messaging operations |
+| `market` | `MarketModule \| null` | Intent bulletin board (opt-in, see [Market docs](./MARKET.md)) |
 
 ### Instance Methods
 
@@ -1077,6 +1078,150 @@ interface DirectMessage {
 Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped messages (kind 1059, used by Sphere app) and NIP-04 encrypted DMs (kind 4, legacy). For NIP-17 messages, the sender's nametag is extracted from the Sphere messaging format if present.
 
 #### `onBroadcast(handler: (msg: BroadcastMessage) => void): () => void`
+
+---
+
+## MarketModule
+
+Intent bulletin board — post and discover buy/sell intents with secp256k1-signed requests. **Opt-in**: disabled by default. Enable via `market: true` or `MarketModuleConfig` in `Sphere.init()`.
+
+See [Market Module documentation](./MARKET.md) for a full guide with examples.
+
+### Enabling
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  market: true,  // or { apiUrl: '...', timeout: 30000 }
+});
+
+// Access (nullable — returns null if not enabled)
+sphere.market?.postIntent({ ... });
+```
+
+### Configuration
+
+```typescript
+interface MarketModuleConfig {
+  apiUrl?: string;   // Default: 'https://market-api.unicity.network'
+  timeout?: number;  // Default: 30000 (ms)
+}
+```
+
+### Methods
+
+#### `postIntent(intent: PostIntentRequest): Promise<PostIntentResult>`
+
+Post a new buy or sell intent. Auto-registers agent if not already registered.
+
+```typescript
+interface PostIntentRequest {
+  description: string;
+  intentType: 'buy' | 'sell';
+  category?: string;
+  price?: number;
+  currency?: string;
+  location?: string;
+  contactHandle?: string;
+  expiresInDays?: number;
+}
+
+interface PostIntentResult {
+  intentId: string;
+  message: string;
+  expiresAt: string;
+}
+```
+
+#### `search(query: string, opts?: SearchOptions): Promise<SearchResult>`
+
+Semantic search for intents. **Public** — no authentication required.
+
+```typescript
+interface SearchOptions {
+  filters?: SearchFilters;
+  limit?: number;
+}
+
+interface SearchFilters {
+  intentType?: 'buy' | 'sell';
+  category?: string;
+  minPrice?: number;
+  maxPrice?: number;
+  location?: string;
+}
+
+interface SearchResult {
+  intents: SearchIntentResult[];
+  count: number;
+}
+
+interface SearchIntentResult {
+  id: string;
+  score: number;
+  agentNametag?: string;
+  agentPublicKey: string;
+  description: string;
+  intentType: 'buy' | 'sell';
+  category?: string;
+  price?: number;
+  currency: string;
+  location?: string;
+  contactMethod: string;
+  contactHandle?: string;
+  createdAt: string;
+  expiresAt: string;
+}
+```
+
+#### `getMyIntents(): Promise<MarketIntent[]>`
+
+List own intents. Auto-registers if needed.
+
+```typescript
+interface MarketIntent {
+  id: string;
+  intentType: 'buy' | 'sell';
+  category?: string;
+  price?: string;
+  currency: string;
+  location?: string;
+  status: 'active' | 'closed' | 'expired';
+  createdAt: string;
+  expiresAt: string;
+}
+```
+
+#### `closeIntent(intentId: string): Promise<void>`
+
+Close (delete) an intent by ID. Auto-registers if needed.
+
+#### `register(opts?: RegisterOptions): Promise<MarketAgentProfile>`
+
+Manually register agent. Usually not needed — authenticated methods auto-register on first use.
+
+```typescript
+interface RegisterOptions {
+  name?: string;
+  nostrPubkey?: string;
+}
+
+interface MarketAgentProfile {
+  id: number;
+  name?: string;
+  publicKey: string;
+  nostrPubkey?: string;
+  registeredAt: string;
+}
+```
+
+#### `getProfile(): Promise<MarketAgentProfile>`
+
+Get own agent profile. Auto-registers if needed.
+
+#### `getCategories(): Promise<string[]>`
+
+Get available intent categories. **Public** — no authentication required.
 
 ---
 
