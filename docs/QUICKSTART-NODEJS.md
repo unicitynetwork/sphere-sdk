@@ -55,6 +55,27 @@ npm run cli -- nametag myname
 # Verify tokens against aggregator (detect spent tokens)
 npm run cli -- verify-balance
 
+# Market: list available categories
+npm run cli -- market-categories
+
+# Market: post a buy intent
+npm run cli -- market-post "Looking for 100 UCT tokens" --type buy --category tokens --price 100 --currency USD
+
+# Market: post a sell intent
+npm run cli -- market-post "Selling UCT at market price" --type sell --price 50 --currency USD --contact @alice
+
+# Market: search intents
+npm run cli -- market-search "UCT tokens for sale" --type sell --limit 5
+
+# Market: list your own intents
+npm run cli -- market-my
+
+# Market: close an intent
+npm run cli -- market-close <intent-id>
+
+# Market: show your agent profile
+npm run cli -- market-profile
+
 # Full help
 npm run cli -- --help
 ```

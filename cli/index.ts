@@ -363,6 +363,15 @@ Wallet Profile Examples:
   npm run cli -- send @bob 0.1 --coin BTC         Send from alice to bob
   npm run cli -- wallet use bob                   Switch to bob
   npm run cli -- balance                          Check bob's balance
+
+Market Examples:
+  npm run cli -- market-categories                                   List categories
+  npm run cli -- market-post "Buying 100 UCT" --type buy             Post buy intent
+  npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD   Post sell intent
+  npm run cli -- market-search "UCT tokens" --type sell --limit 5    Search intents
+  npm run cli -- market-my                                           List own intents
+  npm run cli -- market-close <id>                                   Close an intent
+  npm run cli -- market-profile                                      Show agent profile
 `);
 }
 

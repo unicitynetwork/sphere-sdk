@@ -129,6 +129,184 @@ const providers = createNodeProviders({
 | `apiUrl` | `string` | `https://market-api.unicity.network` | Market API base URL |
 | `timeout` | `number` | `30000` | Request timeout in milliseconds |
 
+## CLI Usage
+
+The market module is available via the built-in CLI. All commands require an initialized wallet.
+
+### Post an Intent
+
+```bash
+# Post a buy intent
+npm run cli -- market-post "Looking for 100 UCT tokens" --type buy --category tokens --price 100 --currency USD --contact @alice
+
+# Post a sell intent with expiration
+npm run cli -- market-post "Selling UCT tokens at market price" --type sell --category tokens --price 50 --currency USD --expires 7
+
+# Minimal (only description and type are required)
+npm run cli -- market-post "Want to trade ETH for UCT" --type buy
+```
+
+Output:
+```
+✓ Intent posted!
+  ID: abc123-def456
+  Expires: 2025-03-01T00:00:00Z
+```
+
+**Flags:**
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--type buy\|sell` | Yes | Intent type |
+| `--category <cat>` | No | Category (from `market-categories`) |
+| `--price <n>` | No | Price amount |
+| `--currency <code>` | No | Currency code (USD, UCT, EUR, etc.) |
+| `--location <loc>` | No | Location filter |
+| `--contact <handle>` | No | Contact handle (e.g., `@alice`) |
+| `--expires <days>` | No | Expiration in days (default: 30) |
+
+### Search for Intents
+
+```bash
+# Basic semantic search
+npm run cli -- market-search "UCT tokens for sale"
+
+# Filter by type and price range
+npm run cli -- market-search "tokens" --type sell --min-price 10 --max-price 500
+
+# Filter by category with limit
+npm run cli -- market-search "trading" --category tokens --limit 5
+
+# Filter by location
+npm run cli -- market-search "services" --location "New York"
+```
+
+Output:
+```
+Found 3 intent(s):
+──────────────────────────────────────────────────
+[0.95] Selling UCT tokens at market price
+  By: @trader
+  Type: sell | Category: tokens | Price: 50 USD
+  Contact: @trader | Expires: 2025-02-20
+──────────────────────────────────────────────────
+[0.82] 500 UCT available for immediate sale
+  By: 02abc1234567...
+  Type: sell | Price: 45 USD
+  Expires: 2025-02-18
+──────────────────────────────────────────────────
+```
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--type buy\|sell` | Filter by intent type |
+| `--category <cat>` | Filter by category |
+| `--min-price <n>` | Minimum price filter |
+| `--max-price <n>` | Maximum price filter |
+| `--location <loc>` | Location filter |
+| `--limit <n>` | Max results (default: 10) |
+
+### List Your Intents
+
+```bash
+npm run cli -- market-my
+```
+
+Output:
+```
+Your intents (2):
+  abc123  buy   active  tokens  expires 2025-02-20
+  def456  sell  active  tokens  expires 2025-02-18
+```
+
+### Close an Intent
+
+```bash
+npm run cli -- market-close abc123
+```
+
+Output:
+```
+✓ Intent abc123 closed.
+```
+
+### List Available Categories
+
+```bash
+npm run cli -- market-categories
+```
+
+Output:
+```
+Available categories: tokens, nfts, services, goods, real-estate
+```
+
+### Show Your Market Profile
+
+```bash
+npm run cli -- market-profile
+```
+
+Output:
+```
+Market Agent Profile:
+  ID: 42
+  Public Key: 02abc123def456...
+  Registered: 2025-01-15T10:30:00Z
+```
+
+### Complete CLI Workflow Example
+
+```bash
+# 1. Create and initialize a wallet
+npm run cli -- wallet create trader
+npm run cli -- init --nametag trader
+
+# 2. Check available categories
+npm run cli -- market-categories
+
+# 3. Post a sell intent
+npm run cli -- market-post "Selling 1000 UCT at $0.05 each" --type sell --category tokens --price 50 --currency USD --contact @trader --expires 14
+
+# 4. Post a buy intent
+npm run cli -- market-post "Looking for BTC tokens, willing to pay market rate" --type buy --category tokens --price 1000 --currency USD
+
+# 5. Search for what others are selling
+npm run cli -- market-search "UCT tokens" --type sell --limit 5
+
+# 6. Search with price filter
+npm run cli -- market-search "tokens for sale" --min-price 10 --max-price 100
+
+# 7. List your own intents
+npm run cli -- market-my
+
+# 8. Close an intent (use the ID from market-my or market-post output)
+npm run cli -- market-close <intent-id>
+
+# 9. Check your agent profile
+npm run cli -- market-profile
+```
+
+### Multi-Wallet Market Example
+
+```bash
+# Alice posts a sell intent
+npm run cli -- wallet use alice
+npm run cli -- market-post "Selling 500 UCT tokens" --type sell --price 25 --currency USD --contact @alice
+
+# Bob searches and finds Alice's intent
+npm run cli -- wallet use bob
+npm run cli -- market-search "buy UCT tokens" --type sell
+# Bob contacts @alice via nametag to arrange the trade
+
+# Alice closes the intent after the trade
+npm run cli -- wallet use alice
+npm run cli -- market-my
+npm run cli -- market-close <intent-id>
+```
+
 ## API Methods
 
 ### `postIntent(intent: PostIntentRequest): Promise<PostIntentResult>`
