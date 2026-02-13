@@ -147,7 +147,7 @@ await sphere.destroy();
 | `sphere.payments.l1.send(request)` | `L1SendResult` | Send L1 transaction |
 | `sphere.payments.l1.getHistory(limit?)` | `L1Transaction[]` | L1 tx history |
 | `sphere.resolve(identifier)` | `PeerInfo \| null` | Resolve @nametag/address/pubkey |
-| `sphere.registerNametag(name)` | `void` | Register nametag (mints on-chain) |
+| `sphere.registerNametag(name)` | `Promise<void>` | Register nametag (mints on-chain) |
 | `sphere.switchToAddress(index)` | `void` | Switch HD address |
 | `sphere.getActiveAddresses()` | `TrackedAddress[]` | Non-hidden tracked addresses |
 | `sphere.on(event, handler)` | `() => void` (unsubscribe) | Subscribe to events |

@@ -915,13 +915,6 @@ const myIntents = await sphere.market!.getMyIntents();
 await sphere.market!.closeIntent(myIntents[0].id);
 ```
 
-### Agent Profile
-
-```typescript
-const profile = await sphere.market!.getProfile();
-console.log('Registered as:', profile.publicKey);
-```
-
 ### Null Safety
 
 The market module is nullable when not enabled:

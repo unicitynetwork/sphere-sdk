@@ -1196,33 +1196,6 @@ interface MarketIntent {
 
 Close (delete) an intent by ID. Auto-registers if needed.
 
-#### `register(opts?: RegisterOptions): Promise<MarketAgentProfile>`
-
-Manually register agent. Usually not needed — authenticated methods auto-register on first use.
-
-```typescript
-interface RegisterOptions {
-  name?: string;
-  nostrPubkey?: string;
-}
-
-interface MarketAgentProfile {
-  id: number;
-  name?: string;
-  publicKey: string;
-  nostrPubkey?: string;
-  registeredAt: string;
-}
-```
-
-#### `getProfile(): Promise<MarketAgentProfile>`
-
-Get own agent profile. Auto-registers if needed.
-
-#### `getCategories(): Promise<string[]>`
-
-Get available intent categories. **Public** — no authentication required.
-
 ---
 
 ## Types
