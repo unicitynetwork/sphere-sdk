@@ -193,7 +193,7 @@ Browser SDK uses two storage mechanisms automatically:
 
 | Data | Storage | Persistence |
 |------|---------|-------------|
-| Wallet (keys, nametag) | `localStorage` | Per-domain, survives refresh |
+| Wallet (mnemonic, nametag) | `localStorage` | Per-domain, survives refresh |
 | Tokens | `IndexedDB` | Per-domain, larger capacity |
 
 **SSR Note:** If `localStorage` is unavailable (SSR), an in-memory fallback is used.
@@ -234,6 +234,9 @@ const providers = createBrowserProviders({
     cacheTtlMs: 60000,        // Cache TTL in ms (default: 60s)
   },
 
+  // Market module (optional — intent bulletin board)
+  market: true,  // or { apiUrl: 'https://market-api.unicity.network', timeout: 30000 }
+
   // Token sync (optional IPFS)
   tokenSync: {
     ipfs: {
@@ -270,7 +273,7 @@ for (const asset of assets) {
 }
 
 // Total portfolio value in USD (null if PriceProvider not configured)
-const totalUsd = await sphere.payments.getBalance();
+const totalUsd = await sphere.payments.getFiatBalance();
 document.getElementById('balance').textContent =
   totalUsd != null ? `$${totalUsd.toFixed(2)}` : 'N/A';
 
@@ -329,18 +332,18 @@ const { sphere } = await Sphere.init({
 
 ```typescript
 // Incoming transfers
-sphere.on('transfer:incoming', (event) => {
-  showNotification(`Received ${event.data.amount} from ${event.data.sender}`);
+sphere.on('transfer:incoming', (transfer) => {
+  showNotification(`Received ${transfer.tokens.length} token(s) from ${transfer.senderNametag ?? transfer.senderPubkey}`);
 });
 
 // Direct messages
 sphere.communications.onDirectMessage((msg) => {
-  showNotification(`Message from ${msg.sender}: ${msg.content}`);
+  showNotification(`Message from ${msg.senderNametag ?? msg.senderPubkey}: ${msg.content}`);
 });
 
 // Connection status
-sphere.on('connection:changed', (event) => {
-  updateConnectionStatus(event.data.connected);
+sphere.on('connection:changed', ({ connected }) => {
+  updateConnectionStatus(connected);
 });
 ```
 
@@ -353,15 +356,28 @@ await sphere.communications.sendDM('@alice', 'Hello from the browser!');
 ## Import Existing Wallet
 
 ```typescript
-// From mnemonic (recovery)
+// From mnemonic (recovery, plaintext storage — default)
 const { sphere } = await Sphere.init({
   ...providers,
   mnemonic: 'word1 word2 word3 ... word12',
 });
 
+// From mnemonic with password encryption
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'word1 word2 word3 ... word12',
+  password: 'my-secret-password',
+});
+
+// Load existing wallet with password
+const { sphere } = await Sphere.init({
+  ...providers,
+  password: 'my-secret-password',
+});
+
 // Nametag will be auto-recovered from Nostr if it was registered
-sphere.on('nametag:recovered', (event) => {
-  console.log('Recovered nametag:', event.data.nametag);
+sphere.on('nametag:recovered', ({ nametag }) => {
+  console.log('Recovered nametag:', nametag);
 });
 ```
 
@@ -397,12 +413,12 @@ function WalletApp() {
       setStatus('Connected');
 
       // Load balance (total USD value, null if no PriceProvider)
-      const bal = await sphere.payments.getBalance();
+      const bal = await sphere.payments.getFiatBalance();
       setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
 
       // Listen for incoming
       sphere.on('transfer:incoming', async () => {
-        const newBal = await sphere.payments.getBalance();
+        const newBal = await sphere.payments.getFiatBalance();
         setBalance(newBal != null ? `$${newBal.toFixed(2)}` : 'N/A');
       });
     };
@@ -428,7 +444,7 @@ function WalletApp() {
       setAmount('');
 
       // Refresh balance
-      const bal = await sphere.payments.getBalance();
+      const bal = await sphere.payments.getFiatBalance();
       setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
     } catch (err: any) {
       setStatus('Error: ' + err.message);

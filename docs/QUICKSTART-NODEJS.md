@@ -55,6 +55,21 @@ npm run cli -- nametag myname
 # Verify tokens against aggregator (detect spent tokens)
 npm run cli -- verify-balance
 
+# Market: post a buy intent
+npm run cli -- market-post "Looking for 100 UCT tokens" --type buy --category tokens --price 100 --currency USD
+
+# Market: post a sell intent
+npm run cli -- market-post "Selling UCT at market price" --type sell --price 50 --currency USD --contact @alice
+
+# Market: search intents
+npm run cli -- market-search "UCT tokens for sale" --type sell --limit 5
+
+# Market: list your own intents
+npm run cli -- market-my
+
+# Market: close an intent
+npm run cli -- market-close <intent-id>
+
 # Full help
 npm run cli -- --help
 ```
@@ -92,7 +107,7 @@ Node.js implementation uses **file-based storage**:
 
 | Data | Location | Format |
 |------|----------|--------|
-| Wallet (keys, nametag) | `dataDir/wallet.json` | Encrypted JSON |
+| Wallet (keys, nametag) | `dataDir/wallet.json` (or custom file name) | JSON (plaintext or password-encrypted mnemonic) |
 | Tokens | `tokensDir/_<tokenId>.json` | One JSON file per token |
 
 > **Note:** IPFS sync is available for both browser and Node.js. See [IPFS Token Sync](#ipfs-token-sync-optional) below.
@@ -137,7 +152,7 @@ main().catch(console.error);
 
 ```
 ./wallet-data/
-  └── wallet.json      # Encrypted wallet data (mnemonic, keys, nametag)
+  └── wallet.json      # Wallet data (mnemonic stored plaintext or password-encrypted)
 
 ./tokens-data/
   ├── _meta.json       # Token storage metadata
@@ -154,6 +169,10 @@ const providers = createNodeProviders({
   // Storage directories (required)
   dataDir: './wallet-data',
   tokensDir: './tokens-data',
+
+  // Custom wallet file name (default: 'wallet.json')
+  // Use .txt extension for plain mnemonic files (no JSON wrapper)
+  walletFileName: 'my-wallet.json',
 
   // Transport options
   transport: {
@@ -183,6 +202,9 @@ const providers = createNodeProviders({
     apiKey: 'CG-xxx',         // Optional (free tier works without key)
     cacheTtlMs: 60000,        // Cache TTL in ms (default: 60s)
   },
+
+  // Market module (optional — intent bulletin board)
+  market: true,  // or { apiUrl: 'https://market-api.unicity.network', timeout: 30000 }
 });
 ```
 
@@ -226,7 +248,7 @@ for (const asset of assets) {
 }
 
 // Total portfolio value in USD (null if PriceProvider not configured)
-const totalUsd = await sphere.payments.getBalance();
+const totalUsd = await sphere.payments.getFiatBalance();
 console.log('Total USD:', totalUsd); // number | null
 
 // L1 (ALPHA) balance
@@ -288,9 +310,9 @@ console.log('Registered:', sphere.identity?.nametag);
 ### Listen for Incoming Transfers
 
 ```typescript
-sphere.on('transfer:incoming', (event) => {
-  console.log('Received:', event.data.amount, event.data.coinId);
-  console.log('From:', event.data.sender);
+sphere.on('transfer:incoming', (transfer) => {
+  console.log('Received:', transfer.tokens.length, 'token(s)');
+  console.log('From:', transfer.senderNametag ?? transfer.senderPubkey);
 });
 ```
 
@@ -300,17 +322,24 @@ sphere.on('transfer:incoming', (event) => {
 await sphere.communications.sendDM('@alice', 'Hello!');
 
 sphere.communications.onDirectMessage((msg) => {
-  console.log('Message from', msg.sender, ':', msg.content);
+  console.log('Message from', msg.senderNametag ?? msg.senderPubkey, ':', msg.content);
 });
 ```
 
 ## Import Existing Wallet
 
 ```typescript
-// From mnemonic
+// From mnemonic (plaintext storage — default)
 const { sphere } = await Sphere.init({
   ...providers,
   mnemonic: 'your twelve word mnemonic phrase here ...',
+});
+
+// From mnemonic with password encryption
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'your twelve word mnemonic phrase here ...',
+  password: 'my-secret-password',
 });
 
 // From master key (legacy)
@@ -320,6 +349,71 @@ const sphere = await Sphere.import({
   basePath: "m/84'/1'/0'",
   derivationMode: 'bip32',
   ...providers,
+});
+```
+
+## Password Encryption
+
+By default, the mnemonic is stored as **plaintext** in `wallet.json`. You can optionally encrypt it with a password:
+
+```typescript
+// Create wallet with password encryption
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  password: 'my-secret-password',
+});
+
+// Load wallet with password
+const { sphere } = await Sphere.init({
+  ...providers,
+  password: 'my-secret-password',
+});
+
+// Load wallet without password (plaintext mnemonic — default)
+const { sphere } = await Sphere.init({ ...providers });
+```
+
+**Backwards compatibility:** Wallets created with older SDK versions (encrypted with the internal default key) will load correctly without a password.
+
+### Custom Wallet File Names
+
+```typescript
+// Use a custom file name
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens-data',
+  walletFileName: 'my-wallet.json',
+});
+
+// Use .txt extension — stores only the mnemonic (no JSON wrapper)
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens-data',
+  walletFileName: 'mnemonic.txt',
+});
+```
+
+### Loading External Wallet Files
+
+If you have a plaintext mnemonic file from another source, simply point `FileStorageProvider` at it:
+
+```typescript
+import { FileStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+// Load from any .txt file containing a mnemonic
+const storage = new FileStorageProvider({
+  dataDir: './wallet-data',
+  fileName: 'external-mnemonic.txt',
+});
+
+const { sphere } = await Sphere.init({
+  storage,
+  tokenStorage: providers.tokenStorage,
+  transport: providers.transport,
+  oracle: providers.oracle,
 });
 ```
 
@@ -346,8 +440,8 @@ console.log(addr.address, addr.publicKey);
 ```typescript
 // All available events
 sphere.on('transfer:incoming', handler);
-sphere.on('transfer:sent', handler);
-sphere.on('transfer:pending', handler);
+sphere.on('transfer:confirmed', handler);
+sphere.on('transfer:failed', handler);
 sphere.on('payment_request:incoming', handler);
 sphere.on('payment_request:paid', handler);
 sphere.on('message:dm', handler);
@@ -433,10 +527,10 @@ async function main() {
   console.log('Nametag:', sphere.identity?.nametag || '(not registered)');
 
   // Listen for incoming transfers
-  sphere.on('transfer:incoming', (event) => {
+  sphere.on('transfer:incoming', (transfer) => {
     console.log('\nIncoming transfer!');
-    console.log('Amount:', event.data.amount);
-    console.log('From:', event.data.sender);
+    console.log('Tokens:', transfer.tokens.length);
+    console.log('From:', transfer.senderNametag ?? transfer.senderPubkey);
   });
 
   // Keep running

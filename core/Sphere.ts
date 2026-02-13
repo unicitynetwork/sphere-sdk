@@ -62,12 +62,15 @@ import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
 import type { GroupChatModuleConfig } from '../modules/groupchat';
+import { MarketModule, createMarketModule } from '../modules/market';
+import type { MarketModuleConfig } from '../modules/market';
 import {
   STORAGE_KEYS_GLOBAL,
   STORAGE_KEYS_ADDRESS,
   getAddressId,
   DEFAULT_BASE_PATH,
   DEFAULT_ENCRYPTION_KEY,
+  DEFAULT_MARKET_API_URL,
   NETWORKS,
   type NetworkType,
 } from '../constants';
@@ -152,6 +155,10 @@ export interface SphereCreateOptions {
   network?: NetworkType;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
+  password?: string;
+  /** Market module configuration. true = enable with defaults, object = custom config. */
+  market?: MarketModuleConfig | boolean;
 }
 
 /** Options for loading existing wallet */
@@ -176,6 +183,10 @@ export interface SphereLoadOptions {
   network?: NetworkType;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Optional password to decrypt the wallet. Must match the password used during creation. */
+  password?: string;
+  /** Market module configuration. true = enable with defaults, object = custom config. */
+  market?: MarketModuleConfig | boolean;
 }
 
 /** Options for importing a wallet */
@@ -208,6 +219,10 @@ export interface SphereImportOptions {
   price?: PriceProvider;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
+  password?: string;
+  /** Market module configuration. true = enable with defaults, object = custom config. */
+  market?: MarketModuleConfig | boolean;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -255,6 +270,10 @@ export interface SphereInitOptions {
    * - Omit/undefined: No groupchat module
    */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Optional password to encrypt/decrypt the wallet. If omitted, mnemonic is stored as plaintext. */
+  password?: string;
+  /** Market module configuration. true = enable with defaults, object = custom config. */
+  market?: MarketModuleConfig | boolean;
 }
 
 /** Result of init operation */
@@ -317,6 +336,7 @@ export class Sphere {
   private _identity: MutableFullIdentity | null = null;
   private _masterKey: MasterKey | null = null;
   private _mnemonic: string | null = null;
+  private _password: string | null = null;
   private _source: WalletSource = 'unknown';
   private _derivationMode: DerivationMode = 'bip32';
   private _basePath: string = DEFAULT_BASE_PATH;
@@ -341,6 +361,7 @@ export class Sphere {
   private _payments: PaymentsModule;
   private _communications: CommunicationsModule;
   private _groupChat: GroupChatModule | null = null;
+  private _market: MarketModule | null = null;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -362,6 +383,7 @@ export class Sphere {
     l1Config?: L1Config,
     priceProvider?: PriceProvider,
     groupChatConfig?: GroupChatModuleConfig,
+    marketConfig?: MarketModuleConfig,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -376,6 +398,7 @@ export class Sphere {
     this._payments = createPaymentsModule({ l1: l1Config });
     this._communications = createCommunicationsModule();
     this._groupChat = groupChatConfig ? createGroupChatModule(groupChatConfig) : null;
+    this._market = marketConfig ? createMarketModule(marketConfig) : null;
   }
 
   // ===========================================================================
@@ -434,6 +457,7 @@ export class Sphere {
   static async init(options: SphereInitOptions): Promise<SphereInitResult> {
     // Resolve groupChat config: true → use network-default relays
     const groupChat = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
+    const market = Sphere.resolveMarketConfig(options.market);
 
     const walletExists = await Sphere.exists(options.storage);
 
@@ -447,6 +471,8 @@ export class Sphere {
         l1: options.l1,
         price: options.price,
         groupChat,
+        password: options.password,
+        market,
       });
       return { sphere, created: false };
     }
@@ -479,6 +505,8 @@ export class Sphere {
       l1: options.l1,
       price: options.price,
       groupChat,
+      password: options.password,
+      market,
     });
 
     return { sphere, created: true, generatedMnemonic };
@@ -513,6 +541,25 @@ export class Sphere {
   }
 
   /**
+   * Resolve market module config from Sphere.init() options.
+   * - `true` → enable with default API URL
+   * - `MarketModuleConfig` → pass through with defaults
+   * - `undefined` → no market module
+   */
+  private static resolveMarketConfig(
+    config: MarketModuleConfig | boolean | undefined,
+  ): MarketModuleConfig | undefined {
+    if (!config) return undefined;
+    if (config === true) {
+      return { apiUrl: DEFAULT_MARKET_API_URL };
+    }
+    return {
+      apiUrl: config.apiUrl ?? DEFAULT_MARKET_API_URL,
+      timeout: config.timeout,
+    };
+  }
+
+  /**
    * Create new wallet with mnemonic
    */
   static async create(options: SphereCreateOptions): Promise<Sphere> {
@@ -527,6 +574,7 @@ export class Sphere {
     }
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
+    const marketConfig = Sphere.resolveMarketConfig(options.market);
 
     const sphere = new Sphere(
       options.storage,
@@ -536,9 +584,11 @@ export class Sphere {
       options.l1,
       options.price,
       groupChatConfig,
+      marketConfig,
     );
+    sphere._password = options.password ?? null;
 
-    // Store encrypted mnemonic
+    // Store mnemonic (encrypted if password provided, plaintext otherwise)
     await sphere.storeMnemonic(options.mnemonic, options.derivationPath);
 
     // Initialize identity from mnemonic
@@ -586,6 +636,7 @@ export class Sphere {
     }
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
+    const marketConfig = Sphere.resolveMarketConfig(options.market);
 
     const sphere = new Sphere(
       options.storage,
@@ -595,7 +646,9 @@ export class Sphere {
       options.l1,
       options.price,
       groupChatConfig,
+      marketConfig,
     );
+    sphere._password = options.password ?? null;
 
     // Load identity from storage
     await sphere.loadIdentityFromStorage();
@@ -661,6 +714,7 @@ export class Sphere {
     }
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat);
+    const marketConfig = Sphere.resolveMarketConfig(options.market);
 
     const sphere = new Sphere(
       options.storage,
@@ -670,7 +724,9 @@ export class Sphere {
       options.l1,
       options.price,
       groupChatConfig,
+      marketConfig,
     );
+    sphere._password = options.password ?? null;
 
     if (options.mnemonic) {
       // Validate and store mnemonic
@@ -871,6 +927,11 @@ export class Sphere {
   /** Group chat module (NIP-29). Null if not configured. */
   get groupChat(): GroupChatModule | null {
     return this._groupChat;
+  }
+
+  /** Market module (intent bulletin board). Null if not configured. */
+  get market(): MarketModule | null {
+    return this._market;
   }
 
   // ===========================================================================
@@ -1920,8 +1981,10 @@ export class Sphere {
     // Re-initialize modules with new identity
     await this.reinitializeModulesForNewAddress();
 
-    // Publish identity binding (with nametag if present — single atomic publish)
-    if (this._identity.nametag) {
+    // Sync identity with transport — also recovers nametag from existing Nostr bindings
+    // via transport.resolve(directAddress). Skipped when registering a new nametag
+    // (that flow handles publishing separately below).
+    if (!newNametag) {
       await this.syncIdentityWithTransport();
     }
 
@@ -2003,9 +2066,15 @@ export class Sphere {
       emitEvent,
     });
 
+    this._market?.initialize({
+      identity: this._identity!,
+      emitEvent,
+    });
+
     await this._payments.load();
     await this._communications.load();
     await this._groupChat?.load();
+    await this._market?.load();
   }
 
   /**
@@ -2984,6 +3053,7 @@ export class Sphere {
     this._payments.destroy();
     this._communications.destroy();
     this._groupChat?.destroy();
+    this._market?.destroy();
 
     await this._transport.disconnect();
     await this._storage.disconnect();
@@ -3342,7 +3412,7 @@ export class Sphere {
     for (const [providerId, provider] of this._tokenStorageProviders) {
       if (typeof provider.onEvent === 'function') {
         const unsub = provider.onEvent((event) => {
-          if (event.type === 'storage:error') {
+          if (event.type === 'storage:error' || event.type === 'sync:error') {
             this.emitConnectionChanged(providerId, provider.isConnected(), provider.getStatus(), event.error);
           }
         });
@@ -3411,9 +3481,15 @@ export class Sphere {
       emitEvent,
     });
 
+    this._market?.initialize({
+      identity: this._identity!,
+      emitEvent,
+    });
+
     await this._payments.load();
     await this._communications.load();
     await this._groupChat?.load();
+    await this._market?.load();
   }
 
   // ===========================================================================
@@ -3444,12 +3520,24 @@ export class Sphere {
   // ===========================================================================
 
   private encrypt(data: string): string {
-    // Use AES-256 encryption with default key
-    // TODO: Add password parameter to create/load for user-provided encryption
-    return encryptSimple(data, DEFAULT_ENCRYPTION_KEY);
+    if (!this._password) return data; // No password — store as plaintext
+    return encryptSimple(data, this._password);
   }
 
   private decrypt(encrypted: string): string | null {
+    // Password provided — decrypt with it
+    if (this._password) {
+      try {
+        return decryptSimple(encrypted, this._password);
+      } catch {
+        return null;
+      }
+    }
+    // No password — check if it's already plaintext (valid BIP39 mnemonic or hex key)
+    if (validateBip39Mnemonic(encrypted) || /^[0-9a-f]{64}$/i.test(encrypted)) {
+      return encrypted;
+    }
+    // Backwards compat: try old hardcoded default key
     try {
       return decryptSimple(encrypted, DEFAULT_ENCRYPTION_KEY);
     } catch {
