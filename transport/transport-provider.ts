@@ -3,7 +3,7 @@
  * Platform-independent P2P messaging abstraction
  */
 
-import type { BaseProvider, FullIdentity } from '../types';
+import type { BaseProvider, ComposingIndicator, FullIdentity } from '../types';
 
 // =============================================================================
 // Transport Provider Interface
@@ -31,6 +31,12 @@ export interface TransportProvider extends BaseProvider {
    * @returns Unsubscribe function
    */
   onMessage(handler: MessageHandler): () => void;
+
+  /**
+   * Subscribe to incoming composing indicators
+   * @returns Unsubscribe function
+   */
+  onComposing?(handler: ComposingHandler): () => void;
 
   /**
    * Send token transfer payload
@@ -279,6 +285,12 @@ export interface IncomingMessage {
 }
 
 export type MessageHandler = (message: IncomingMessage) => void;
+
+// =============================================================================
+// Composing Indicator Types
+// =============================================================================
+
+export type ComposingHandler = (indicator: ComposingIndicator) => void;
 
 // =============================================================================
 // Token Transfer Types

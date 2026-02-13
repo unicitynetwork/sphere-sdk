@@ -29,6 +29,7 @@ import type { ProviderStatus, FullIdentity } from '../types';
 import type {
   TransportProvider,
   MessageHandler,
+  ComposingHandler,
   TokenTransferHandler,
   BroadcastHandler,
   PaymentRequestHandler,
@@ -222,7 +223,7 @@ export class NostrTransportProvider implements TransportProvider {
   // Event handlers
   private processedEventIds = new Set<string>();
   private messageHandlers: Set<MessageHandler> = new Set();
-  private composingHandlers: Set<(indicator: { senderPubkey: string; senderNametag?: string; expiresIn: number }) => void> = new Set();
+  private composingHandlers: Set<ComposingHandler> = new Set();
   private pendingMessages: IncomingMessage[] = [];  // buffer for messages arriving before handlers register
   private transferHandlers: Set<TokenTransferHandler> = new Set();
   private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
@@ -541,16 +542,16 @@ export class NostrTransportProvider implements TransportProvider {
     // Structured messages (those with a "type" field) are sent as-is — they
     // already include senderNametag and should not be double-wrapped.
     const senderNametag = this.identity?.nametag;
-    let wrappedContent: string;
+    let isStructured = false;
     try {
       const parsed = JSON.parse(content);
-      if (typeof parsed === 'object' && parsed.type) {
-        // Structured message (e.g. composing indicator) — send as-is
-        wrappedContent = content;
-      } else {
-        throw new Error('not structured');
-      }
-    } catch {
+      isStructured = typeof parsed === 'object' && parsed !== null && !!parsed.type;
+    } catch {}
+
+    let wrappedContent: string;
+    if (isStructured) {
+      wrappedContent = content;
+    } else {
       wrappedContent = senderNametag
         ? JSON.stringify({ senderNametag, text: content })
         : content;
@@ -590,7 +591,7 @@ export class NostrTransportProvider implements TransportProvider {
     return () => this.messageHandlers.delete(handler);
   }
 
-  onComposing(handler: (indicator: { senderPubkey: string; senderNametag?: string; expiresIn: number }) => void): () => void {
+  onComposing(handler: ComposingHandler): () => void {
     this.composingHandlers.add(handler);
     return () => this.composingHandlers.delete(handler);
   }

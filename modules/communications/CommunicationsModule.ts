@@ -84,11 +84,9 @@ export class CommunicationsModule {
     });
 
     // Subscribe to composing indicators
-    if ('onComposing' in deps.transport) {
-      this.unsubscribeComposing = (deps.transport as any).onComposing((indicator: { senderPubkey: string; senderNametag?: string; expiresIn: number }) => {
-        this.handleComposingIndicator(indicator);
-      });
-    }
+    this.unsubscribeComposing = deps.transport.onComposing?.((indicator) => {
+      this.handleComposingIndicator(indicator);
+    }) ?? null;
   }
 
   /**
@@ -372,7 +370,7 @@ export class CommunicationsModule {
     this.pruneIfNeeded();
   }
 
-  private handleComposingIndicator(indicator: { senderPubkey: string; senderNametag?: string; expiresIn: number }): void {
+  private handleComposingIndicator(indicator: ComposingIndicator): void {
     const composing: ComposingIndicator = {
       senderPubkey: indicator.senderPubkey,
       senderNametag: indicator.senderNametag,
