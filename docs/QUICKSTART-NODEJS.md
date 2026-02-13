@@ -55,6 +55,21 @@ npm run cli -- nametag myname
 # Verify tokens against aggregator (detect spent tokens)
 npm run cli -- verify-balance
 
+# Market: post a buy intent
+npm run cli -- market-post "Looking for 100 UCT tokens" --type buy --category tokens --price 100 --currency USD
+
+# Market: post a sell intent
+npm run cli -- market-post "Selling UCT at market price" --type sell --price 50 --currency USD --contact @alice
+
+# Market: search intents
+npm run cli -- market-search "UCT tokens for sale" --type sell --limit 5
+
+# Market: list your own intents
+npm run cli -- market-my
+
+# Market: close an intent
+npm run cli -- market-close <intent-id>
+
 # Full help
 npm run cli -- --help
 ```
@@ -187,6 +202,9 @@ const providers = createNodeProviders({
     apiKey: 'CG-xxx',         // Optional (free tier works without key)
     cacheTtlMs: 60000,        // Cache TTL in ms (default: 60s)
   },
+
+  // Market module (optional — intent bulletin board)
+  market: true,  // or { apiUrl: 'https://market-api.unicity.network', timeout: 30000 }
 });
 ```
 
@@ -230,7 +248,7 @@ for (const asset of assets) {
 }
 
 // Total portfolio value in USD (null if PriceProvider not configured)
-const totalUsd = await sphere.payments.getBalance();
+const totalUsd = await sphere.payments.getFiatBalance();
 console.log('Total USD:', totalUsd); // number | null
 
 // L1 (ALPHA) balance
@@ -292,9 +310,9 @@ console.log('Registered:', sphere.identity?.nametag);
 ### Listen for Incoming Transfers
 
 ```typescript
-sphere.on('transfer:incoming', (event) => {
-  console.log('Received:', event.data.amount, event.data.coinId);
-  console.log('From:', event.data.sender);
+sphere.on('transfer:incoming', (transfer) => {
+  console.log('Received:', transfer.tokens.length, 'token(s)');
+  console.log('From:', transfer.senderNametag ?? transfer.senderPubkey);
 });
 ```
 
@@ -304,7 +322,7 @@ sphere.on('transfer:incoming', (event) => {
 await sphere.communications.sendDM('@alice', 'Hello!');
 
 sphere.communications.onDirectMessage((msg) => {
-  console.log('Message from', msg.sender, ':', msg.content);
+  console.log('Message from', msg.senderNametag ?? msg.senderPubkey, ':', msg.content);
 });
 ```
 
@@ -422,8 +440,8 @@ console.log(addr.address, addr.publicKey);
 ```typescript
 // All available events
 sphere.on('transfer:incoming', handler);
-sphere.on('transfer:sent', handler);
-sphere.on('transfer:pending', handler);
+sphere.on('transfer:confirmed', handler);
+sphere.on('transfer:failed', handler);
 sphere.on('payment_request:incoming', handler);
 sphere.on('payment_request:paid', handler);
 sphere.on('message:dm', handler);
@@ -509,10 +527,10 @@ async function main() {
   console.log('Nametag:', sphere.identity?.nametag || '(not registered)');
 
   // Listen for incoming transfers
-  sphere.on('transfer:incoming', (event) => {
+  sphere.on('transfer:incoming', (transfer) => {
     console.log('\nIncoming transfer!');
-    console.log('Amount:', event.data.amount);
-    console.log('From:', event.data.sender);
+    console.log('Tokens:', transfer.tokens.length);
+    console.log('From:', transfer.senderNametag ?? transfer.senderPubkey);
   });
 
   // Keep running

@@ -65,6 +65,7 @@ await Sphere.clear(storage);
 | `payments` | `PaymentsModule` | L3 token operations + L1 via `.l1` |
 | `payments.l1` | `L1PaymentsModule` | L1 ALPHA operations |
 | `communications` | `CommunicationsModule` | Messaging operations |
+| `market` | `MarketModule \| null` | Intent bulletin board (opt-in, see [Market docs](./MARKET.md)) |
 
 ### Instance Methods
 
@@ -476,24 +477,30 @@ type V5FinalizationStage = 'RECEIVED' | 'MINT_SUBMITTED' | 'MINT_PROVEN' | 'TRAN
 
 ### Methods: Balance & Token Queries
 
-#### `getBalance(coinId?: string): TokenBalance[]`
+#### `getBalance(coinId?: string): Asset[]`
 
 Get token balances grouped by coin type. **Synchronous** (no await needed).
 
 Skips tokens with status `'spent'`, `'invalid'`, or `'transferring'`. Fires a non-blocking `resolveUnconfirmed()` call as a side effect.
 
 ```typescript
-interface TokenBalance {
+interface Asset {
   readonly coinId: string;
   readonly symbol: string;
   readonly name: string;
+  readonly decimals: number;
+  readonly iconUrl?: string;
   readonly totalAmount: string;          // confirmedAmount + unconfirmedAmount
   readonly confirmedAmount: string;      // Tokens with inclusion proofs
   readonly unconfirmedAmount: string;    // Tokens pending proof (status: 'submitted')
   readonly tokenCount: number;           // Total token count
   readonly confirmedTokenCount: number;
   readonly unconfirmedTokenCount: number;
-  readonly decimals: number;
+  readonly priceUsd: number | null;      // Price per whole unit in USD
+  readonly priceEur: number | null;      // Price per whole unit in EUR
+  readonly change24h: number | null;     // 24h price change percentage
+  readonly fiatValueUsd: number | null;  // Total fiat value in USD
+  readonly fiatValueEur: number | null;  // Total fiat value in EUR
 }
 ```
 
@@ -687,24 +694,10 @@ Mint a nametag token on-chain. Required for receiving tokens via PROXY addresses
 ```typescript
 interface MintNametagResult {
   success: boolean;
-  token?: Token;
-  nametagData?: NametagData;
-  readonly id: string;                       // Local transfer UUID
-  status: TransferStatus;                    // Current status
-  readonly tokens: Token[];                  // Tokens involved
-  readonly tokenTransfers: TokenTransferDetail[];  // Per-token transfer details
-  error?: string;                            // Error message if failed
+  token?: Token;              // The minted nametag token
+  nametagData?: NametagData;  // Nametag metadata
+  error?: string;             // Error message if failed
 }
-
-interface TokenTransferDetail {
-  readonly sourceTokenId: string;   // Source token ID consumed
-  readonly method: 'direct' | 'split';  // Transfer method
-  readonly requestIdHex?: string;   // Aggregator commitment request ID (direct)
-  readonly splitGroupId?: string;   // Split group ID (split)
-  readonly nostrEventId?: string;   // Nostr event ID (split)
-}
-
-type TransferStatus = 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';
 ```
 
 #### `isNametagAvailable(nametag: string): Promise<boolean>`
@@ -1080,6 +1073,123 @@ Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped message
 
 ---
 
+## MarketModule
+
+Intent bulletin board — post and discover buy/sell intents with secp256k1-signed requests. **Opt-in**: disabled by default. Enable via `market: true` or `MarketModuleConfig` in `Sphere.init()`.
+
+See [Market Module documentation](./MARKET.md) for a full guide with examples.
+
+### Enabling
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  market: true,  // or { apiUrl: '...', timeout: 30000 }
+});
+
+// Access (nullable — returns null if not enabled)
+sphere.market?.postIntent({ ... });
+```
+
+### Configuration
+
+```typescript
+interface MarketModuleConfig {
+  apiUrl?: string;   // Default: 'https://market-api.unicity.network'
+  timeout?: number;  // Default: 30000 (ms)
+}
+```
+
+### Methods
+
+#### `postIntent(intent: PostIntentRequest): Promise<PostIntentResult>`
+
+Post a new buy or sell intent. Auto-registers agent if not already registered.
+
+```typescript
+interface PostIntentRequest {
+  description: string;
+  intentType: 'buy' | 'sell';
+  category?: string;
+  price?: number;
+  currency?: string;
+  location?: string;
+  contactHandle?: string;
+  expiresInDays?: number;
+}
+
+interface PostIntentResult {
+  intentId: string;
+  message: string;
+  expiresAt: string;
+}
+```
+
+#### `search(query: string, opts?: SearchOptions): Promise<SearchResult>`
+
+Semantic search for intents. **Public** — no authentication required.
+
+```typescript
+interface SearchOptions {
+  filters?: SearchFilters;
+  limit?: number;
+}
+
+interface SearchFilters {
+  intentType?: 'buy' | 'sell';
+  category?: string;
+  minPrice?: number;
+  maxPrice?: number;
+  location?: string;
+}
+
+interface SearchResult {
+  intents: SearchIntentResult[];
+  count: number;
+}
+
+interface SearchIntentResult {
+  id: string;
+  score: number;
+  agentNametag?: string;
+  agentPublicKey: string;
+  description: string;
+  intentType: 'buy' | 'sell';
+  category?: string;
+  price?: number;
+  currency: string;
+  location?: string;
+  contactMethod: string;
+  contactHandle?: string;
+  createdAt: string;
+  expiresAt: string;
+}
+```
+
+#### `getMyIntents(): Promise<MarketIntent[]>`
+
+List own intents. Auto-registers if needed.
+
+```typescript
+interface MarketIntent {
+  id: string;
+  intentType: 'buy' | 'sell';
+  category?: string;
+  price?: string;
+  currency: string;
+  location?: string;
+  status: 'active' | 'closed' | 'expired';
+  createdAt: string;
+  expiresAt: string;
+}
+```
+
+#### `closeIntent(intentId: string): Promise<void>`
+
+Close (delete) an intent by ID. Auto-registers if needed.
+
+---
+
 ## Types
 
 ### FullIdentity
@@ -1179,7 +1289,15 @@ type SphereEventType =
   | 'identity:changed'
   | 'address:activated'
   | 'address:hidden'
-  | 'address:unhidden';
+  | 'address:unhidden'
+  | 'sync:remote-update'
+  | 'groupchat:message'
+  | 'groupchat:joined'
+  | 'groupchat:left'
+  | 'groupchat:kicked'
+  | 'groupchat:group_deleted'
+  | 'groupchat:updated'
+  | 'groupchat:connection';
 ```
 
 ### SphereEventMap
@@ -1200,7 +1318,7 @@ interface SphereEventMap {
   'sync:completed': { source: string; count: number };
   'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
-  'connection:changed': { provider: string; connected: boolean };
+  'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': {
@@ -1213,6 +1331,14 @@ interface SphereEventMap {
   'address:activated': { address: TrackedAddress };
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
+  'sync:remote-update': { providerId: string; name: string; sequence: number; cid: string; added: number; removed: number };
+  'groupchat:message': GroupMessageData;
+  'groupchat:joined': { groupId: string; groupName: string };
+  'groupchat:left': { groupId: string };
+  'groupchat:kicked': { groupId: string; groupName: string };
+  'groupchat:group_deleted': { groupId: string; groupName: string };
+  'groupchat:updated': Record<string, never>;
+  'groupchat:connection': { connected: boolean };
 }
 ```
 
@@ -1297,29 +1423,14 @@ const available = await sphere.isNametagAvailable('alice');
 
 ### MintNametagResult
 
-```typescript
-interface MintNametagResult {
-  success: boolean;
-  token?: Token;           // The minted nametag token
-  nametagData?: NametagData;  // Nametag metadata
-  error?: string;          // Error message if failed
-}
-
-interface NametagData {
-  name: string;            // Nametag without @ prefix
-  token: object;           // Token JSON (genesis + state)
-  timestamp: number;       // Mint timestamp
-  format?: string;         // 'txf'
-  version?: string;        // '2.0'
-}
-```
+See [`MintNametagResult`](#mintnametagnametag-string-promisemintnamtagresult) in the PaymentsModule section above for the full type definition.
 
 ### NametagMinter Class
 
 For advanced usage, create a NametagMinter directly:
 
 ```typescript
-import { NametagMinter, createNametagMinter } from '@unicitylabs/sphere-sdk';
+import { NametagMinter, createNametagMinter } from '@unicitylabs/sphere-sdk/modules/payments';
 
 const minter = createNametagMinter({
   stateTransitionClient: client,
