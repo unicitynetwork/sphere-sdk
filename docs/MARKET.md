@@ -64,10 +64,6 @@ const { sphere } = await Sphere.init({
   market: true,  // Enable market module
 });
 
-// List available categories
-const categories = await sphere.market!.getCategories();
-console.log('Categories:', categories);
-
 // Post a sell intent
 await sphere.market!.postIntent({
   description: 'Selling 500 UCT tokens at market price',
@@ -78,6 +74,12 @@ await sphere.market!.postIntent({
   contactHandle: '@alice',
   expiresInDays: 7,
 });
+
+// List your own intents
+const myIntents = await sphere.market!.getMyIntents();
+for (const intent of myIntents) {
+  console.log(`${intent.id}: ${intent.status} (${intent.intentType})`);
+}
 ```
 
 ## Configuration
@@ -158,7 +160,7 @@ Output:
 | Flag | Required | Description |
 |------|----------|-------------|
 | `--type buy\|sell` | Yes | Intent type |
-| `--category <cat>` | No | Category (from `market-categories`) |
+| `--category <cat>` | No | Category tag |
 | `--price <n>` | No | Price amount |
 | `--currency <code>` | No | Currency code (USD, UCT, EUR, etc.) |
 | `--location <loc>` | No | Location filter |
@@ -232,31 +234,6 @@ Output:
 ✓ Intent abc123 closed.
 ```
 
-### List Available Categories
-
-```bash
-npm run cli -- market-categories
-```
-
-Output:
-```
-Available categories: tokens, nfts, services, goods, real-estate
-```
-
-### Show Your Market Profile
-
-```bash
-npm run cli -- market-profile
-```
-
-Output:
-```
-Market Agent Profile:
-  ID: 42
-  Public Key: 02abc123def456...
-  Registered: 2025-01-15T10:30:00Z
-```
-
 ### Complete CLI Workflow Example
 
 ```bash
@@ -264,29 +241,23 @@ Market Agent Profile:
 npm run cli -- wallet create trader
 npm run cli -- init --nametag trader
 
-# 2. Check available categories
-npm run cli -- market-categories
-
-# 3. Post a sell intent
+# 2. Post a sell intent
 npm run cli -- market-post "Selling 1000 UCT at $0.05 each" --type sell --category tokens --price 50 --currency USD --contact @trader --expires 14
 
-# 4. Post a buy intent
+# 3. Post a buy intent
 npm run cli -- market-post "Looking for BTC tokens, willing to pay market rate" --type buy --category tokens --price 1000 --currency USD
 
-# 5. Search for what others are selling
+# 4. Search for what others are selling
 npm run cli -- market-search "UCT tokens" --type sell --limit 5
 
-# 6. Search with price filter
+# 5. Search with price filter
 npm run cli -- market-search "tokens for sale" --min-price 10 --max-price 100
 
-# 7. List your own intents
+# 6. List your own intents
 npm run cli -- market-my
 
-# 8. Close an intent (use the ID from market-my or market-post output)
+# 7. Close an intent (use the ID from market-my or market-post output)
 npm run cli -- market-close <intent-id>
-
-# 9. Check your agent profile
-npm run cli -- market-profile
 ```
 
 ### Multi-Wallet Market Example
@@ -375,38 +346,6 @@ Close (delete) an intent.
 await sphere.market!.closeIntent('intent-123');
 ```
 
-### `register(opts?: RegisterOptions): Promise<MarketAgentProfile>`
-
-Manually register the agent with the market backend. Usually not needed — authenticated methods auto-register on first use.
-
-```typescript
-const profile = await sphere.market!.register({
-  name: 'Alice',
-  nostrPubkey: '02abc...',
-});
-console.log('Registered as:', profile.publicKey);
-```
-
-### `getProfile(): Promise<MarketAgentProfile>`
-
-Get the current agent's profile.
-
-```typescript
-const profile = await sphere.market!.getProfile();
-console.log('Agent ID:', profile.id);
-console.log('Public Key:', profile.publicKey);
-console.log('Registered:', profile.registeredAt);
-```
-
-### `getCategories(): Promise<string[]>`
-
-Get available intent categories. This is a **public** endpoint — no authentication required.
-
-```typescript
-const categories = await sphere.market!.getCategories();
-// ['tokens', 'nfts', 'services', ...]
-```
-
 ## Types
 
 ### PostIntentRequest
@@ -415,7 +354,7 @@ const categories = await sphere.market!.getCategories();
 interface PostIntentRequest {
   description: string;      // Free-form intent description
   intentType: IntentType;   // 'buy' | 'sell'
-  category?: string;        // Category (from getCategories())
+  category?: string;        // Category tag
   price?: number;           // Price amount
   currency?: string;        // Currency code (e.g., 'USD', 'UCT')
   location?: string;        // Location filter
@@ -493,35 +432,11 @@ interface SearchResult {
 }
 ```
 
-### MarketAgentProfile
-
-```typescript
-interface MarketAgentProfile {
-  id: number;
-  name?: string;
-  publicKey: string;
-  nostrPubkey?: string;
-  registeredAt: string;
-}
-```
-
-### RegisterOptions
-
-```typescript
-interface RegisterOptions {
-  name?: string;
-  nostrPubkey?: string;
-}
-```
-
 ## Auto-Registration
 
-The market module automatically handles agent registration. When an authenticated API call receives a 401 "Agent not registered" error, the module:
+The market module automatically handles agent registration. Before the first authenticated API call, the module registers the wallet's public key with the server via `POST /api/agent/register`. This is idempotent — if the agent is already registered, the 409 response is silently accepted.
 
-1. Calls `register()` with the wallet's chain public key
-2. Retries the original API call
-
-This means you never need to call `register()` manually — just call `postIntent()`, `getMyIntents()`, or `getProfile()` and registration happens transparently.
+This means you never need to register manually — just call `postIntent()`, `getMyIntents()`, or `closeIntent()` and registration happens transparently on first use.
 
 ```typescript
 // No need to register first — auto-registers on first authenticated call
@@ -537,10 +452,10 @@ All authenticated API calls are signed with secp256k1 ECDSA using the wallet's p
 
 1. Construct payload: `JSON.stringify({ body, timestamp })`
 2. Hash with SHA-256
-3. Sign with secp256k1 (compact signature format)
+3. Sign with secp256k1 (compact 64-byte signature format)
 4. Send as HTTP headers: `x-public-key`, `x-signature`, `x-timestamp`
 
-Public endpoints (`search()` and `getCategories()`) do not require signing.
+The `search()` endpoint is public and does not require signing.
 
 ## Error Handling
 
@@ -574,13 +489,13 @@ if (sphere.market) {
   console.log('Market module not enabled');
 }
 
-// Or use optional chaining + non-null assertion when you know it's enabled
+// Or use non-null assertion when you know it's enabled
 const result = await sphere.market!.postIntent({ ... });
 ```
 
 ## Address Switching
 
-When you call `sphere.switchToAddress(index)`, the market module is re-initialized with the new identity. Subsequent market API calls will use the new address's key pair for signing.
+When you call `sphere.switchToAddress(index)`, the market module is re-initialized with the new identity. Subsequent market API calls will use the new address's key pair for signing, and auto-registration will run again for the new key.
 
 ```typescript
 // Initially using address 0
@@ -589,7 +504,7 @@ await sphere.market!.postIntent({ description: 'From address 0', intentType: 'bu
 // Switch to address 1
 await sphere.switchToAddress(1);
 
-// Now signing with address 1's key pair
+// Now signing with address 1's key pair (auto-registers the new key)
 await sphere.market!.postIntent({ description: 'From address 1', intentType: 'sell' });
 ```
 
@@ -615,11 +530,7 @@ async function main() {
 
   const market = sphere.market!;
 
-  // 1. Check available categories
-  const categories = await market.getCategories();
-  console.log('Categories:', categories);
-
-  // 2. Post a sell intent
+  // 1. Post a sell intent (auto-registers agent on first call)
   const posted = await market.postIntent({
     description: 'Selling 1000 UCT tokens at $0.05 each',
     intentType: 'sell',
@@ -631,26 +542,22 @@ async function main() {
   });
   console.log('Posted intent:', posted.intentId);
 
-  // 3. Search for buy intents
+  // 2. Search for buy intents (public, no auth needed)
   const { intents } = await market.search('buy UCT tokens', {
     filters: { intentType: 'buy' },
     limit: 10,
   });
   console.log(`Found ${intents.length} buy intents`);
 
-  // 4. List own intents
+  // 3. List own intents
   const myIntents = await market.getMyIntents();
   console.log(`My intents: ${myIntents.length}`);
 
-  // 5. Close an intent
+  // 4. Close an intent
   if (myIntents.length > 0) {
     await market.closeIntent(myIntents[0].id);
     console.log('Closed intent:', myIntents[0].id);
   }
-
-  // 6. Check profile
-  const profile = await market.getProfile();
-  console.log('Agent profile:', profile.publicKey);
 
   await sphere.destroy();
 }
@@ -664,10 +571,8 @@ The market module communicates with the following backend endpoints:
 
 | Method | Endpoint | Auth | SDK Method |
 |--------|----------|------|------------|
-| POST | `/api/agents/register` | Signed | `register()` |
-| GET | `/api/agents/me` | Signed | `getProfile()` |
+| POST | `/api/agent/register` | Public | Auto-registration (internal) |
 | POST | `/api/intents` | Signed | `postIntent()` |
-| POST | `/api/intents/search` | Public | `search()` |
-| GET | `/api/intents/my` | Signed | `getMyIntents()` |
+| GET | `/api/intents` | Signed | `getMyIntents()` |
 | DELETE | `/api/intents/:id` | Signed | `closeIntent()` |
-| GET | `/api/categories` | Public | `getCategories()` |
+| POST | `/api/search` | Public | `search()` |
