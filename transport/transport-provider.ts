@@ -33,6 +33,13 @@ export interface TransportProvider extends BaseProvider {
   onMessage(handler: MessageHandler): () => void;
 
   /**
+   * Send a composing (typing) indicator to a recipient.
+   * Uses a dedicated event kind (25050) inside a NIP-17 gift wrap.
+   * Fire-and-forget — not persisted.
+   */
+  sendComposingIndicator?(recipientTransportPubkey: string, content: string): Promise<void>;
+
+  /**
    * Subscribe to incoming composing indicators
    * @returns Unsubscribe function
    */

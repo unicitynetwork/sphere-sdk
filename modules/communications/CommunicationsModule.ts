@@ -242,12 +242,11 @@ export class CommunicationsModule {
     const recipientPubkey = await this.resolveRecipient(recipientPubkeyOrNametag);
 
     const content = JSON.stringify({
-      type: 'composing',
       senderNametag: this.deps!.identity.nametag,
       expiresIn: 30000,
     });
 
-    await this.deps!.transport.sendMessage(recipientPubkey, content);
+    await this.deps!.transport.sendComposingIndicator?.(recipientPubkey, content);
   }
 
   /**

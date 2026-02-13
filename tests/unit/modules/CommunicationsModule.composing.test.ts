@@ -101,24 +101,30 @@ describe('CommunicationsModule - Composing Indicators', () => {
   // ---------------------------------------------------------------------------
 
   describe('sendComposingIndicator()', () => {
-    it('sends a composing indicator via transport.sendMessage', async () => {
+    it('sends a composing indicator via transport.sendComposingIndicator', async () => {
+      const transport = createMockTransport({
+        sendComposingIndicator: vi.fn().mockResolvedValue(undefined),
+      });
+      deps = createDeps({ transport });
       comms.initialize(deps);
 
       await comms.sendComposingIndicator('recipient-pubkey-hex');
 
-      expect(deps.transport.sendMessage).toHaveBeenCalledOnce();
-      const [recipientArg, contentArg] = (deps.transport.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(transport.sendComposingIndicator).toHaveBeenCalledOnce();
+      const [recipientArg, contentArg] = (transport.sendComposingIndicator as ReturnType<typeof vi.fn>).mock.calls[0];
       expect(recipientArg).toBe('recipient-pubkey-hex');
 
       const parsed = JSON.parse(contentArg);
-      expect(parsed.type).toBe('composing');
       expect(parsed.senderNametag).toBe('testuser');
       expect(parsed.expiresIn).toBe(30000);
+      // No "type" field — discrimination is by event kind, not content
+      expect(parsed.type).toBeUndefined();
     });
 
     it('resolves @nametag before sending', async () => {
       const transport = createMockTransport({
         resolveNametag: vi.fn().mockResolvedValue('resolved-pubkey-123'),
+        sendComposingIndicator: vi.fn().mockResolvedValue(undefined),
       });
       deps = createDeps({ transport });
       comms.initialize(deps);
@@ -126,7 +132,7 @@ describe('CommunicationsModule - Composing Indicators', () => {
       await comms.sendComposingIndicator('@alice');
 
       expect(transport.resolveNametag).toHaveBeenCalledWith('alice');
-      expect(transport.sendMessage).toHaveBeenCalledWith(
+      expect(transport.sendComposingIndicator).toHaveBeenCalledWith(
         'resolved-pubkey-123',
         expect.any(String),
       );

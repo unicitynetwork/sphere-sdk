@@ -18,12 +18,14 @@ import {
   NostrKeyManager,
   NIP04,
   NIP17,
+  NIP44,
   Event as NostrEventClass,
   EventKinds,
   hashNametag,
   NostrClient,
   Filter,
 } from '@unicitylabs/nostr-js-sdk';
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey, publicKeyToAddress } from '../core/crypto';
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
@@ -54,6 +56,16 @@ import {
   STORAGE_KEYS_GLOBAL,
   TIMEOUTS,
 } from '../constants';
+
+// =============================================================================
+// Composing Indicator Kind
+// =============================================================================
+
+/** Ephemeral-range kind for composing (typing) indicators inside NIP-17 gift wraps */
+const COMPOSING_INDICATOR_KIND = 25050;
+
+/** Randomization window for gift wrap timestamps (+/- 2 days in seconds) */
+const TIMESTAMP_RANDOMIZATION = 2 * 24 * 60 * 60;
 
 // =============================================================================
 // Configuration
@@ -539,23 +551,10 @@ export class NostrTransportProvider implements TransportProvider {
       : recipientPubkey;
 
     // Wrap content with sender nametag for Sphere app compatibility
-    // Structured messages (those with a "type" field) are sent as-is — they
-    // already include senderNametag and should not be double-wrapped.
     const senderNametag = this.identity?.nametag;
-    let isStructured = false;
-    try {
-      const parsed = JSON.parse(content);
-      isStructured = typeof parsed === 'object' && parsed !== null && !!parsed.type;
-    } catch {}
-
-    let wrappedContent: string;
-    if (isStructured) {
-      wrappedContent = content;
-    } else {
-      wrappedContent = senderNametag
-        ? JSON.stringify({ senderNametag, text: content })
-        : content;
-    }
+    const wrappedContent = senderNametag
+      ? JSON.stringify({ senderNametag, text: content })
+      : content;
 
     // Create NIP-17 gift-wrapped message (kind 1059)
     const giftWrap = NIP17.createGiftWrap(this.keyManager!, nostrRecipient, wrappedContent);
@@ -594,6 +593,21 @@ export class NostrTransportProvider implements TransportProvider {
   onComposing(handler: ComposingHandler): () => void {
     this.composingHandlers.add(handler);
     return () => this.composingHandlers.delete(handler);
+  }
+
+  async sendComposingIndicator(recipientPubkey: string, content: string): Promise<void> {
+    this.ensureReady();
+
+    // NIP-17 requires 32-byte x-only pubkey; strip 02/03 prefix if present
+    const nostrRecipient = recipientPubkey.length === 66 && (recipientPubkey.startsWith('02') || recipientPubkey.startsWith('03'))
+      ? recipientPubkey.slice(2)
+      : recipientPubkey;
+
+    // Build NIP-17 gift wrap with kind 25050 rumor (instead of kind 14 for DMs).
+    // We replicate the three-layer NIP-59 envelope because NIP17.createGiftWrap
+    // hardcodes kind 14 for the inner rumor.
+    const giftWrap = this.createCustomKindGiftWrap(nostrRecipient, content, COMPOSING_INDICATOR_KIND);
+    await this.publishEvent(giftWrap);
   }
 
   async sendTokenTransfer(
@@ -1342,34 +1356,43 @@ export class NostrTransportProvider implements TransportProvider {
         this.log('Skipping own message');
         return;
       }
-      if (pm.kind !== EventKinds.CHAT_MESSAGE) {
-        this.log('Skipping non-chat message, kind:', pm.kind);
+      // Route by inner rumor kind
+      if (pm.kind === COMPOSING_INDICATOR_KIND) {
+        // Kind 25050 — composing indicator
+        let senderNametag: string | undefined;
+        let expiresIn = 30000;
+        try {
+          const parsed = JSON.parse(pm.content);
+          senderNametag = parsed.senderNametag || undefined;
+          expiresIn = parsed.expiresIn ?? 30000;
+        } catch {
+          // Payload parse failed — use defaults
+        }
+        const indicator = {
+          senderPubkey: pm.senderPubkey,
+          senderNametag,
+          expiresIn,
+        };
+        this.log('Composing indicator from:', indicator.senderNametag || pm.senderPubkey?.slice(0, 16));
+        for (const handler of this.composingHandlers) {
+          try { handler(indicator); } catch (error) { this.log('Composing handler error:', error); }
+        }
         return;
       }
 
-      // Sphere app wraps DM content as JSON: {senderNametag, text} or {type: "composing", ...}
+      if (pm.kind !== EventKinds.CHAT_MESSAGE) {
+        this.log('Skipping unrecognized rumor kind:', pm.kind);
+        return;
+      }
+
+      // Kind 14 — chat message. Sphere app wraps content as JSON: {senderNametag, text}
       let content = pm.content;
       let senderNametag: string | undefined;
       try {
         const parsed = JSON.parse(content);
-        if (typeof parsed === 'object') {
-          if (parsed.type === 'composing') {
-            // Composing indicator — route to composing handlers, not message handlers
-            const indicator = {
-              senderPubkey: pm.senderPubkey,
-              senderNametag: parsed.senderNametag || undefined,
-              expiresIn: parsed.expiresIn ?? 30000,
-            };
-            this.log('Composing indicator from:', indicator.senderNametag || pm.senderPubkey?.slice(0, 16));
-            for (const handler of this.composingHandlers) {
-              try { handler(indicator); } catch (error) { this.log('Composing handler error:', error); }
-            }
-            return;
-          }
-          if (parsed.text !== undefined) {
-            content = parsed.text;
-            senderNametag = parsed.senderNametag || undefined;
-          }
+        if (typeof parsed === 'object' && parsed.text !== undefined) {
+          content = parsed.text;
+          senderNametag = parsed.senderNametag || undefined;
         }
       } catch {
         // Plain text — use as-is
@@ -1912,6 +1935,47 @@ export class NostrTransportProvider implements TransportProvider {
         this.log('Event callback error:', error);
       }
     }
+  }
+
+  /**
+   * Create a NIP-17 gift wrap with a custom inner rumor kind.
+   * Replicates the three-layer NIP-59 envelope (rumor → seal → gift wrap)
+   * because NIP17.createGiftWrap hardcodes kind 14 for the inner rumor.
+   */
+  private createCustomKindGiftWrap(recipientPubkeyHex: string, content: string, rumorKind: number): NostrEventClass {
+    const senderPubkey = this.keyManager!.getPublicKeyHex();
+    const now = Math.floor(Date.now() / 1000);
+
+    // 1. Create Rumor (unsigned inner event with custom kind)
+    const rumorTags: string[][] = [['p', recipientPubkeyHex]];
+    const rumorSerialized = JSON.stringify([0, senderPubkey, now, rumorKind, rumorTags, content]);
+    const rumorId = bytesToHex(sha256Noble(new TextEncoder().encode(rumorSerialized)));
+    const rumor = { id: rumorId, pubkey: senderPubkey, created_at: now, kind: rumorKind, tags: rumorTags, content };
+
+    // 2. Create Seal (kind 13, signed by sender, encrypts rumor)
+    const recipientPubkeyBytes = hexToBytes(recipientPubkeyHex);
+    const encryptedRumor = NIP44.encrypt(JSON.stringify(rumor), this.keyManager!.getPrivateKey(), recipientPubkeyBytes);
+    const sealTimestamp = now + Math.floor(Math.random() * 2 * TIMESTAMP_RANDOMIZATION) - TIMESTAMP_RANDOMIZATION;
+    const seal = NostrEventClass.create(this.keyManager!, {
+      kind: EventKinds.SEAL,
+      tags: [],
+      content: encryptedRumor,
+      created_at: sealTimestamp,
+    });
+
+    // 3. Create Gift Wrap (kind 1059, signed by ephemeral key, encrypts seal)
+    const ephemeralKeys = NostrKeyManager.generate();
+    const encryptedSeal = NIP44.encrypt(JSON.stringify(seal.toJSON()), ephemeralKeys.getPrivateKey(), recipientPubkeyBytes);
+    const wrapTimestamp = now + Math.floor(Math.random() * 2 * TIMESTAMP_RANDOMIZATION) - TIMESTAMP_RANDOMIZATION;
+    const giftWrap = NostrEventClass.create(ephemeralKeys, {
+      kind: EventKinds.GIFT_WRAP,
+      tags: [['p', recipientPubkeyHex]],
+      content: encryptedSeal,
+      created_at: wrapTimestamp,
+    });
+    ephemeralKeys.clear();
+
+    return giftWrap;
   }
 
   private log(...args: unknown[]): void {
