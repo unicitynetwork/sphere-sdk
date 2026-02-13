@@ -477,24 +477,30 @@ type V5FinalizationStage = 'RECEIVED' | 'MINT_SUBMITTED' | 'MINT_PROVEN' | 'TRAN
 
 ### Methods: Balance & Token Queries
 
-#### `getBalance(coinId?: string): TokenBalance[]`
+#### `getBalance(coinId?: string): Asset[]`
 
 Get token balances grouped by coin type. **Synchronous** (no await needed).
 
 Skips tokens with status `'spent'`, `'invalid'`, or `'transferring'`. Fires a non-blocking `resolveUnconfirmed()` call as a side effect.
 
 ```typescript
-interface TokenBalance {
+interface Asset {
   readonly coinId: string;
   readonly symbol: string;
   readonly name: string;
+  readonly decimals: number;
+  readonly iconUrl?: string;
   readonly totalAmount: string;          // confirmedAmount + unconfirmedAmount
   readonly confirmedAmount: string;      // Tokens with inclusion proofs
   readonly unconfirmedAmount: string;    // Tokens pending proof (status: 'submitted')
   readonly tokenCount: number;           // Total token count
   readonly confirmedTokenCount: number;
   readonly unconfirmedTokenCount: number;
-  readonly decimals: number;
+  readonly priceUsd: number | null;      // Price per whole unit in USD
+  readonly priceEur: number | null;      // Price per whole unit in EUR
+  readonly change24h: number | null;     // 24h price change percentage
+  readonly fiatValueUsd: number | null;  // Total fiat value in USD
+  readonly fiatValueEur: number | null;  // Total fiat value in EUR
 }
 ```
 
@@ -688,24 +694,10 @@ Mint a nametag token on-chain. Required for receiving tokens via PROXY addresses
 ```typescript
 interface MintNametagResult {
   success: boolean;
-  token?: Token;
-  nametagData?: NametagData;
-  readonly id: string;                       // Local transfer UUID
-  status: TransferStatus;                    // Current status
-  readonly tokens: Token[];                  // Tokens involved
-  readonly tokenTransfers: TokenTransferDetail[];  // Per-token transfer details
-  error?: string;                            // Error message if failed
+  token?: Token;              // The minted nametag token
+  nametagData?: NametagData;  // Nametag metadata
+  error?: string;             // Error message if failed
 }
-
-interface TokenTransferDetail {
-  readonly sourceTokenId: string;   // Source token ID consumed
-  readonly method: 'direct' | 'split';  // Transfer method
-  readonly requestIdHex?: string;   // Aggregator commitment request ID (direct)
-  readonly splitGroupId?: string;   // Split group ID (split)
-  readonly nostrEventId?: string;   // Nostr event ID (split)
-}
-
-type TransferStatus = 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';
 ```
 
 #### `isNametagAvailable(nametag: string): Promise<boolean>`
@@ -1415,29 +1407,14 @@ const available = await sphere.isNametagAvailable('alice');
 
 ### MintNametagResult
 
-```typescript
-interface MintNametagResult {
-  success: boolean;
-  token?: Token;           // The minted nametag token
-  nametagData?: NametagData;  // Nametag metadata
-  error?: string;          // Error message if failed
-}
-
-interface NametagData {
-  name: string;            // Nametag without @ prefix
-  token: object;           // Token JSON (genesis + state)
-  timestamp: number;       // Mint timestamp
-  format?: string;         // 'txf'
-  version?: string;        // '2.0'
-}
-```
+See [`MintNametagResult`](#mintnametagnametag-string-promisemintnamtagresult) in the PaymentsModule section above for the full type definition.
 
 ### NametagMinter Class
 
 For advanced usage, create a NametagMinter directly:
 
 ```typescript
-import { NametagMinter, createNametagMinter } from '@unicitylabs/sphere-sdk';
+import { NametagMinter, createNametagMinter } from '@unicitylabs/sphere-sdk/modules/payments';
 
 const minter = createNametagMinter({
   stateTransitionClient: client,

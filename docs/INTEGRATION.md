@@ -1079,10 +1079,11 @@ await sphere.registerNametag('alice');
 await sphere.switchToAddress(1);
 await sphere.registerNametag('bob');
 
-// Query nametags
-sphere.getNametagForAddress(0);  // 'alice'
-sphere.getNametagForAddress(1);  // 'bob'
-sphere.getAllAddressNametags();  // Map { 0 => 'alice', 1 => 'bob' }
+// Query nametags (parameter is addressId string, omit for current address)
+sphere.getNametagForAddress();  // 'alice' (current address)
+const addresses = sphere.getActiveAddresses();
+sphere.getNametagForAddress(addresses[1].addressId);  // 'bob'
+sphere.getAllAddressNametags();  // Map<addressId, Map<nametagIndex, nametag>>
 ```
 
 ### Troubleshooting: "Nametag already taken"
@@ -1387,7 +1388,7 @@ import { generateMnemonic, validateMnemonic } from '../../../core/crypto';
 
 describe('generateMnemonic()', () => {
   it('should generate valid 12-word mnemonic', () => {
-    const mnemonic = generateMnemonic(12);
+    const mnemonic = generateMnemonic(128);  // 128 bits = 12 words
     const words = mnemonic.split(' ');
 
     expect(words).toHaveLength(12);
