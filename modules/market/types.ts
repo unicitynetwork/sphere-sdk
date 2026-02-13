@@ -94,15 +94,3 @@ export interface SearchResult {
   count: number;
 }
 
-export interface MarketAgentProfile {
-  id: number;
-  name?: string;
-  publicKey: string;
-  nostrPubkey?: string;
-  registeredAt: string;
-}
-
-export interface RegisterOptions {
-  name?: string;
-  nostrPubkey?: string;
-}

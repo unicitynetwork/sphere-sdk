@@ -19,8 +19,6 @@ import type {
   SearchIntentResult,
   SearchOptions,
   SearchResult,
-  MarketAgentProfile,
-  RegisterOptions,
 } from './types';
 import type { FullIdentity } from '../../types';
 
@@ -125,15 +123,6 @@ function mapMyIntent(raw: any): MarketIntent {
   };
 }
 
-function mapProfile(raw: any): MarketAgentProfile {
-  return {
-    id: raw.id,
-    name: raw.name ?? undefined,
-    publicKey: raw.public_key,
-    nostrPubkey: raw.nostr_pubkey ?? undefined,
-    registeredAt: raw.registered_at,
-  };
-}
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 // =============================================================================
@@ -165,38 +154,15 @@ export class MarketModule {
   // Public API
   // ---------------------------------------------------------------------------
 
-  /** Register this agent with the market backend */
-  async register(opts?: RegisterOptions): Promise<MarketAgentProfile> {
-    this.ensureIdentity();
-    const body: Record<string, unknown> = {
-      public_key: this.identity!.chainPubkey,
-    };
-    if (opts?.name !== undefined) body.name = opts.name;
-    if (opts?.nostrPubkey !== undefined) body.nostr_pubkey = opts.nostrPubkey;
-
-    const data = await this.apiPost('/api/agents/register', body);
-    return mapProfile(data.agent ?? data);
-  }
-
-  /** Get own agent profile */
-  async getProfile(): Promise<MarketAgentProfile> {
-    return this.withAutoRegister(async () => {
-      const data = await this.apiGet('/api/agents/me');
-      return mapProfile(data.agent ?? data);
-    });
-  }
-
-  /** Post a new intent */
+  /** Post a new intent (agent is auto-registered on first post) */
   async postIntent(intent: PostIntentRequest): Promise<PostIntentResult> {
-    return this.withAutoRegister(async () => {
-      const body = toSnakeCaseIntent(intent);
-      const data = await this.apiPost('/api/intents', body);
-      return {
-        intentId: data.intent_id ?? data.intentId,
-        message: data.message,
-        expiresAt: data.expires_at ?? data.expiresAt,
-      };
-    });
+    const body = toSnakeCaseIntent(intent);
+    const data = await this.apiPost('/api/intents', body);
+    return {
+      intentId: data.intent_id ?? data.intentId,
+      message: data.message,
+      expiresAt: data.expires_at ?? data.expiresAt,
+    };
   }
 
   /** Semantic search for intents (public — no auth required) */
@@ -205,47 +171,20 @@ export class MarketModule {
       query,
       ...toSnakeCaseFilters(opts),
     };
-    const data = await this.apiPublicPost('/api/intents/search', body);
-    const results: SearchIntentResult[] = (data.results ?? []).map(mapSearchResult);
+    const data = await this.apiPublicPost('/api/search', body);
+    const results: SearchIntentResult[] = (data.intents ?? []).map(mapSearchResult);
     return { intents: results, count: results.length };
   }
 
-  /** List own intents */
+  /** List own intents (authenticated) */
   async getMyIntents(): Promise<MarketIntent[]> {
-    return this.withAutoRegister(async () => {
-      const data = await this.apiGet('/api/intents/my');
-      return (data.intents ?? []).map(mapMyIntent);
-    });
+    const data = await this.apiGet('/api/intents');
+    return (data.intents ?? []).map(mapMyIntent);
   }
 
   /** Close (delete) an intent */
   async closeIntent(intentId: string): Promise<void> {
-    return this.withAutoRegister(async () => {
-      await this.apiDelete(`/api/intents/${encodeURIComponent(intentId)}`);
-    });
-  }
-
-  /** Get available categories */
-  async getCategories(): Promise<string[]> {
-    const data = await this.apiPublicGet('/api/categories');
-    return data.categories ?? [];
-  }
-
-  // ---------------------------------------------------------------------------
-  // Private: Auto-register wrapper
-  // ---------------------------------------------------------------------------
-
-  private async withAutoRegister<T>(fn: () => Promise<T>): Promise<T> {
-    try {
-      return await fn();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg === 'Agent not registered') {
-        await this.register();
-        return await fn();
-      }
-      throw err;
-    }
+    await this.apiDelete(`/api/intents/${encodeURIComponent(intentId)}`);
   }
 
   // ---------------------------------------------------------------------------
@@ -314,13 +253,6 @@ export class MarketModule {
     return this.parseResponse(res);
   }
 
-  private async apiPublicGet(path: string): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
-    const res = await fetch(`${this.apiUrl}${path}`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    return this.parseResponse(res);
-  }
 }
 
 // =============================================================================

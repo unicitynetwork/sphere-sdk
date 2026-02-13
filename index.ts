@@ -224,8 +224,6 @@ export type {
   SearchFilters,
   SearchOptions,
   SearchResult,
-  MarketAgentProfile,
-  RegisterOptions,
   IntentType,
   IntentStatus,
 } from './modules/market';

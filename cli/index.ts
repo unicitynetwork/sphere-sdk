@@ -317,8 +317,6 @@ MARKET (Intent Bulletin Board):
                                       --limit <n>        Max results (default: 10)
   market-my                           List your own intents
   market-close <id>                   Close (delete) an intent
-  market-categories                   List available categories
-  market-profile                      Show your market agent profile
 
 ENCRYPTION:
   encrypt <data> <password>         Encrypt data with password
@@ -365,13 +363,11 @@ Wallet Profile Examples:
   npm run cli -- balance                          Check bob's balance
 
 Market Examples:
-  npm run cli -- market-categories                                   List categories
   npm run cli -- market-post "Buying 100 UCT" --type buy             Post buy intent
   npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD   Post sell intent
   npm run cli -- market-search "UCT tokens" --type sell --limit 5    Search intents
   npm run cli -- market-my                                           List own intents
   npm run cli -- market-close <id>                                   Close an intent
-  npm run cli -- market-profile                                      Show agent profile
 `);
 }
 
@@ -1800,41 +1796,6 @@ async function main() {
 
         await sphere.market.closeIntent(intentId);
         console.log(`✓ Intent ${intentId} closed.`);
-
-        await closeSphere();
-        break;
-      }
-
-      case 'market-categories': {
-        const sphere = await getSphere();
-
-        if (!sphere.market) {
-          console.error('Market module not available.');
-          process.exit(1);
-        }
-
-        const categories = await sphere.market.getCategories();
-        console.log(`Available categories: ${categories.join(', ')}`);
-
-        await closeSphere();
-        break;
-      }
-
-      case 'market-profile': {
-        const sphere = await getSphere();
-
-        if (!sphere.market) {
-          console.error('Market module not available.');
-          process.exit(1);
-        }
-
-        const profile = await sphere.market.getProfile();
-
-        console.log('Market Agent Profile:');
-        console.log(`  ID: ${profile.id}`);
-        console.log(`  Public Key: ${profile.publicKey}`);
-        console.log(`  Registered: ${profile.registeredAt}`);
-        if (profile.name) console.log(`  Name: ${profile.name}`);
 
         await closeSphere();
         break;

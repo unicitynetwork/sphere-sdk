@@ -176,10 +176,10 @@ describe('MarketModule integration with Sphere', () => {
 
       // Verify by calling a method and checking the URL
       vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-        new Response(JSON.stringify({ categories: [] }), { status: 200 })
+        new Response(JSON.stringify({ intents: [] }), { status: 200 })
       );
 
-      await sphere.market!.getCategories();
+      await sphere.market!.search('test');
       const fetchCalls = (globalThis.fetch as any).mock.calls;
       const lastCall = fetchCalls[fetchCalls.length - 1];
       expect(lastCall[0]).toContain('https://custom-market.api');
@@ -388,7 +388,7 @@ describe('MarketModule integration with Sphere', () => {
 
     it('should access market methods when module exists', async () => {
       vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-        new Response(JSON.stringify({ categories: ['goods', 'services'] }), { status: 200 })
+        new Response(JSON.stringify({ intents: [], count: 0 }), { status: 200 })
       );
 
       const { sphere } = await Sphere.init({
@@ -401,8 +401,8 @@ describe('MarketModule integration with Sphere', () => {
       });
 
       expect(sphere.market).not.toBeNull();
-      const categories = await sphere.market!.getCategories();
-      expect(categories).toEqual(['goods', 'services']);
+      const result = await sphere.market!.search('test query');
+      expect(result.intents).toEqual([]);
 
       await sphere.destroy();
     });
@@ -437,7 +437,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should reinitialize market module with new identity on address switch', async () => {
       const fetchSpy = vi.spyOn(globalThis, 'fetch');
       fetchSpy.mockResolvedValue(
-        new Response(JSON.stringify({ agent: { id: 1, public_key: '02ab', registered_at: '2025-01-01' } }), { status: 200 })
+        new Response(JSON.stringify({ intents: [] }), { status: 200 })
       );
 
       const { sphere } = await Sphere.init({
@@ -451,9 +451,9 @@ describe('MarketModule integration with Sphere', () => {
 
       const identity1 = sphere.identity;
 
-      // Call a market method to capture the public key used
+      // Call an authenticated market method to capture the public key used
       fetchSpy.mockClear();
-      await sphere.market!.register();
+      await sphere.market!.getMyIntents();
       const pubkey1 = (fetchSpy.mock.calls[0][1]?.headers as Record<string, string>)['x-public-key'];
 
       // Switch to address 1
@@ -470,9 +470,9 @@ describe('MarketModule integration with Sphere', () => {
       // Call market method again and verify it uses the NEW identity
       fetchSpy.mockClear();
       fetchSpy.mockResolvedValue(
-        new Response(JSON.stringify({ agent: { id: 2, public_key: '03cd', registered_at: '2025-01-01' } }), { status: 200 })
+        new Response(JSON.stringify({ intents: [] }), { status: 200 })
       );
-      await sphere.market!.register();
+      await sphere.market!.getMyIntents();
       const pubkey2 = (fetchSpy.mock.calls[0][1]?.headers as Record<string, string>)['x-public-key'];
 
       // Verify different public keys were used (proving module was reinitialized)
@@ -502,10 +502,11 @@ describe('MarketModule integration with Sphere', () => {
 
       // Market should be ready to use
       vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-        new Response(JSON.stringify({ categories: [] }), { status: 200 })
+        new Response(JSON.stringify({ intents: [] }), { status: 200 })
       );
 
-      await expect(sphere.market!.getCategories()).resolves.toEqual([]);
+      const result = await sphere.market!.search('test');
+      expect(result.intents).toEqual([]);
 
       await sphere.destroy();
     });
@@ -550,10 +551,10 @@ describe('MarketModule integration with Sphere', () => {
       expect(sphere.market).not.toBeNull();
 
       vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-        new Response(JSON.stringify({ categories: [] }), { status: 200 })
+        new Response(JSON.stringify({ intents: [] }), { status: 200 })
       );
 
-      await sphere.market!.getCategories();
+      await sphere.market!.search('test');
 
       await sphere.destroy();
     });
@@ -667,7 +668,7 @@ describe('MarketModule integration with Sphere', () => {
   describe('end-to-end flow', () => {
     it('should create wallet and use market module together', async () => {
       vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-        new Response(JSON.stringify({ categories: ['goods'] }), { status: 200 })
+        new Response(JSON.stringify({ intents: [] }), { status: 200 })
       );
 
       const { sphere } = await Sphere.init({
@@ -686,13 +687,13 @@ describe('MarketModule integration with Sphere', () => {
       // Verify market
       expect(sphere.market).not.toBeNull();
 
-      // Use market module
-      const categories = await sphere.market!.getCategories();
-      expect(categories).toEqual(['goods']);
+      // Use market module (search is public, no auth needed)
+      const result = await sphere.market!.search('goods');
+      expect(result.intents).toEqual([]);
 
       // Verify it was called with correct URL
       const fetchCalls = (globalThis.fetch as any).mock.calls;
-      expect(fetchCalls[0][0]).toContain('https://test.market/api/categories');
+      expect(fetchCalls[0][0]).toContain('https://test.market/api/search');
 
       await sphere.destroy();
     });
