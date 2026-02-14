@@ -381,6 +381,7 @@ function extractStateHashFromSdkData(sdkData: string | undefined): string {
 
     // Try alternative locations if not found in standard place
     if (!stateHash) {
+      /* eslint-disable @typescript-eslint/no-explicit-any */
       if ((txf as any).state?.hash) {
         return (txf as any).state.hash;
       }
@@ -390,6 +391,7 @@ function extractStateHashFromSdkData(sdkData: string | undefined): string {
       if ((txf as any).currentStateHash) {
         return (txf as any).currentStateHash;
       }
+      /* eslint-enable @typescript-eslint/no-explicit-any */
     }
 
     return stateHash || '';
@@ -2502,7 +2504,6 @@ export class PaymentsModule {
   /**
    * Non-blocking proof check with 500ms timeout.
    */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async quickProofCheck(
     stClient: StateTransitionClient,
     trustBase: RootTrustBase,
@@ -2526,7 +2527,6 @@ export class PaymentsModule {
    * Perform V5 bundle finalization from stored bundle data and proofs.
    * Extracted from InstantSplitProcessor.processV5Bundle() steps 4-10.
    */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async finalizeFromV5Bundle(
     bundle: InstantSplitBundleV5,
     pending: PendingV5Finalization,
@@ -2736,7 +2736,7 @@ export class PaymentsModule {
 
     // Check for exact duplicate (same tokenId AND same stateHash)
     if (incomingStateKey) {
-      for (const [existingId, existing] of this.tokens) {
+      for (const [_existingId, existing] of this.tokens) {
         if (isSameTokenState(existing, token)) {
           // Exact duplicate - same tokenId and same stateHash
           this.log(`Duplicate token state ignored: ${incomingTokenId?.slice(0, 8)}..._${incomingStateHash?.slice(0, 8)}...`);
@@ -4508,7 +4508,7 @@ export class PaymentsModule {
           }
 
           clearTimeout(timeoutId);
-        } catch (err) {
+        } catch (_err) {
           // Proof not ready yet or timed out
           continue;
         }
