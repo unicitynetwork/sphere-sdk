@@ -71,6 +71,7 @@ import {
   NETWORKS,
   type NetworkType,
 } from '../constants';
+import { TokenRegistry } from '../registry';
 import {
   generateMnemonic as generateBip39Mnemonic,
   validateMnemonic as validateBip39Mnemonic,
@@ -441,6 +442,12 @@ export class Sphere {
    * ```
    */
   static async init(options: SphereInitOptions): Promise<SphereInitResult> {
+    // Configure TokenRegistry in the main bundle context.
+    // Factory functions (createBrowserProviders/createNodeProviders) are built as
+    // separate bundles by tsup, so their TokenRegistry.configure() call configures
+    // a different singleton copy. We must configure the main bundle's copy here.
+    Sphere.configureTokenRegistry(options.storage, options.network);
+
     // Resolve groupChat config: true → use network-default relays
     const groupChat = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
 
@@ -524,6 +531,20 @@ export class Sphere {
   }
 
   /**
+   * Configure TokenRegistry in the main bundle context.
+   *
+   * The provider factory functions (createBrowserProviders / createNodeProviders)
+   * are compiled into separate bundles by tsup, each with their own inlined copy
+   * of TokenRegistry. Their TokenRegistry.configure() call configures a different
+   * singleton than the one used by PaymentsModule (which lives in the main bundle).
+   * This method ensures the main bundle's TokenRegistry is properly configured.
+   */
+  private static configureTokenRegistry(storage: StorageProvider, network?: NetworkType): void {
+    const netConfig = network ? NETWORKS[network] : NETWORKS.testnet;
+    TokenRegistry.configure({ remoteUrl: netConfig.tokenRegistryUrl, storage });
+  }
+
+  /**
    * Create new wallet with mnemonic
    */
   static async create(options: SphereCreateOptions): Promise<Sphere> {
@@ -536,6 +557,9 @@ export class Sphere {
     if (await Sphere.exists(options.storage)) {
       throw new Error('Wallet already exists. Use Sphere.load() or Sphere.clear() first.');
     }
+
+    // Configure TokenRegistry in main bundle context (see init() for details)
+    Sphere.configureTokenRegistry(options.storage, options.network);
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
 
@@ -596,6 +620,9 @@ export class Sphere {
     if (!(await Sphere.exists(options.storage))) {
       throw new Error('No wallet found. Use Sphere.create() to create a new wallet.');
     }
+
+    // Configure TokenRegistry in main bundle context (see init() for details)
+    Sphere.configureTokenRegistry(options.storage, options.network);
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
 

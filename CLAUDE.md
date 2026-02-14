@@ -406,14 +406,19 @@ npm run typecheck
 ### Token Registry (Remote + Cached)
 - `TokenRegistry` is a singleton that provides token metadata (symbol, name, decimals, icons) by coin ID
 - **No bundled data** — starts empty, data comes from remote URL + persistent cache
-- Configured automatically by `createBrowserProviders()` / `createNodeProviders()` via `TokenRegistry.configure({ remoteUrl, storage })`
-- **Data flow:** on `configure()` → load from StorageProvider cache (if fresh) → fetch from remote URL in background → persist to cache on success → repeat every 1 hour
+- Configured in two places due to tsup bundle duplication (see below):
+  - By `createBrowserProviders()` / `createNodeProviders()` — configures the impl bundle's singleton
+  - By `Sphere.init()` / `Sphere.load()` / `Sphere.create()` — configures the main bundle's singleton
+- **Data flow:** on `configure()` → `performInitialLoad()`: try cache first (if fresh) → fall back to remote fetch (if `autoRefresh` is true) → start periodic auto-refresh
+- **Readiness:** `TokenRegistry.waitForReady(timeoutMs?)` — returns a promise that resolves when initial data is loaded (cache or remote). `PaymentsModule.load()` awaits this before parsing tokens to ensure metadata is available.
 - **Graceful degradation:** if no cache and no network, lookup methods return fallbacks (truncated coinId for symbol, 0 for decimals)
 - Remote URL per network: `constants.ts` → `NETWORKS[network].tokenRegistryUrl`
 - Cache keys: `STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE` (JSON) and `TOKEN_REGISTRY_CACHE_TS` (timestamp)
 - Race-safe: cache load skipped if remote data is already newer (`lastRefreshAt > cacheTs`)
 - Concurrent `refreshFromRemote()` calls are deduplicated (only one fetch at a time)
 - `TokenRegistry.destroy()` stops auto-refresh and resets singleton
+
+**tsup bundle duplication note:** tsup compiles multiple entry points (`index.ts`, `impl/browser/index.ts`, etc.) into separate bundles, each inlining its own copy of `TokenRegistry`. The static singleton in `dist/impl/browser/index.js` is a different instance from the one in `dist/index.js`. This is why `Sphere` must call `TokenRegistry.configure()` in its own bundle context, not rely on the factory functions alone.
 
 ### Event Timestamp Persistence
 - Transport persists last processed wallet event timestamp via `TransportStorageAdapter`
@@ -437,14 +442,14 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 1315 (52 test files)
+**Total tests:** 1335 (53 test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
 - `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer, event timestamp persistence
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
-- `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh
+- `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh, waitForReady
 - `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
 - `tests/unit/l1/L1PaymentsHistory.test.ts` - L1 transaction history direction/amounts
