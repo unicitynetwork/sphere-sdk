@@ -60,6 +60,10 @@ export const STORAGE_KEYS_GLOBAL = {
   TOKEN_REGISTRY_CACHE: 'token_registry_cache',
   /** Timestamp of last token registry cache update (ms since epoch) */
   TOKEN_REGISTRY_CACHE_TS: 'token_registry_cache_ts',
+  /** Cached price data JSON (from CoinGecko or other provider) */
+  PRICE_CACHE: 'price_cache',
+  /** Timestamp of last price cache update (ms since epoch) */
+  PRICE_CACHE_TS: 'price_cache_ts',
 } as const;
 
 /**
@@ -354,13 +358,6 @@ export const TIMEOUTS = {
   /** Sync interval */
   SYNC_INTERVAL: 60000,
 } as const;
-
-// =============================================================================
-// Market API Defaults
-// =============================================================================
-
-/** Default Market API URL (intent bulletin board) */
-export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network' as const;
 
 /** Validation limits */
 export const LIMITS = {

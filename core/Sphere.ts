@@ -62,18 +62,16 @@ import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
 import type { GroupChatModuleConfig } from '../modules/groupchat';
-import { MarketModule, createMarketModule } from '../modules/market';
-import type { MarketModuleConfig } from '../modules/market';
 import {
   STORAGE_KEYS_GLOBAL,
   STORAGE_KEYS_ADDRESS,
   getAddressId,
   DEFAULT_BASE_PATH,
   DEFAULT_ENCRYPTION_KEY,
-  DEFAULT_MARKET_API_URL,
   NETWORKS,
   type NetworkType,
 } from '../constants';
+import { TokenRegistry } from '../registry';
 import {
   generateMnemonic as generateBip39Mnemonic,
   validateMnemonic as validateBip39Mnemonic,
@@ -157,8 +155,6 @@ export interface SphereCreateOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
-  /** Market module configuration. true = enable with defaults, object = custom config. */
-  market?: MarketModuleConfig | boolean;
 }
 
 /** Options for loading existing wallet */
@@ -185,8 +181,6 @@ export interface SphereLoadOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
   password?: string;
-  /** Market module configuration. true = enable with defaults, object = custom config. */
-  market?: MarketModuleConfig | boolean;
 }
 
 /** Options for importing a wallet */
@@ -221,8 +215,6 @@ export interface SphereImportOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
   password?: string;
-  /** Market module configuration. true = enable with defaults, object = custom config. */
-  market?: MarketModuleConfig | boolean;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -272,8 +264,6 @@ export interface SphereInitOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Optional password to encrypt/decrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
-  /** Market module configuration. true = enable with defaults, object = custom config. */
-  market?: MarketModuleConfig | boolean;
 }
 
 /** Result of init operation */
@@ -361,7 +351,6 @@ export class Sphere {
   private _payments: PaymentsModule;
   private _communications: CommunicationsModule;
   private _groupChat: GroupChatModule | null = null;
-  private _market: MarketModule | null = null;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -383,7 +372,6 @@ export class Sphere {
     l1Config?: L1Config,
     priceProvider?: PriceProvider,
     groupChatConfig?: GroupChatModuleConfig,
-    marketConfig?: MarketModuleConfig,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -398,7 +386,6 @@ export class Sphere {
     this._payments = createPaymentsModule({ l1: l1Config });
     this._communications = createCommunicationsModule();
     this._groupChat = groupChatConfig ? createGroupChatModule(groupChatConfig) : null;
-    this._market = marketConfig ? createMarketModule(marketConfig) : null;
   }
 
   // ===========================================================================
@@ -455,9 +442,14 @@ export class Sphere {
    * ```
    */
   static async init(options: SphereInitOptions): Promise<SphereInitResult> {
+    // Configure TokenRegistry in the main bundle context.
+    // Factory functions (createBrowserProviders/createNodeProviders) are built as
+    // separate bundles by tsup, so their TokenRegistry.configure() call configures
+    // a different singleton copy. We must configure the main bundle's copy here.
+    Sphere.configureTokenRegistry(options.storage, options.network);
+
     // Resolve groupChat config: true → use network-default relays
     const groupChat = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
-    const market = Sphere.resolveMarketConfig(options.market);
 
     const walletExists = await Sphere.exists(options.storage);
 
@@ -472,7 +464,6 @@ export class Sphere {
         price: options.price,
         groupChat,
         password: options.password,
-        market,
       });
       return { sphere, created: false };
     }
@@ -506,7 +497,6 @@ export class Sphere {
       price: options.price,
       groupChat,
       password: options.password,
-      market,
     });
 
     return { sphere, created: true, generatedMnemonic };
@@ -541,22 +531,17 @@ export class Sphere {
   }
 
   /**
-   * Resolve market module config from Sphere.init() options.
-   * - `true` → enable with default API URL
-   * - `MarketModuleConfig` → pass through with defaults
-   * - `undefined` → no market module
+   * Configure TokenRegistry in the main bundle context.
+   *
+   * The provider factory functions (createBrowserProviders / createNodeProviders)
+   * are compiled into separate bundles by tsup, each with their own inlined copy
+   * of TokenRegistry. Their TokenRegistry.configure() call configures a different
+   * singleton than the one used by PaymentsModule (which lives in the main bundle).
+   * This method ensures the main bundle's TokenRegistry is properly configured.
    */
-  private static resolveMarketConfig(
-    config: MarketModuleConfig | boolean | undefined,
-  ): MarketModuleConfig | undefined {
-    if (!config) return undefined;
-    if (config === true) {
-      return { apiUrl: DEFAULT_MARKET_API_URL };
-    }
-    return {
-      apiUrl: config.apiUrl ?? DEFAULT_MARKET_API_URL,
-      timeout: config.timeout,
-    };
+  private static configureTokenRegistry(storage: StorageProvider, network?: NetworkType): void {
+    const netConfig = network ? NETWORKS[network] : NETWORKS.testnet;
+    TokenRegistry.configure({ remoteUrl: netConfig.tokenRegistryUrl, storage });
   }
 
   /**
@@ -573,8 +558,10 @@ export class Sphere {
       throw new Error('Wallet already exists. Use Sphere.load() or Sphere.clear() first.');
     }
 
+    // Configure TokenRegistry in main bundle context (see init() for details)
+    Sphere.configureTokenRegistry(options.storage, options.network);
+
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
-    const marketConfig = Sphere.resolveMarketConfig(options.market);
 
     const sphere = new Sphere(
       options.storage,
@@ -584,7 +571,6 @@ export class Sphere {
       options.l1,
       options.price,
       groupChatConfig,
-      marketConfig,
     );
     sphere._password = options.password ?? null;
 
@@ -635,8 +621,10 @@ export class Sphere {
       throw new Error('No wallet found. Use Sphere.create() to create a new wallet.');
     }
 
+    // Configure TokenRegistry in main bundle context (see init() for details)
+    Sphere.configureTokenRegistry(options.storage, options.network);
+
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
-    const marketConfig = Sphere.resolveMarketConfig(options.market);
 
     const sphere = new Sphere(
       options.storage,
@@ -646,7 +634,6 @@ export class Sphere {
       options.l1,
       options.price,
       groupChatConfig,
-      marketConfig,
     );
     sphere._password = options.password ?? null;
 
@@ -714,7 +701,6 @@ export class Sphere {
     }
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat);
-    const marketConfig = Sphere.resolveMarketConfig(options.market);
 
     const sphere = new Sphere(
       options.storage,
@@ -724,7 +710,6 @@ export class Sphere {
       options.l1,
       options.price,
       groupChatConfig,
-      marketConfig,
     );
     sphere._password = options.password ?? null;
 
@@ -927,11 +912,6 @@ export class Sphere {
   /** Group chat module (NIP-29). Null if not configured. */
   get groupChat(): GroupChatModule | null {
     return this._groupChat;
-  }
-
-  /** Market module (intent bulletin board). Null if not configured. */
-  get market(): MarketModule | null {
-    return this._market;
   }
 
   // ===========================================================================
@@ -2066,15 +2046,9 @@ export class Sphere {
       emitEvent,
     });
 
-    this._market?.initialize({
-      identity: this._identity!,
-      emitEvent,
-    });
-
     await this._payments.load();
     await this._communications.load();
     await this._groupChat?.load();
-    await this._market?.load();
   }
 
   /**
@@ -2913,32 +2887,16 @@ export class Sphere {
     }
 
     try {
-      // Check if a binding already exists by querying the relay by transport pubkey
-      // (= x-only pubkey = chainPubkey without the 02/03 prefix).
-      // This finds events in ANY format (old d=hashedNametag and new d=hash(identity:pubkey))
-      // because resolve(64-hex) searches by event author, not by tag.
-      const transportPubkey = this._identity?.chainPubkey?.slice(2);
-      if (transportPubkey && this._transport.resolve) {
+      // Check if a binding already exists via transport.resolve(directAddress).
+      // If yes — skip publish. Only registerNametag() should modify bindings.
+      // Uses _transport.resolve directly because this runs before _initialized = true.
+      if (this._identity?.directAddress && this._transport.resolve) {
         try {
-          const existing = await this._transport.resolve(transportPubkey);
+          const existing = await this._transport.resolve(this._identity.directAddress);
           if (existing) {
             // If existing binding has nametag but local state doesn't — recover it
-            let recoveredNametag = existing.nametag;
-            let fromLegacy = false;
-
-            // Old-format events don't have content.nametag (only encrypted_nametag).
-            // Fall back to recoverNametag() which decrypts encrypted_nametag from any event.
-            if (!recoveredNametag && !this._identity?.nametag && this._transport.recoverNametag) {
-              try {
-                recoveredNametag = await this._transport.recoverNametag() ?? undefined;
-                if (recoveredNametag) fromLegacy = true;
-              } catch {
-                // Decryption failed — continue without nametag
-              }
-            }
-
-            if (recoveredNametag && !this._identity?.nametag) {
-              (this._identity as MutableFullIdentity).nametag = recoveredNametag;
+            if (existing.nametag && !this._identity.nametag) {
+              (this._identity as MutableFullIdentity).nametag = existing.nametag;
               await this._updateCachedProxyAddress();
 
               const entry = await this.ensureAddressTracked(this._currentAddressIndex);
@@ -2948,25 +2906,12 @@ export class Sphere {
                 this._addressNametags.set(entry.addressId, nametags);
               }
               if (!nametags.has(0)) {
-                nametags.set(0, recoveredNametag);
+                nametags.set(0, existing.nametag);
                 await this.persistAddressNametags();
               }
 
-              this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
-
-              // Re-publish in new format only when migrating from legacy event
-              if (fromLegacy) {
-                await this._transport.publishIdentityBinding!(
-                  this._identity!.chainPubkey,
-                  this._identity!.l1Address,
-                  this._identity!.directAddress || '',
-                  recoveredNametag,
-                );
-                console.log(`[Sphere] Migrated legacy binding with nametag @${recoveredNametag}`);
-                return;
-              }
+              this.emitEvent('nametag:recovered', { nametag: existing.nametag });
             }
-
             console.log('[Sphere] Existing binding found, skipping re-publish');
             return;
           }
@@ -3082,7 +3027,6 @@ export class Sphere {
     this._payments.destroy();
     this._communications.destroy();
     this._groupChat?.destroy();
-    this._market?.destroy();
 
     await this._transport.disconnect();
     await this._storage.disconnect();
@@ -3510,15 +3454,9 @@ export class Sphere {
       emitEvent,
     });
 
-    this._market?.initialize({
-      identity: this._identity!,
-      emitEvent,
-    });
-
     await this._payments.load();
     await this._communications.load();
     await this._groupChat?.load();
-    await this._market?.load();
   }
 
   // ===========================================================================

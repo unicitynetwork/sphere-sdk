@@ -36,7 +36,6 @@ import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
-import type { MarketModuleConfig } from '../../modules/market';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
 import { TokenRegistry } from '../../registry';
@@ -44,7 +43,6 @@ import {
   type BaseTransportConfig,
   type BaseOracleConfig,
   type BasePriceConfig,
-  type BaseMarketConfig,
   type L1Config,
   type BrowserTransportExtensions,
   resolveTransportConfig,
@@ -54,7 +52,6 @@ import {
   resolveArrayConfig,
   getNetworkConfig,
   resolveGroupChatConfig,
-  resolveMarketConfig,
 } from '../shared';
 
 // =============================================================================
@@ -182,8 +179,6 @@ export interface BrowserProvidersConfig {
   price?: BasePriceConfig;
   /** Group chat (NIP-29) configuration. true = enable with defaults, object = custom config */
   groupChat?: { enabled?: boolean; relays?: string[] } | boolean;
-  /** Market module configuration. true = enable with defaults, object = custom config */
-  market?: BaseMarketConfig | boolean;
 }
 
 export interface BrowserProviders {
@@ -200,8 +195,6 @@ export interface BrowserProviders {
   ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Group chat config (resolved, for passing to Sphere.init) */
   groupChat?: GroupChatModuleConfig | boolean;
-  /** Market module config (resolved, for passing to Sphere.init) */
-  market?: MarketModuleConfig | boolean;
   /**
    * Token sync configuration (resolved from tokenSync options)
    * For advanced use cases when additional sync backends are needed
@@ -366,9 +359,9 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
   const l1Config = resolveL1Config(network, config?.l1);
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
-  const priceConfig = resolvePriceConfig(config?.price);
 
   const storage = createLocalStorageProvider(config?.storage);
+  const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled
   const ipfsConfig = tokenSyncConfig?.ipfs;
@@ -386,13 +379,9 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const networkConfig = getNetworkConfig(network);
   TokenRegistry.configure({ remoteUrl: networkConfig.tokenRegistryUrl, storage });
 
-  // Resolve market config
-  const market = resolveMarketConfig(config?.market);
-
   return {
     storage,
     groupChat,
-    market,
     transport: createNostrTransportProvider({
       relays: transportConfig.relays,
       timeout: transportConfig.timeout,

@@ -3,19 +3,18 @@
  * Utility functions for resolving provider configurations with extend/override pattern
  */
 
-import { NETWORKS, DEFAULT_AGGREGATOR_API_KEY, DEFAULT_MARKET_API_URL, type NetworkType, type NetworkConfig } from '../../constants';
+import { NETWORKS, DEFAULT_AGGREGATOR_API_KEY, type NetworkType, type NetworkConfig } from '../../constants';
 import type {
   BaseTransportConfig,
   BaseOracleConfig,
   BasePriceConfig,
-  BaseMarketConfig,
   L1Config,
   ResolvedTransportConfig,
   ResolvedOracleConfig,
 } from './config';
 import type { PriceProviderConfig } from '../../price';
+import type { StorageProvider } from '../../storage';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
-import type { MarketModuleConfig } from '../../modules/market';
 
 // =============================================================================
 // Network Resolution
@@ -178,7 +177,8 @@ export function resolveL1Config(
  * ```
  */
 export function resolvePriceConfig(
-  config?: BasePriceConfig
+  config?: BasePriceConfig,
+  storage?: StorageProvider,
 ): PriceProviderConfig | undefined {
   if (config === undefined) {
     return undefined;
@@ -191,6 +191,7 @@ export function resolvePriceConfig(
     cacheTtlMs: config.cacheTtlMs,
     timeout: config.timeout,
     debug: config.debug,
+    storage,
   };
 }
 
@@ -263,29 +264,5 @@ export function resolveGroupChatConfig(
   const netConfig = getNetworkConfig(network);
   return {
     relays: config.relays ?? [...netConfig.groupRelays],
-  };
-}
-
-// =============================================================================
-// Market Resolution
-// =============================================================================
-
-/**
- * Resolve market module configuration.
- * @param config - User-provided market config (true, object, or undefined)
- * @returns Resolved MarketModuleConfig or undefined if disabled
- */
-export function resolveMarketConfig(
-  config?: BaseMarketConfig | boolean,
-): MarketModuleConfig | undefined {
-  if (!config) return undefined;
-
-  if (config === true) {
-    return { apiUrl: DEFAULT_MARKET_API_URL };
-  }
-
-  return {
-    apiUrl: config.apiUrl ?? DEFAULT_MARKET_API_URL,
-    timeout: config.timeout,
   };
 }

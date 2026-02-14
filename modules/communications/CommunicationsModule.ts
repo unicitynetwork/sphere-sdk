@@ -79,33 +79,6 @@ export class CommunicationsModule {
     this.unsubscribeMessages = deps.transport.onMessage((msg) => {
       this.handleIncomingMessage(msg);
     });
-
-    // Subscribe to incoming read receipts
-    if (deps.transport.onReadReceipt) {
-      deps.transport.onReadReceipt((receipt) => {
-        const msg = this.messages.get(receipt.messageEventId);
-        // Only process if this is our own sent message being read by the recipient
-        if (msg && msg.senderPubkey === this.deps!.identity.chainPubkey) {
-          msg.isRead = true;
-          this.save();
-          this.deps!.emitEvent('message:read', {
-            messageIds: [receipt.messageEventId],
-            peerPubkey: receipt.senderTransportPubkey,
-          });
-        }
-      });
-    }
-
-    // Subscribe to incoming typing indicators
-    if (deps.transport.onTypingIndicator) {
-      deps.transport.onTypingIndicator((indicator) => {
-        this.deps!.emitEvent('message:typing', {
-          senderPubkey: indicator.senderTransportPubkey,
-          senderNametag: indicator.senderNametag,
-          timestamp: indicator.timestamp,
-        });
-      });
-    }
   }
 
   /**
@@ -154,8 +127,6 @@ export class CommunicationsModule {
     const eventId = await this.deps!.transport.sendMessage(recipientPubkey, content);
 
     // Create message record
-    // isRead=false for sent messages means "not yet read by recipient".
-    // Set to true when a read receipt arrives.
     const message: DirectMessage = {
       id: eventId,
       senderPubkey: this.deps!.identity.chainPubkey,
@@ -163,7 +134,7 @@ export class CommunicationsModule {
       recipientPubkey,
       content,
       timestamp: Date.now(),
-      isRead: false,
+      isRead: true,
     };
 
     // Save
@@ -226,18 +197,6 @@ export class CommunicationsModule {
     if (this.config.autoSave) {
       await this.save();
     }
-
-    // Send NIP-17 read receipts for incoming messages
-    if (this.config.readReceipts && this.deps?.transport.sendReadReceipt) {
-      for (const id of messageIds) {
-        const msg = this.messages.get(id);
-        if (msg && msg.senderPubkey !== this.deps.identity.chainPubkey) {
-          this.deps.transport.sendReadReceipt(msg.senderPubkey, id).catch((err) => {
-            console.warn('[Communications] Failed to send read receipt:', err);
-          });
-        }
-      }
-    }
   }
 
   /**
@@ -253,16 +212,6 @@ export class CommunicationsModule {
     }
 
     return messages.length;
-  }
-
-  /**
-   * Send typing indicator to a peer
-   */
-  async sendTypingIndicator(peerPubkey: string): Promise<void> {
-    this.ensureInitialized();
-    if (this.deps!.transport.sendTypingIndicator) {
-      await this.deps!.transport.sendTypingIndicator(peerPubkey);
-    }
   }
 
   /**
@@ -349,37 +298,8 @@ export class CommunicationsModule {
   // ===========================================================================
 
   private handleIncomingMessage(msg: IncomingMessage): void {
-    // Self-wrap replay: sent message recovered from relay
-    if (msg.isSelfWrap && msg.recipientTransportPubkey) {
-      // Dedup: skip if already known
-      if (this.messages.has(msg.id)) return;
-
-      const message: DirectMessage = {
-        id: msg.id,
-        senderPubkey: this.deps!.identity.chainPubkey,
-        senderNametag: msg.senderNametag,
-        recipientPubkey: msg.recipientTransportPubkey,
-        content: msg.content,
-        timestamp: msg.timestamp,
-        isRead: false,
-      };
-
-      this.messages.set(message.id, message);
-
-      // Emit as sent message replay (same event, UI can pick it up)
-      this.deps!.emitEvent('message:dm', message);
-
-      if (this.config.autoSave) {
-        this.save();
-      }
-      return;
-    }
-
-    // Skip own messages (non-self-wrap)
+    // Skip own messages
     if (msg.senderTransportPubkey === this.deps?.identity.chainPubkey) return;
-
-    // Dedup: skip if already known
-    if (this.messages.has(msg.id)) return;
 
     const message: DirectMessage = {
       id: msg.id,

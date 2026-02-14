@@ -113,6 +113,7 @@ export class TokenRegistry {
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private lastRefreshAt: number = 0;
   private refreshPromise: Promise<boolean> | null = null;
+  private initialLoadPromise: Promise<boolean> | null = null;
 
   private constructor() {
     this.definitionsById = new Map();
@@ -156,15 +157,11 @@ export class TokenRegistry {
       instance.refreshIntervalMs = options.refreshIntervalMs;
     }
 
-    // Load from cache first (async, fire-and-forget — populates maps ASAP)
-    if (instance.storage) {
-      instance.loadFromCache();
-    }
-
     const autoRefresh = options.autoRefresh ?? true;
-    if (autoRefresh && instance.remoteUrl) {
-      instance.startAutoRefresh();
-    }
+
+    // Perform initial load (cache → remote fallback) and store the promise
+    // so consumers can await readiness via TokenRegistry.waitForReady()
+    instance.initialLoadPromise = instance.performInitialLoad(autoRefresh);
   }
 
   /**
@@ -183,6 +180,63 @@ export class TokenRegistry {
    */
   static destroy(): void {
     TokenRegistry.resetInstance();
+  }
+
+  /**
+   * Wait for the initial data load (cache or remote) to complete.
+   * Returns true if data was loaded, false if not (timeout or no data source).
+   *
+   * @param timeoutMs - Maximum wait time in ms (default: 10s). Set to 0 for no timeout.
+   */
+  static async waitForReady(timeoutMs: number = 10_000): Promise<boolean> {
+    const instance = TokenRegistry.getInstance();
+    if (!instance.initialLoadPromise) {
+      return instance.definitionsById.size > 0;
+    }
+    if (timeoutMs <= 0) {
+      return instance.initialLoadPromise;
+    }
+    return Promise.race([
+      instance.initialLoadPromise,
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+    ]);
+  }
+
+  // ===========================================================================
+  // Initial Load
+  // ===========================================================================
+
+  /**
+   * Perform initial data load: try cache first, fall back to remote fetch.
+   * After initial data is available, start periodic auto-refresh if configured.
+   */
+  private async performInitialLoad(autoRefresh: boolean): Promise<boolean> {
+    // Step 1: Try loading from cache
+    let loaded = false;
+    if (this.storage) {
+      loaded = await this.loadFromCache();
+    }
+
+    if (loaded) {
+      // Cache hit — start auto-refresh in background (includes immediate remote fetch)
+      if (autoRefresh && this.remoteUrl) {
+        this.startAutoRefresh();
+      }
+      return true;
+    }
+
+    // Step 2: Cache miss — wait for first remote fetch (only when auto-refresh is enabled)
+    if (autoRefresh && this.remoteUrl) {
+      loaded = await this.refreshFromRemote();
+      // Start periodic refresh (skip immediate since we just fetched)
+      this.stopAutoRefresh();
+      this.refreshTimer = setInterval(() => {
+        this.refreshFromRemote();
+      }, this.refreshIntervalMs);
+      return loaded;
+    }
+
+    return false;
   }
 
   // ===========================================================================

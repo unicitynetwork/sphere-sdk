@@ -114,8 +114,8 @@ async function configureWithCache(
   // Configure with cache, no auto-refresh
   TokenRegistry.configure({ storage, autoRefresh: false });
 
-  // Wait for loadFromCache (it's fire-and-forget in configure, give it a tick)
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  // Wait for initial load (cache) to complete
+  await TokenRegistry.waitForReady();
 
   return storage;
 }
@@ -154,6 +154,87 @@ describe('TokenRegistry', () => {
       TokenRegistry.resetInstance();
       const instance2 = TokenRegistry.getInstance();
       expect(instance1).not.toBe(instance2);
+    });
+  });
+
+  // ===========================================================================
+  // waitForReady Tests
+  // ===========================================================================
+
+  describe('waitForReady()', () => {
+    it('should return false when configure was never called and registry is empty', async () => {
+      const result = await TokenRegistry.waitForReady();
+      expect(result).toBe(false);
+    });
+
+    it('should return true when data is loaded from cache', async () => {
+      await configureWithCache();
+      const result = await TokenRegistry.waitForReady();
+      expect(result).toBe(true);
+    });
+
+    it('should return true when remote fetch succeeds on cache miss', async () => {
+      const json = JSON.stringify(TEST_DEFINITIONS);
+      vi.spyOn(globalThis, 'fetch').mockImplementation(
+        () => Promise.resolve(new Response(json, { status: 200 })),
+      );
+
+      const storage = createMockStorage();
+      TokenRegistry.configure({
+        remoteUrl: 'https://example.com/registry.json',
+        storage,
+        autoRefresh: true,
+      });
+
+      const result = await TokenRegistry.waitForReady();
+      expect(result).toBe(true);
+
+      const registry = TokenRegistry.getInstance();
+      expect(registry.getDefinition(UCT_COIN_ID)).toBeDefined();
+    });
+
+    it('should respect timeout and return false when loading takes too long', async () => {
+      // Mock fetch that never resolves
+      vi.spyOn(globalThis, 'fetch').mockImplementation(
+        () => new Promise(() => {}), // never resolves
+      );
+
+      const storage = createMockStorage();
+      TokenRegistry.configure({
+        remoteUrl: 'https://example.com/registry.json',
+        storage,
+        autoRefresh: true,
+      });
+
+      const result = await TokenRegistry.waitForReady(50); // 50ms timeout
+      expect(result).toBe(false);
+    });
+
+    it('should wait indefinitely when timeoutMs is 0', async () => {
+      const json = JSON.stringify(TEST_DEFINITIONS);
+      let resolveDelay!: () => void;
+      const delayPromise = new Promise<void>((resolve) => { resolveDelay = resolve; });
+
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+        await delayPromise;
+        return new Response(json, { status: 200 });
+      });
+
+      const storage = createMockStorage();
+      TokenRegistry.configure({
+        remoteUrl: 'https://example.com/registry.json',
+        storage,
+        autoRefresh: true,
+      });
+
+      // Start waiting with no timeout
+      const readyPromise = TokenRegistry.waitForReady(0);
+
+      // Resolve the delayed fetch
+      resolveDelay();
+
+      const result = await readyPromise;
+      expect(result).toBe(true);
     });
   });
 
@@ -826,7 +907,7 @@ describe('StorageProvider Cache', () => {
     await storage.set(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS, String(staleTs));
 
     TokenRegistry.configure({ storage, autoRefresh: false });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await TokenRegistry.waitForReady();
 
     const registry = TokenRegistry.getInstance();
     // Stale cache should not be loaded
@@ -840,7 +921,7 @@ describe('StorageProvider Cache', () => {
     // No timestamp set
 
     TokenRegistry.configure({ storage, autoRefresh: false });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await TokenRegistry.waitForReady();
 
     const registry = TokenRegistry.getInstance();
     expect(registry.getAllDefinitions()).toEqual([]);
@@ -852,7 +933,7 @@ describe('StorageProvider Cache', () => {
     await storage.set(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS, String(Date.now()));
 
     TokenRegistry.configure({ storage, autoRefresh: false });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await TokenRegistry.waitForReady();
 
     const registry = TokenRegistry.getInstance();
     expect(registry.getAllDefinitions()).toEqual([]);
@@ -926,7 +1007,7 @@ describe('StorageProvider Cache', () => {
     // Now simulate a late cache load (by calling loadFromCache via a second configure)
     // The cache has older timestamp, so it should NOT overwrite
     TokenRegistry.configure({ storage, autoRefresh: false });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await TokenRegistry.waitForReady();
 
     // Remote data should still be there (cache didn't overwrite)
     expect(registry.getDefinitionBySymbol('NEW')).toBeDefined();

@@ -786,6 +786,10 @@ export class PaymentsModule {
   async load(): Promise<void> {
     this.ensureInitialized();
 
+    // Ensure token registry has loaded metadata (symbol, name, decimals)
+    // before parsing tokens — otherwise tokens get fallback truncated coinId values
+    await TokenRegistry.waitForReady();
+
     // Load metadata from TokenStorageProviders (archived, tombstones, forked)
     // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
     const providers = this.getTokenStorageProviders();
