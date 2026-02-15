@@ -116,6 +116,7 @@ describe('Sphere Connect Integration', () => {
       }),
       onIntent: vi.fn().mockResolvedValue({ result: { success: true } }),
       ...overrides,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any);
     return host;
   }
@@ -125,6 +126,7 @@ describe('Sphere Connect Integration', () => {
       transport: transports.client,
       dapp: defaultDapp,
       ...overrides,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any);
     return client;
   }
@@ -204,7 +206,7 @@ describe('Sphere Connect Integration', () => {
     });
 
     it('gets assets', async () => {
-      const assets = await client.query(RPC_METHODS.GET_ASSETS);
+      const _assets = await client.query(RPC_METHODS.GET_ASSETS);
       expect(mockSphere.payments.getAssets).toHaveBeenCalled();
     });
 
@@ -233,6 +235,7 @@ describe('Sphere Connect Integration', () => {
     it('resolves nametag', async () => {
       const peer = await client.query(RPC_METHODS.RESOLVE, { identifier: '@bob' });
       expect(mockSphere.resolve).toHaveBeenCalledWith('@bob');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       expect((peer as any).nametag).toBe('bob');
     });
   });

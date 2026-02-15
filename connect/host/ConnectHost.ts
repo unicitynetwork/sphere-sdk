@@ -13,7 +13,6 @@ import type {
   SphereRpcRequest,
   SphereIntentRequest,
   SphereHandshake,
-  DAppMetadata,
   PublicIdentity,
 } from '../protocol';
 import {
@@ -385,7 +384,7 @@ export class ConnectHost {
     return tokens.map((t) => {
       const token = t as Record<string, unknown>;
       // Return all fields except internal sdkData
-      const { sdkData, ...publicFields } = token;
+      const { sdkData: _sdkData, ...publicFields } = token;
       return publicFields;
     });
   }
