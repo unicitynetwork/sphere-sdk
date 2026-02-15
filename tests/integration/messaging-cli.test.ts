@@ -26,6 +26,7 @@ async function runCli(
     const result = await exec(TSX, ['tsx', CLI_PATH, ...args], {
       timeout: options?.timeout ?? 15000,
       env: { ...process.env, NODE_NO_WARNINGS: '1' },
+      shell: process.platform === 'win32',
     });
     return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
   } catch (err: unknown) {

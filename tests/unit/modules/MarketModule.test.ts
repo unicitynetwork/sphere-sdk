@@ -391,9 +391,9 @@ describe('MarketModule', () => {
       const differentSig = secp256k1.sign(differentHash, hexToBytes(identity.privateKey));
 
       // Signatures should be different (proving uniqueness), but both valid format
-      expect(sig).not.toBe(bytesToHex(differentSig));
+      expect(sig).not.toBe(differentSig.toHex());
       expect(sig).toMatch(/^[0-9a-f]{128}$/);
-      expect(bytesToHex(differentSig)).toMatch(/^[0-9a-f]{128}$/);
+      expect(differentSig.toHex()).toMatch(/^[0-9a-f]{128}$/);
     });
 
     it('should include derived public key from private key', async () => {
