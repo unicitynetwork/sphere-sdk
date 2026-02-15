@@ -60,6 +60,10 @@ export const STORAGE_KEYS_GLOBAL = {
   TOKEN_REGISTRY_CACHE: 'token_registry_cache',
   /** Timestamp of last token registry cache update (ms since epoch) */
   TOKEN_REGISTRY_CACHE_TS: 'token_registry_cache_ts',
+  /** Cached price data JSON (from CoinGecko or other provider) */
+  PRICE_CACHE: 'price_cache',
+  /** Timestamp of last price cache update (ms since epoch) */
+  PRICE_CACHE_TS: 'price_cache_ts',
 } as const;
 
 /**
@@ -356,11 +360,14 @@ export const TIMEOUTS = {
 } as const;
 
 // =============================================================================
-// Market API Defaults
+// Sphere Connect
 // =============================================================================
 
-/** Default Market API URL (intent bulletin board) */
-export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network' as const;
+/** Signal sent by wallet popup to dApp when ConnectHost is ready */
+export const HOST_READY_TYPE = 'sphere-connect:host-ready' as const;
+
+/** Default timeout (ms) for waiting for the host-ready signal */
+export const HOST_READY_TIMEOUT = 30_000;
 
 /** Validation limits */
 export const LIMITS = {

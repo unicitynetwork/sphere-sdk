@@ -50,8 +50,8 @@ import {
   resolveL1Config,
   resolvePriceConfig,
   resolveGroupChatConfig,
-  getNetworkConfig,
   resolveMarketConfig,
+  getNetworkConfig,
 } from '../shared';
 
 // =============================================================================
@@ -183,12 +183,12 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   const transportConfig = resolveTransportConfig(network, config?.transport);
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
   const l1Config = resolveL1Config(network, config?.l1);
-  const priceConfig = resolvePriceConfig(config?.price);
 
   const storage = createFileStorageProvider({
     dataDir: config?.dataDir ?? './sphere-data',
     ...(config?.walletFileName ? { fileName: config.walletFileName } : {}),
   });
+  const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled
   const ipfsSync = config?.tokenSync?.ipfs;
@@ -199,12 +199,12 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
 
+  // Resolve market config
+  const market = resolveMarketConfig(config?.market);
+
   // Configure token registry remote refresh with persistent cache
   const networkConfig = getNetworkConfig(network);
   TokenRegistry.configure({ remoteUrl: networkConfig.tokenRegistryUrl, storage });
-
-  // Resolve market config
-  const market = resolveMarketConfig(config?.market);
 
   return {
     storage,

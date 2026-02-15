@@ -213,6 +213,7 @@ export type {
 export {
   MarketModule,
   createMarketModule,
+  DEFAULT_MARKET_API_URL,
 } from './modules/market';
 export type {
   MarketModuleConfig,
@@ -247,8 +248,6 @@ export {
   DEV_AGGREGATOR_URL,
   TEST_AGGREGATOR_URL,
   DEFAULT_AGGREGATOR_TIMEOUT,
-  // Market
-  DEFAULT_MARKET_API_URL,
   // IPFS
   DEFAULT_IPFS_GATEWAYS,
   DEFAULT_IPFS_BOOTSTRAP_PEERS,

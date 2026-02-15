@@ -366,9 +366,9 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
   const l1Config = resolveL1Config(network, config?.l1);
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
-  const priceConfig = resolvePriceConfig(config?.price);
 
   const storage = createLocalStorageProvider(config?.storage);
+  const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled
   const ipfsConfig = tokenSyncConfig?.ipfs;
@@ -382,12 +382,12 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
 
+  // Resolve market config
+  const market = resolveMarketConfig(config?.market);
+
   // Configure token registry remote refresh with persistent cache
   const networkConfig = getNetworkConfig(network);
   TokenRegistry.configure({ remoteUrl: networkConfig.tokenRegistryUrl, storage });
-
-  // Resolve market config
-  const market = resolveMarketConfig(config?.market);
 
   return {
     storage,

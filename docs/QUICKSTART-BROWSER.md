@@ -234,9 +234,6 @@ const providers = createBrowserProviders({
     cacheTtlMs: 60000,        // Cache TTL in ms (default: 60s)
   },
 
-  // Market module (optional — intent bulletin board)
-  market: true,  // or { apiUrl: 'https://market-api.unicity.network', timeout: 30000 }
-
   // Token sync (optional IPFS)
   tokenSync: {
     ipfs: {
@@ -273,7 +270,7 @@ for (const asset of assets) {
 }
 
 // Total portfolio value in USD (null if PriceProvider not configured)
-const totalUsd = await sphere.payments.getFiatBalance();
+const totalUsd = await sphere.payments.getBalance();
 document.getElementById('balance').textContent =
   totalUsd != null ? `$${totalUsd.toFixed(2)}` : 'N/A';
 
@@ -332,18 +329,18 @@ const { sphere } = await Sphere.init({
 
 ```typescript
 // Incoming transfers
-sphere.on('transfer:incoming', (transfer) => {
-  showNotification(`Received ${transfer.tokens.length} token(s) from ${transfer.senderNametag ?? transfer.senderPubkey}`);
+sphere.on('transfer:incoming', (event) => {
+  showNotification(`Received ${event.data.amount} from ${event.data.sender}`);
 });
 
 // Direct messages
 sphere.communications.onDirectMessage((msg) => {
-  showNotification(`Message from ${msg.senderNametag ?? msg.senderPubkey}: ${msg.content}`);
+  showNotification(`Message from ${msg.sender}: ${msg.content}`);
 });
 
 // Connection status
-sphere.on('connection:changed', ({ connected }) => {
-  updateConnectionStatus(connected);
+sphere.on('connection:changed', (event) => {
+  updateConnectionStatus(event.data.connected);
 });
 ```
 
@@ -376,8 +373,8 @@ const { sphere } = await Sphere.init({
 });
 
 // Nametag will be auto-recovered from Nostr if it was registered
-sphere.on('nametag:recovered', ({ nametag }) => {
-  console.log('Recovered nametag:', nametag);
+sphere.on('nametag:recovered', (event) => {
+  console.log('Recovered nametag:', event.data.nametag);
 });
 ```
 
@@ -413,12 +410,12 @@ function WalletApp() {
       setStatus('Connected');
 
       // Load balance (total USD value, null if no PriceProvider)
-      const bal = await sphere.payments.getFiatBalance();
+      const bal = await sphere.payments.getBalance();
       setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
 
       // Listen for incoming
       sphere.on('transfer:incoming', async () => {
-        const newBal = await sphere.payments.getFiatBalance();
+        const newBal = await sphere.payments.getBalance();
         setBalance(newBal != null ? `$${newBal.toFixed(2)}` : 'N/A');
       });
     };
@@ -444,7 +441,7 @@ function WalletApp() {
       setAmount('');
 
       // Refresh balance
-      const bal = await sphere.payments.getFiatBalance();
+      const bal = await sphere.payments.getBalance();
       setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
     } catch (err: any) {
       setStatus('Error: ' + err.message);

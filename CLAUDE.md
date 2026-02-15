@@ -137,11 +137,9 @@ await sphere.destroy();
 | `Sphere.clear({ storage, tokenStorage? })` | `void` | Delete all wallet data |
 | `Sphere.import(options)` | `Sphere` | Import from mnemonic/masterKey |
 | `sphere.payments.getAssets(coinId?)` | `Asset[]` | Get assets grouped by coin |
-| `sphere.payments.getBalance(coinId?)` | `Asset[]` | Assets with confirmed/unconfirmed breakdown |
-| `sphere.payments.getFiatBalance()` | `Promise<number \| null>` | Total USD value (null if no PriceProvider) |
+| `sphere.payments.getBalance()` | `number \| null` | Total USD value |
 | `sphere.payments.getTokens(filter?)` | `Token[]` | Get individual tokens |
 | `sphere.payments.send(request)` | `TransferResult` | Send L3 tokens |
-| `sphere.payments.receive(opts?)` | `Promise<{ transfers }>` | Check for incoming transfers |
 | `sphere.payments.sync()` | `{ added, removed }` | Sync with remote storage |
 | `sphere.payments.validate()` | `{ valid, invalid }` | Validate against aggregator |
 | `sphere.payments.getHistory()` | `TransactionHistoryEntry[]` | Transaction history |
@@ -149,7 +147,7 @@ await sphere.destroy();
 | `sphere.payments.l1.send(request)` | `L1SendResult` | Send L1 transaction |
 | `sphere.payments.l1.getHistory(limit?)` | `L1Transaction[]` | L1 tx history |
 | `sphere.resolve(identifier)` | `PeerInfo \| null` | Resolve @nametag/address/pubkey |
-| `sphere.registerNametag(name)` | `Promise<void>` | Register nametag (mints on-chain) |
+| `sphere.registerNametag(name)` | `void` | Register nametag (mints on-chain) |
 | `sphere.switchToAddress(index)` | `void` | Switch HD address |
 | `sphere.getActiveAddresses()` | `TrackedAddress[]` | Non-hidden tracked addresses |
 | `sphere.on(event, handler)` | `() => void` (unsubscribe) | Subscribe to events |
@@ -205,10 +203,6 @@ sphere-sdk/
 │   │   ├── TokenSplitCalculator.ts
 │   │   ├── TokenSplitExecutor.ts
 │   │   └── NametagMinter.ts       # On-chain nametag minting
-│   ├── market/
-│   │   ├── MarketModule.ts        # Intent bulletin board (buy/sell intents)
-│   │   ├── types.ts               # Market types (PostIntentRequest, etc.)
-│   │   └── index.ts               # Barrel exports + factory
 │   ├── groupchat/
 │   │   ├── GroupChatModule.ts     # NIP-29 group chat (relay-based)
 │   │   ├── types.ts               # GroupData, GroupMessageData, etc.
@@ -260,11 +254,7 @@ sphere-sdk/
 │
 ├── docs/                    # Documentation
 │   ├── API.md              # API reference
-│   ├── INTEGRATION.md      # Integration guide
-│   ├── MARKET.md           # Market module (intent bulletin board)
-│   ├── IPFS-STORAGE.md     # IPFS/IPNS storage provider
-│   ├── QUICKSTART-BROWSER.md # Browser quickstart guide
-│   └── QUICKSTART-NODEJS.md  # Node.js quickstart guide
+│   └── INTEGRATION.md      # Integration guide
 │
 ├── index.ts                 # Main SDK entry point
 ├── constants.ts             # Global constants and defaults
@@ -416,14 +406,32 @@ npm run typecheck
 ### Token Registry (Remote + Cached)
 - `TokenRegistry` is a singleton that provides token metadata (symbol, name, decimals, icons) by coin ID
 - **No bundled data** — starts empty, data comes from remote URL + persistent cache
-- Configured automatically by `createBrowserProviders()` / `createNodeProviders()` via `TokenRegistry.configure({ remoteUrl, storage })`
-- **Data flow:** on `configure()` → load from StorageProvider cache (if fresh) → fetch from remote URL in background → persist to cache on success → repeat every 1 hour
+- Configured in two places due to tsup bundle duplication (see below):
+  - By `createBrowserProviders()` / `createNodeProviders()` — configures the impl bundle's singleton
+  - By `Sphere.init()` / `Sphere.load()` / `Sphere.create()` — configures the main bundle's singleton
+- **Data flow:** on `configure()` → `performInitialLoad()`: try cache first (if fresh) → fall back to remote fetch (if `autoRefresh` is true) → start periodic auto-refresh
+- **Readiness:** `TokenRegistry.waitForReady(timeoutMs?)` — returns a promise that resolves when initial data is loaded (cache or remote). `PaymentsModule.load()` awaits this before parsing tokens to ensure metadata is available.
 - **Graceful degradation:** if no cache and no network, lookup methods return fallbacks (truncated coinId for symbol, 0 for decimals)
 - Remote URL per network: `constants.ts` → `NETWORKS[network].tokenRegistryUrl`
 - Cache keys: `STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE` (JSON) and `TOKEN_REGISTRY_CACHE_TS` (timestamp)
 - Race-safe: cache load skipped if remote data is already newer (`lastRefreshAt > cacheTs`)
 - Concurrent `refreshFromRemote()` calls are deduplicated (only one fetch at a time)
 - `TokenRegistry.destroy()` stops auto-refresh and resets singleton
+
+**tsup bundle duplication note:** tsup compiles multiple entry points (`index.ts`, `impl/browser/index.ts`, etc.) into separate bundles, each inlining its own copy of `TokenRegistry`. The static singleton in `dist/impl/browser/index.js` is a different instance from the one in `dist/index.js`. This is why `Sphere` must call `TokenRegistry.configure()` in its own bundle context, not rely on the factory functions alone.
+
+### Price Provider (CoinGecko)
+- `CoinGeckoPriceProvider` fetches token prices from CoinGecko API with multi-layer caching
+- **In-memory cache:** prices cached with configurable TTL (`cacheTtlMs`, default 60s)
+- **Persistent cache:** when `StorageProvider` is passed, prices are persisted to survive page reloads
+  - Cache keys: `STORAGE_KEYS_GLOBAL.PRICE_CACHE` (JSON) and `PRICE_CACHE_TS` (timestamp)
+  - On first `getPrices()` call: loads from storage if within TTL, populates in-memory cache
+  - After each successful API fetch: saves all cached prices to storage (fire-and-forget)
+  - Factory functions (`createBrowserProviders`, `createNodeProviders`) pass storage automatically
+- **Unlisted tokens:** tokens not found on CoinGecko (e.g., UCT, USDU) are cached with zero-price `TokenPrice` entries (`priceUsd: 0`), persisted to storage, and not re-requested until TTL expires
+- **Request deduplication:** concurrent `getPrices()` calls share an in-flight fetch promise if all requested tokens are covered by the current request
+- **Rate-limit backoff:** on 429 response, extends stale cache entries by 60s to prevent retry hammering
+- **Error resilience:** on fetch failure, returns stale cached data if available; corrupted storage data is silently ignored
 
 ### Event Timestamp Persistence
 - Transport persists last processed wallet event timestamp via `TransportStorageAdapter`
@@ -447,22 +455,18 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 1377 (54 unit/integration test files + 9 E2E/relay test files)
+**Total tests:** 1475 (57 test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
 - `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer, event timestamp persistence
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
-- `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh
-- `tests/unit/modules/MarketModule.test.ts` - Market intent bulletin board
-- `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
+- `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh, waitForReady
+- `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider: caching, deduplication, rate-limit backoff, persistent storage, unlisted tokens
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
 - `tests/unit/l1/L1PaymentsHistory.test.ts` - L1 transaction history direction/amounts
-- `tests/unit/validation/TokenValidator.test.ts` - Token validation
-- `tests/unit/impl/shared/ipfs/*.test.ts` - IPFS/IPNS storage
 - `tests/integration/tracked-addresses.test.ts` - Tracked addresses registry
-- `tests/integration/market-module.test.ts` - Market module integration
 - `tests/relay/groupchat-relay.test.ts` - GroupChat NIP-29 relay integration (Docker + remote)
 
 ### Relay Integration Tests

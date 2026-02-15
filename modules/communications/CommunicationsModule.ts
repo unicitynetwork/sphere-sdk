@@ -87,6 +87,22 @@ export class CommunicationsModule {
     this.unsubscribeComposing = deps.transport.onComposing?.((indicator) => {
       this.handleComposingIndicator(indicator);
     }) ?? null;
+
+    // Subscribe to incoming read receipts
+    if (deps.transport.onReadReceipt) {
+      deps.transport.onReadReceipt((receipt) => {
+        const msg = this.messages.get(receipt.messageEventId);
+        // Only process if this is our own sent message being read by the recipient
+        if (msg && msg.senderPubkey === this.deps!.identity.chainPubkey) {
+          msg.isRead = true;
+          this.save();
+          this.deps!.emitEvent('message:read', {
+            messageIds: [receipt.messageEventId],
+            peerPubkey: receipt.senderTransportPubkey,
+          });
+        }
+      });
+    }
   }
 
   /**
@@ -137,6 +153,8 @@ export class CommunicationsModule {
     const eventId = await this.deps!.transport.sendMessage(recipientPubkey, content);
 
     // Create message record
+    // isRead=false for sent messages means "not yet read by recipient".
+    // Set to true when a read receipt arrives.
     const message: DirectMessage = {
       id: eventId,
       senderPubkey: this.deps!.identity.chainPubkey,
@@ -144,7 +162,7 @@ export class CommunicationsModule {
       recipientPubkey,
       content,
       timestamp: Date.now(),
-      isRead: true,
+      isRead: false,
     };
 
     // Save
@@ -206,6 +224,18 @@ export class CommunicationsModule {
 
     if (this.config.autoSave) {
       await this.save();
+    }
+
+    // Send NIP-17 read receipts for incoming messages
+    if (this.config.readReceipts && this.deps?.transport.sendReadReceipt) {
+      for (const id of messageIds) {
+        const msg = this.messages.get(id);
+        if (msg && msg.senderPubkey !== this.deps.identity.chainPubkey) {
+          this.deps.transport.sendReadReceipt(msg.senderPubkey, id).catch((err) => {
+            console.warn('[Communications] Failed to send read receipt:', err);
+          });
+        }
+      }
     }
   }
 
@@ -333,8 +363,37 @@ export class CommunicationsModule {
   // ===========================================================================
 
   private handleIncomingMessage(msg: IncomingMessage): void {
-    // Skip own messages
+    // Self-wrap replay: sent message recovered from relay
+    if (msg.isSelfWrap && msg.recipientTransportPubkey) {
+      // Dedup: skip if already known
+      if (this.messages.has(msg.id)) return;
+
+      const message: DirectMessage = {
+        id: msg.id,
+        senderPubkey: this.deps!.identity.chainPubkey,
+        senderNametag: msg.senderNametag,
+        recipientPubkey: msg.recipientTransportPubkey,
+        content: msg.content,
+        timestamp: msg.timestamp,
+        isRead: false,
+      };
+
+      this.messages.set(message.id, message);
+
+      // Emit as sent message replay (same event, UI can pick it up)
+      this.deps!.emitEvent('message:dm', message);
+
+      if (this.config.autoSave) {
+        this.save();
+      }
+      return;
+    }
+
+    // Skip own messages (non-self-wrap)
     if (msg.senderTransportPubkey === this.deps?.identity.chainPubkey) return;
+
+    // Dedup: skip if already known
+    if (this.messages.has(msg.id)) return;
 
     const message: DirectMessage = {
       id: msg.id,

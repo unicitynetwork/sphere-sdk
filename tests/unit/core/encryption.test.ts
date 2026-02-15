@@ -16,7 +16,6 @@ import {
   serializeEncrypted,
   deserializeEncrypted,
   generateRandomKey,
-  type EncryptedData,
 } from '../../../core/encryption';
 
 // =============================================================================
@@ -192,18 +191,10 @@ describe('decryptSimple()', () => {
     expect(decrypted).toBe(TEST_PLAINTEXT);
   });
 
-  it('should throw or return wrong data with wrong password', () => {
+  it('should throw with wrong password', () => {
     const encrypted = encryptSimple(TEST_PLAINTEXT, TEST_PASSWORD);
 
-    // CryptoJS with wrong password either throws (empty UTF-8 result)
-    // or produces garbage output — both are acceptable, but the original
-    // plaintext must never be returned.
-    try {
-      const result = decryptSimple(encrypted, 'wrong');
-      expect(result).not.toBe(TEST_PLAINTEXT);
-    } catch {
-      // Threw — also acceptable
-    }
+    expect(() => decryptSimple(encrypted, 'wrong')).toThrow();
   });
 
   it('should handle special characters', () => {

@@ -3,7 +3,7 @@
  * Utility functions for resolving provider configurations with extend/override pattern
  */
 
-import { NETWORKS, DEFAULT_AGGREGATOR_API_KEY, DEFAULT_MARKET_API_URL, type NetworkType, type NetworkConfig } from '../../constants';
+import { NETWORKS, DEFAULT_AGGREGATOR_API_KEY, type NetworkType, type NetworkConfig } from '../../constants';
 import type {
   BaseTransportConfig,
   BaseOracleConfig,
@@ -14,6 +14,7 @@ import type {
   ResolvedOracleConfig,
 } from './config';
 import type { PriceProviderConfig } from '../../price';
+import type { StorageProvider } from '../../storage';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { MarketModuleConfig } from '../../modules/market';
 
@@ -178,7 +179,8 @@ export function resolveL1Config(
  * ```
  */
 export function resolvePriceConfig(
-  config?: BasePriceConfig
+  config?: BasePriceConfig,
+  storage?: StorageProvider,
 ): PriceProviderConfig | undefined {
   if (config === undefined) {
     return undefined;
@@ -191,6 +193,7 @@ export function resolvePriceConfig(
     cacheTtlMs: config.cacheTtlMs,
     timeout: config.timeout,
     debug: config.debug,
+    storage,
   };
 }
 
@@ -279,13 +282,6 @@ export function resolveMarketConfig(
   config?: BaseMarketConfig | boolean,
 ): MarketModuleConfig | undefined {
   if (!config) return undefined;
-
-  if (config === true) {
-    return { apiUrl: DEFAULT_MARKET_API_URL };
-  }
-
-  return {
-    apiUrl: config.apiUrl ?? DEFAULT_MARKET_API_URL,
-    timeout: config.timeout,
-  };
+  if (config === true) return {};
+  return { apiUrl: config.apiUrl, timeout: config.timeout };
 }
