@@ -234,6 +234,7 @@ export class NostrTransportProvider implements TransportProvider {
   // Event handlers
   private processedEventIds = new Set<string>();
   private messageHandlers: Set<MessageHandler> = new Set();
+  private pendingMessages: IncomingMessage[] = [];  // buffer for messages arriving before handlers register
   private transferHandlers: Set<TokenTransferHandler> = new Set();
   private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
   private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
