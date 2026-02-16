@@ -28,6 +28,9 @@ export interface IndexedDBStorageProviderConfig {
 // Implementation
 // =============================================================================
 
+/** Global connection counter for diagnostic tracing */
+let connectionSeq = 0;
+
 export class IndexedDBStorageProvider implements StorageProvider {
   readonly id = 'indexeddb-storage';
   readonly name = 'IndexedDB Storage';
@@ -40,6 +43,8 @@ export class IndexedDBStorageProvider implements StorageProvider {
   private identity: FullIdentity | null = null;
   private status: ProviderStatus = 'disconnected';
   private db: IDBDatabase | null = null;
+  /** Monotonic connection ID for tracing open/close pairs */
+  private connId = 0;
 
   constructor(config?: IndexedDBStorageProviderConfig) {
     this.prefix = config?.prefix ?? 'sphere_';
@@ -59,7 +64,8 @@ export class IndexedDBStorageProvider implements StorageProvider {
     // enough for the browser to finish the deletion.
     for (let attempt = 0; attempt < 2; attempt++) {
       this.status = 'connecting';
-      console.log(`[IndexedDBStorage] connect: opening db=${this.dbName}${attempt > 0 ? ' (retry)' : ''}`);
+      const t0 = Date.now();
+      console.log(`[IndexedDBStorage] connect: opening db=${this.dbName}, attempt=${attempt + 1}/2`);
 
       try {
         this.db = await Promise.race([
@@ -69,11 +75,11 @@ export class IndexedDBStorageProvider implements StorageProvider {
           ),
         ]);
         this.status = 'connected';
-        console.log(`[IndexedDBStorage] connect: connected to db=${this.dbName}`);
+        console.log(`[IndexedDBStorage] connect: connected db=${this.dbName} connId=${this.connId} (${Date.now() - t0}ms)`);
         return;
       } catch (error) {
+        console.warn(`[IndexedDBStorage] connect: open failed db=${this.dbName} attempt=${attempt + 1} (${Date.now() - t0}ms):`, error);
         if (attempt === 0) {
-          console.warn(`[IndexedDBStorage] connect: open failed, retrying in 1s...`);
           this.status = 'disconnected';
           await new Promise((r) => setTimeout(r, 1000));
           continue;
@@ -85,7 +91,8 @@ export class IndexedDBStorageProvider implements StorageProvider {
   }
 
   async disconnect(): Promise<void> {
-    console.log(`[IndexedDBStorage] disconnect: closing db=${this.dbName}, wasConnected=${!!this.db}`);
+    const cid = this.connId;
+    console.log(`[IndexedDBStorage] disconnect: db=${this.dbName} connId=${cid} wasConnected=${!!this.db}`);
     if (this.db) {
       this.db.close();
       this.db = null;
@@ -155,44 +162,47 @@ export class IndexedDBStorageProvider implements StorageProvider {
 
   async clear(prefix?: string): Promise<void> {
     if (!prefix) {
-      // Close connection first (no transactions), then deleteDatabase.
-      // Do NOT clearStore() before close — lingering transactions keep the
-      // connection alive and cause deleteDatabase to fire onblocked.
-      console.log(`[IndexedDBStorage] clear: starting, db=${this.dbName}, wasConnected=${!!this.db}`);
-      if (this.db) {
-        this.db.close();
-        this.db = null;
-      }
-      this.status = 'disconnected';
+      // Clear the object store contents instead of deleteDatabase().
+      // deleteDatabase() gets blocked by leaked IDB connections (e.g. React
+      // StrictMode double-mount starts async init, cleanup destroys the
+      // instance but the first init's connections keep draining in background).
+      // A blocked deleteDatabase also blocks ALL subsequent open() calls,
+      // bricking the wallet until the user refreshes the page.
+      const t0 = Date.now();
+      const prevConnId = this.connId;
+      console.log(`[IndexedDBStorage] clear: starting db=${this.dbName} connId=${prevConnId} status=${this.status} hasDb=${!!this.db}`);
 
-      await new Promise<void>((resolve) => {
-        try {
-          const req = indexedDB.deleteDatabase(this.dbName);
-          // Do NOT resolve on onblocked — the pending deleteDatabase would
-          // block all subsequent open() calls. Wait for onsuccess or timeout.
-          const timer = setTimeout(() => {
-            console.warn(`[IndexedDBStorage] clear: deleteDatabase timed out for db=${this.dbName}`);
-            resolve();
-          }, 5000);
-          req.onsuccess = () => {
-            clearTimeout(timer);
-            console.log(`[IndexedDBStorage] clear: deleted db=${this.dbName}`);
-            resolve();
-          };
-          req.onerror = () => {
-            clearTimeout(timer);
-            console.warn(`[IndexedDBStorage] clear: error deleting db=${this.dbName}`, req.error);
-            resolve();
-          };
-          req.onblocked = () => {
-            console.warn(`[IndexedDBStorage] clear: deleteDatabase blocked for db=${this.dbName}, waiting...`);
-          };
-        } catch {
-          resolve();
+      try {
+        // Ensure we have a connection to clear the store
+        if (!this.db || this.status !== 'connected') {
+          if (this.db) {
+            console.log(`[IndexedDBStorage] clear: closing stale handle connId=${prevConnId}`);
+            this.db.close();
+            this.db = null;
+          }
+          console.log(`[IndexedDBStorage] clear: opening fresh connection for wipe`);
+          this.db = await Promise.race([
+            this.openDatabase(),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('open timed out')), 3000),
+            ),
+          ]);
+          this.status = 'connected';
         }
-      });
 
-      this.log('Database deleted:', this.dbName);
+        // Clear all data from the store — cannot be blocked by other connections
+        await this.idbClear();
+        console.log(`[IndexedDBStorage] clear: store cleared db=${this.dbName} connId=${this.connId} (${Date.now() - t0}ms)`);
+      } catch (err) {
+        console.warn(`[IndexedDBStorage] clear: failed db=${this.dbName} (${Date.now() - t0}ms)`, err);
+      } finally {
+        if (this.db) {
+          this.db.close();
+          this.db = null;
+        }
+        this.status = 'disconnected';
+      }
+
       return;
     }
 
@@ -276,13 +286,30 @@ export class IndexedDBStorageProvider implements StorageProvider {
 
       request.onerror = () => reject(request.error);
 
-      request.onsuccess = () => resolve(request.result);
+      request.onsuccess = () => {
+        const db = request.result;
+        const cid = ++connectionSeq;
+        this.connId = cid;
+
+        // Auto-close when another context requests version change or deletion.
+        // Prevents leaked connections (e.g. React StrictMode double-mount)
+        // from blocking deleteDatabase() or version upgrades.
+        db.onversionchange = () => {
+          console.log(`[IndexedDBStorage] onversionchange: auto-closing db=${this.dbName} connId=${cid}`);
+          db.close();
+          if (this.db === db) {
+            this.db = null;
+            this.status = 'disconnected';
+          }
+        };
+        resolve(db);
+      };
 
       // onblocked fires when another connection (e.g. other tab) holds
       // the database at a lower version. Log it — onsuccess will follow
       // once the other connection closes.
       request.onblocked = () => {
-        console.warn('[IndexedDBStorageProvider] open blocked by another connection');
+        console.warn(`[IndexedDBStorage] open blocked by another connection, db=${this.dbName}`);
       };
 
       request.onupgradeneeded = (event) => {
