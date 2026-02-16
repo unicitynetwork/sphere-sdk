@@ -9,6 +9,9 @@
  * - Per-address key scoping via getFullKey()
  * - saveTrackedAddresses / loadTrackedAddresses
  * - getJSON / setJSON helpers
+ * - clear() with leaked connections (React StrictMode scenario)
+ *   Reproduces the exact bug: leaked IDB connection blocks deleteDatabase(),
+ *   which then blocks all subsequent open() calls — bricking wallet creation.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -173,6 +176,199 @@ describe('IndexedDBStorageProvider', () => {
       expect(await provider.get('foo_a')).toBeNull();
       expect(await provider.get('foo_b')).toBeNull();
       expect(await provider.get('bar_a')).toBe('3');
+    });
+  });
+
+  // =========================================================================
+  // clear() with leaked connections (React StrictMode scenario)
+  //
+  // These tests reproduce the EXACT bug:
+  //   1. React StrictMode double-mount opens two IDB connections
+  //   2. First mount's cleanup calls db.close() but connection drains async
+  //   3. Second mount's "delete wallet" calls clear() → deleteDatabase()
+  //   4. deleteDatabase() fires onblocked, hangs indefinitely
+  //   5. The pending delete also blocks ALL subsequent open() calls
+  //   6. New wallet creation (Sphere.init()) hangs → wallet bricked
+  //
+  // The fix: clear() uses idbClear() (store clearing) instead of
+  // deleteDatabase(). Store clearing is a normal transaction that cannot
+  // be blocked by other connections.
+  // =========================================================================
+
+  describe('clear() with leaked connections (React StrictMode scenario)', () => {
+    it('should clear and reopen despite leaked connection holding the database', async () => {
+      const dbName = `test-leak-${Math.random().toString(36).slice(2)}`;
+
+      // ── Sphere.init() → Sphere.create() ──
+      // First wallet is created: storage.connect() → storage.set(mnemonic, ...)
+      const storage = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      await storage.connect();
+      await storage.set('mnemonic', 'old-wallet-data');
+      await storage.set('masterKey', 'old-master-key');
+      expect(await storage.get('mnemonic')).toBe('old-wallet-data');
+
+      // ── React StrictMode leaked connection ──
+      // StrictMode first mount opens IDB → cleanup closes provider,
+      // but the raw IDB connection drains async and stays alive.
+      // We simulate this by opening a raw IDB connection and NOT closing it.
+      const leakedDb = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(dbName, 1);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+        req.onupgradeneeded = (e) => {
+          const db = (e.target as IDBOpenDBRequest).result;
+          if (!db.objectStoreNames.contains('kv')) {
+            db.createObjectStore('kv', { keyPath: 'k' });
+          }
+        };
+      });
+      // leakedDb is NOT closed — this is the root cause of the bug!
+
+      // ── Sphere.destroy() ──
+      // User clicks "Delete wallet". Sphere.destroy() disconnects providers.
+      await storage.disconnect();
+      expect(storage.isConnected()).toBe(false);
+
+      // ── 50ms yield (from Sphere.clear()) ──
+      await new Promise((r) => setTimeout(r, 50));
+
+      // ── storage.clear() ──
+      // Sphere.clear() reconnects if needed, then clears the store.
+      // BUG: clear() calls deleteDatabase() → blocked by leakedDb → timeout →
+      //      all subsequent open() also blocked → new wallet creation hangs.
+      // FIX: clear() calls idbClear() → works despite leaked connection.
+      await storage.clear();
+      expect(storage.isConnected()).toBe(false);
+
+      // ── Sphere.init() again → Sphere.create() ──
+      // User creates a new wallet. storage.connect() must work.
+      const newStorage = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      await newStorage.connect();
+      expect(newStorage.isConnected()).toBe(true);
+
+      // Old data MUST be gone
+      expect(await newStorage.get('mnemonic')).toBeNull();
+      expect(await newStorage.get('masterKey')).toBeNull();
+
+      // New wallet data is saved
+      await newStorage.set('mnemonic', 'new-wallet-data');
+      await newStorage.set('masterKey', 'new-master-key');
+      expect(await newStorage.get('mnemonic')).toBe('new-wallet-data');
+
+      // Cleanup
+      leakedDb.close();
+      await newStorage.disconnect();
+    });
+
+    it('should survive full init→destroy→clear→init cycle with leaked connection', async () => {
+      const dbName = `test-cycle-${Math.random().toString(36).slice(2)}`;
+
+      // ── First wallet lifecycle ──
+      const wallet1 = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      await wallet1.connect();
+      await wallet1.set('mnemonic', 'first-wallet');
+      await wallet1.set('masterKey', 'first-key');
+
+      // ── Leaked connection (StrictMode first mount's async drain) ──
+      const leaked = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(dbName, 1);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+
+      // ── destroy() first wallet ──
+      await wallet1.disconnect();
+      // leaked is still open!
+
+      // ── 50ms yield ──
+      await new Promise((r) => setTimeout(r, 50));
+
+      // ── clear() via a fresh provider (as Sphere.clear() does) ──
+      const clearer = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      await clearer.connect();
+      await clearer.clear();
+
+      // ── Create second wallet (MUST NOT hang!) ──
+      const wallet2 = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      await wallet2.connect();
+      expect(wallet2.isConnected()).toBe(true);
+
+      // Old data wiped
+      expect(await wallet2.get('mnemonic')).toBeNull();
+      expect(await wallet2.get('masterKey')).toBeNull();
+
+      // New wallet works
+      await wallet2.set('mnemonic', 'second-wallet');
+      expect(await wallet2.get('mnemonic')).toBe('second-wallet');
+
+      leaked.close();
+      await wallet2.disconnect();
+    });
+
+    it('should handle multiple leaked connections simultaneously', async () => {
+      const dbName = `test-multi-leak-${Math.random().toString(36).slice(2)}`;
+
+      // ── Save data ──
+      const storage = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      await storage.connect();
+      await storage.set('data', 'original');
+
+      // ── Create multiple leaked connections (StrictMode rapid re-mounts) ──
+      const leaks: IDBDatabase[] = [];
+      for (let i = 0; i < 3; i++) {
+        const db = await new Promise<IDBDatabase>((resolve, reject) => {
+          const req = indexedDB.open(dbName, 1);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+        leaks.push(db);
+      }
+
+      // ── destroy + clear ──
+      await storage.disconnect();
+      await new Promise((r) => setTimeout(r, 50));
+      await storage.clear();
+
+      // ── Reopen must work despite 3 leaked connections ──
+      const fresh = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      await fresh.connect();
+      expect(fresh.isConnected()).toBe(true);
+      expect(await fresh.get('data')).toBeNull();
+
+      // Cleanup
+      for (const db of leaks) db.close();
+      await fresh.disconnect();
+    });
+
+    it('should clear when provider itself was never connected', async () => {
+      const dbName = `test-cold-clear-${Math.random().toString(36).slice(2)}`;
+
+      // ── Pre-populate the database via a separate connection ──
+      const setup = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      await setup.connect();
+      await setup.set('mnemonic', 'stale-data');
+      await setup.disconnect();
+
+      // ── Leaked connection holding the DB ──
+      const leaked = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(dbName, 1);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+
+      // ── cold clear: new provider that was never connected calls clear() ──
+      // This mimics Sphere.clear() when storage was already disconnected.
+      const coldProvider = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      // NOT calling connect() — clear() must handle this internally
+      await coldProvider.clear();
+
+      // ── Verify data is gone ──
+      const verify = new IndexedDBStorageProvider({ prefix: 'test_', dbName });
+      await verify.connect();
+      expect(await verify.get('mnemonic')).toBeNull();
+
+      leaked.close();
+      await verify.disconnect();
     });
   });
 

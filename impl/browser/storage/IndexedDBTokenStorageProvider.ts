@@ -8,6 +8,10 @@ import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, 
 import type { FullIdentity, ProviderStatus } from '../../../types';
 import { getAddressId } from '../../../constants';
 
+// =============================================================================
+// Configuration
+// =============================================================================
+
 const DB_NAME = 'sphere-token-storage';
 const DB_VERSION = 1;
 const STORE_TOKENS = 'tokens';
@@ -16,7 +20,16 @@ const STORE_META = 'meta';
 export interface IndexedDBTokenStorageConfig {
   /** Database name prefix (default: 'sphere-token-storage') */
   dbNamePrefix?: string;
+  /** Enable debug logging */
+  debug?: boolean;
 }
+
+// =============================================================================
+// Implementation
+// =============================================================================
+
+/** Global connection counter for diagnostic tracing */
+let connectionSeq = 0;
 
 export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfStorageDataBase> {
   readonly id = 'indexeddb-token-storage';
@@ -25,13 +38,17 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
 
   private dbNamePrefix: string;
   private dbName: string;
+  private debug: boolean;
   private db: IDBDatabase | null = null;
   private status: ProviderStatus = 'disconnected';
   private identity: FullIdentity | null = null;
+  /** Monotonic connection ID for tracing open/close pairs */
+  private connId = 0;
 
   constructor(config?: IndexedDBTokenStorageConfig) {
     this.dbNamePrefix = config?.dbNamePrefix ?? DB_NAME;
     this.dbName = this.dbNamePrefix;
+    this.debug = config?.debug ?? false;
   }
 
   setIdentity(identity: FullIdentity): void {
@@ -41,15 +58,17 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       const addressId = getAddressId(identity.directAddress);
       this.dbName = `${this.dbNamePrefix}-${addressId}`;
     }
-    console.log(`[IndexedDBTokenStorage] setIdentity → db=${this.dbName}`);
+    console.log(`[IndexedDBTokenStorage] setIdentity: db=${this.dbName}`);
   }
 
   async initialize(): Promise<boolean> {
+    const prevConnId = this.connId;
+    const t0 = Date.now();
     try {
       // Close any existing connection before opening a new one
       // (e.g. when switching addresses — prevents leaked IDB connections)
       if (this.db) {
-        console.log(`[IndexedDBTokenStorage] initialize: closing existing connection before re-open (db=${this.dbName})`);
+        console.log(`[IndexedDBTokenStorage] initialize: closing existing connId=${prevConnId} before re-open (db=${this.dbName})`);
         this.db.close();
         this.db = null;
       }
@@ -57,17 +76,18 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       console.log(`[IndexedDBTokenStorage] initialize: opening db=${this.dbName}`);
       this.db = await this.openDatabase();
       this.status = 'connected';
-      console.log(`[IndexedDBTokenStorage] initialize: connected to db=${this.dbName}`);
+      console.log(`[IndexedDBTokenStorage] initialize: connected db=${this.dbName} connId=${this.connId} (${Date.now() - t0}ms)`);
       return true;
     } catch (error) {
-      console.error('[IndexedDBTokenStorage] Failed to initialize:', error);
+      console.error(`[IndexedDBTokenStorage] initialize: failed db=${this.dbName} (${Date.now() - t0}ms):`, error);
       this.status = 'error';
       return false;
     }
   }
 
   async shutdown(): Promise<void> {
-    console.log(`[IndexedDBTokenStorage] shutdown: closing db=${this.dbName}, wasConnected=${!!this.db}`);
+    const cid = this.connId;
+    console.log(`[IndexedDBTokenStorage] shutdown: db=${this.dbName} connId=${cid} wasConnected=${!!this.db}`);
     if (this.db) {
       this.db.close();
       this.db = null;
@@ -267,66 +287,42 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   async clear(): Promise<boolean> {
-    // Close connection first (no transactions), then deleteDatabase.
-    // Do NOT clearStore() before close — lingering transactions keep the
-    // connection alive and cause deleteDatabase to fire onblocked.
+    // Uses IDBObjectStore.clear() instead of deleteDatabase().
+    // deleteDatabase() is a schema operation that gets blocked by leaked IDB
+    // connections (React StrictMode, multiple tabs) and leaves a pending delete
+    // that blocks ALL subsequent open() calls, bricking the wallet.
+    // store.clear() is a normal readwrite transaction — cannot be blocked.
+    const t0 = Date.now();
     try {
-      console.log(`[IndexedDBTokenStorage] clear: starting, db=${this.dbName}, wasConnected=${!!this.db}`);
+      // 1. Close own connection
       if (this.db) {
         this.db.close();
         this.db = null;
       }
       this.status = 'disconnected';
 
-      // Collect all databases matching our prefix
-      const dbNames = [this.dbName];
-      if (typeof indexedDB.databases === 'function') {
-        try {
-          const dbs = await Promise.race([
-            indexedDB.databases(),
-            new Promise<IDBDatabaseInfo[]>((_, reject) =>
-              setTimeout(() => reject(new Error('timeout')), 1500),
-            ),
-          ]);
-          for (const dbInfo of dbs) {
-            if (dbInfo.name && dbInfo.name.startsWith(this.dbNamePrefix) && dbInfo.name !== this.dbName) {
-              dbNames.push(dbInfo.name);
-            }
-          }
-        } catch {
-          // Timeout or unsupported
-        }
+      // 2. Collect all databases with our prefix (current + other addresses)
+      const dbNames = new Set<string>([this.dbName]);
+      for (const name of await this.findPrefixedDatabases()) {
+        dbNames.add(name);
       }
 
-      console.log(`[IndexedDBTokenStorage] clear: deleting ${dbNames.length} database(s):`, dbNames);
+      // 3. Clear stores in each database in parallel
+      console.log(`[IndexedDBTokenStorage] clear: clearing ${dbNames.size} database(s) (${[...dbNames].join(', ')})`);
+      const results = await Promise.allSettled(
+        [...dbNames].map((name) => this.clearDatabaseStores(name)),
+      );
 
-      // Delete all databases and wait for completion
-      await Promise.all(dbNames.map((name) =>
-        new Promise<void>((resolve) => {
-          try {
-            const req = indexedDB.deleteDatabase(name);
-            req.onsuccess = () => {
-              console.log(`[IndexedDBTokenStorage] clear: deleted db=${name}`);
-              resolve();
-            };
-            req.onerror = () => {
-              console.warn(`[IndexedDBTokenStorage] clear: error deleting db=${name}`, req.error);
-              resolve();
-            };
-            req.onblocked = () => {
-              console.warn(`[IndexedDBTokenStorage] clear: deleteDatabase blocked for db=${name}`);
-              resolve();
-            };
-          } catch {
-            resolve();
-          }
-        }),
-      ));
+      const failed = results.filter((r) => r.status === 'rejected');
+      if (failed.length > 0) {
+        console.warn(`[IndexedDBTokenStorage] clear: ${failed.length}/${dbNames.size} failed (${Date.now() - t0}ms)`,
+          failed.map((r) => (r as PromiseRejectedResult).reason));
+      }
 
-      console.log(`[IndexedDBTokenStorage] clear: done`);
-      return true;
+      console.log(`[IndexedDBTokenStorage] clear: done ${dbNames.size} database(s) (${Date.now() - t0}ms)`);
+      return failed.length === 0;
     } catch (err) {
-      console.warn('[IndexedDBTokenStorage] clear() failed:', err);
+      console.warn(`[IndexedDBTokenStorage] clear: failed (${Date.now() - t0}ms)`, err);
       return false;
     }
   }
@@ -339,12 +335,31 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(this.dbName, DB_VERSION);
 
-      request.onerror = () => {
-        reject(request.error);
-      };
+      request.onerror = () => reject(request.error);
 
       request.onsuccess = () => {
-        resolve(request.result);
+        const db = request.result;
+        const cid = ++connectionSeq;
+        this.connId = cid;
+
+        // Auto-close when another context requests version change or deletion.
+        // Prevents leaked connections (e.g. React StrictMode double-mount)
+        // from blocking deleteDatabase() or version upgrades.
+        db.onversionchange = () => {
+          console.log(`[IndexedDBTokenStorage] onversionchange: auto-closing db=${this.dbName} connId=${cid}`);
+          db.close();
+          if (this.db === db) {
+            this.db = null;
+            this.status = 'disconnected';
+          }
+        };
+        resolve(db);
+      };
+
+      // onblocked fires when another connection holds the database.
+      // Log it — onsuccess will follow once the other connection closes.
+      request.onblocked = () => {
+        console.warn(`[IndexedDBTokenStorage] open blocked by another connection, db=${this.dbName}`);
       };
 
       request.onupgradeneeded = (event) => {
@@ -432,20 +447,72 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     });
   }
 
-  private clearStore(storeName: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (!this.db) {
-        resolve();
-        return;
+  /**
+   * Find all IndexedDB databases with our prefix.
+   * Returns empty array if indexedDB.databases() is unavailable (older browsers).
+   */
+  private async findPrefixedDatabases(): Promise<string[]> {
+    if (typeof indexedDB.databases !== 'function') return [];
+    try {
+      const allDbs = await Promise.race([
+        indexedDB.databases(),
+        new Promise<IDBDatabaseInfo[]>((_, reject) =>
+          setTimeout(() => reject(new Error('databases() timed out')), 1500),
+        ),
+      ]);
+      return allDbs
+        .map((info) => info.name)
+        .filter((name): name is string => !!name && name.startsWith(this.dbNamePrefix));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Clear all object stores in a single database.
+   * Opens a temporary connection, clears STORE_TOKENS and STORE_META, then closes.
+   * Uses IDBObjectStore.clear() which is a normal readwrite transaction — cannot
+   * be blocked by other connections (unlike deleteDatabase()).
+   */
+  private async clearDatabaseStores(dbName: string): Promise<void> {
+    const db = await Promise.race([
+      new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(dbName, DB_VERSION);
+        req.onerror = () => reject(req.error);
+        req.onsuccess = () => {
+          const db = req.result;
+          db.onversionchange = () => { db.close(); };
+          resolve(db);
+        };
+        req.onupgradeneeded = (event) => {
+          const db = (event.target as IDBOpenDBRequest).result;
+          if (!db.objectStoreNames.contains(STORE_TOKENS)) {
+            db.createObjectStore(STORE_TOKENS, { keyPath: 'id' });
+          }
+          if (!db.objectStoreNames.contains(STORE_META)) {
+            db.createObjectStore(STORE_META);
+          }
+        };
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`open timed out: ${dbName}`)), 3000),
+      ),
+    ]);
+
+    try {
+      for (const storeName of [STORE_TOKENS, STORE_META]) {
+        if (db.objectStoreNames.contains(storeName)) {
+          await new Promise<void>((resolve, reject) => {
+            const tx = db.transaction(storeName, 'readwrite');
+            const req = tx.objectStore(storeName).clear();
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve();
+          });
+        }
       }
-
-      const transaction = this.db.transaction(storeName, 'readwrite');
-      const store = transaction.objectStore(storeName);
-      const request = store.clear();
-
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
-    });
+    } finally {
+      db.close();
+    }
   }
 }
 

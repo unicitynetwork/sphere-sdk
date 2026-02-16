@@ -57,6 +57,14 @@ class VestingClassifier {
 
       request.onsuccess = (event) => {
         this.db = (event.target as IDBOpenDBRequest).result;
+        // Auto-close when another context requests version change or deletion.
+        // Prevents leaked connections from blocking deleteDatabase().
+        this.db.onversionchange = () => {
+          if (this.db) {
+            this.db.close();
+            this.db = null;
+          }
+        };
         resolve();
       };
 
@@ -323,9 +331,16 @@ class VestingClassifier {
     if (typeof indexedDB !== 'undefined') {
       await new Promise<void>((resolve) => {
         const req = indexedDB.deleteDatabase(this.dbName);
-        req.onsuccess = () => resolve();
-        req.onerror = () => resolve();
-        req.onblocked = () => resolve();
+        const timer = setTimeout(() => {
+          console.warn(`[VestingClassifier] destroy: deleteDatabase timed out for ${this.dbName}`);
+          resolve();
+        }, 3000);
+        req.onsuccess = () => { clearTimeout(timer); resolve(); };
+        req.onerror = () => { clearTimeout(timer); resolve(); };
+        req.onblocked = () => {
+          console.warn(`[VestingClassifier] destroy: deleteDatabase blocked for ${this.dbName}, waiting...`);
+          // Do NOT resolve — onversionchange handler on leaked connections should close them.
+        };
       });
     }
   }

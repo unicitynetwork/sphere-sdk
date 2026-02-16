@@ -880,8 +880,7 @@ export class Sphere {
 
     // 3. Yield to let IndexedDB finalize pending transactions after close().
     //    db.close() is synchronous but the connection isn't fully released
-    //    until all in-flight transactions complete. Without this yield,
-    //    deleteDatabase() fires onblocked.
+    //    until all in-flight transactions complete.
     console.log('[Sphere.clear] Yielding 50ms for IDB transaction settlement...');
     await new Promise((r) => setTimeout(r, 50));
 
