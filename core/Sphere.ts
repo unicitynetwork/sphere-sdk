@@ -66,7 +66,6 @@ import { MarketModule, createMarketModule } from '../modules/market';
 import type { MarketModuleConfig } from '../modules/market';
 import {
   STORAGE_KEYS_GLOBAL,
-  STORAGE_KEYS_ADDRESS,
   getAddressId,
   DEFAULT_BASE_PATH,
   DEFAULT_ENCRYPTION_KEY,
@@ -410,20 +409,28 @@ export class Sphere {
    */
   static async exists(storage: StorageProvider): Promise<boolean> {
     try {
-      // Ensure storage is connected before checking
-      if (!storage.isConnected()) {
+      const wasConnected = storage.isConnected();
+      if (!wasConnected) {
         await storage.connect();
       }
 
-      // Check for mnemonic or master_key directly
-      // These are saved with 'default' address before identity is set
-      const mnemonic = await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC);
-      if (mnemonic) return true;
+      try {
+        // Check for mnemonic or master_key directly
+        // These are saved with 'default' address before identity is set
+        const mnemonic = await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC);
+        if (mnemonic) return true;
 
-      const masterKey = await storage.get(STORAGE_KEYS_GLOBAL.MASTER_KEY);
-      if (masterKey) return true;
+        const masterKey = await storage.get(STORAGE_KEYS_GLOBAL.MASTER_KEY);
+        if (masterKey) return true;
 
-      return false;
+        return false;
+      } finally {
+        // Always restore original connection state — callers (create, load,
+        // import) are responsible for connecting storage when they need it.
+        if (!wasConnected) {
+          await storage.disconnect();
+        }
+      }
     } catch {
       return false;
     }
@@ -588,6 +595,11 @@ export class Sphere {
       throw new Error('Wallet already exists. Use Sphere.load() or Sphere.clear() first.');
     }
 
+    // exists() restores original (disconnected) state — reconnect for writes
+    if (!options.storage.isConnected()) {
+      await options.storage.connect();
+    }
+
     // Configure TokenRegistry in main bundle context (see init() for details)
     Sphere.configureTokenRegistry(options.storage, options.network);
 
@@ -670,6 +682,11 @@ export class Sphere {
       marketConfig,
     );
     sphere._password = options.password ?? null;
+
+    // exists() restores original (disconnected) state — reconnect for reads
+    if (!options.storage.isConnected()) {
+      await options.storage.connect();
+    }
 
     // Load identity from storage
     await sphere.loadIdentityFromStorage();
@@ -848,56 +865,55 @@ export class Sphere {
     const storage = 'get' in storageOrOptions ? storageOrOptions as StorageProvider : storageOrOptions.storage;
     const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
 
-    // Ensure storage is connected (may have been disconnected by a previous destroy() cycle)
-    if (!storage.isConnected()) {
-      await storage.connect();
-    }
-
-    // Clear global wallet data
-    console.log('[Sphere.clear] Removing storage keys...');
-    await storage.remove(STORAGE_KEYS_GLOBAL.MNEMONIC);
-    await storage.remove(STORAGE_KEYS_GLOBAL.MASTER_KEY);
-    await storage.remove(STORAGE_KEYS_GLOBAL.CHAIN_CODE);
-    await storage.remove(STORAGE_KEYS_GLOBAL.DERIVATION_PATH);
-    await storage.remove(STORAGE_KEYS_GLOBAL.BASE_PATH);
-    await storage.remove(STORAGE_KEYS_GLOBAL.DERIVATION_MODE);
-    await storage.remove(STORAGE_KEYS_GLOBAL.WALLET_SOURCE);
-    await storage.remove(STORAGE_KEYS_GLOBAL.WALLET_EXISTS);
-    await storage.remove(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
-    await storage.remove(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
-    // Per-address data
-    await storage.remove(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
-    await storage.remove(STORAGE_KEYS_ADDRESS.OUTBOX);
-    console.log('[Sphere.clear] Storage keys removed');
-
-    // Clear token storage if provided (with timeout to prevent IndexedDB deadlock)
-    if (tokenStorage?.clear) {
-      console.log('[Sphere.clear] Clearing token storage...');
-      try {
-        await Promise.race([
-          tokenStorage.clear(),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('tokenStorage.clear() timed out after 2s')), 2000),
-          ),
-        ]);
-        console.log('[Sphere.clear] Token storage cleared');
-      } catch (err) {
-        console.warn('[Sphere.clear] Token storage clear failed/timed out:', err);
-      }
-    }
-
-    // Clear L1 vesting cache
-    console.log('[Sphere.clear] Destroying vesting classifier...');
-    await vestingClassifier.destroy();
-    console.log('[Sphere.clear] Vesting classifier destroyed');
-
+    // 1. Destroy Sphere instance — flushes pending IPFS writes (saves good
+    //    state), then closes all connections. Awaited so IPFS completes
+    //    before we delete databases.
     if (Sphere.instance) {
       console.log('[Sphere.clear] Destroying Sphere instance...');
       await Sphere.instance.destroy();
       console.log('[Sphere.clear] Sphere instance destroyed');
-    } else {
-      console.log('[Sphere.clear] No Sphere instance to destroy');
     }
+
+    // 2. Clear L1 vesting cache
+    console.log('[Sphere.clear] Clearing L1 vesting cache...');
+    await vestingClassifier.destroy();
+
+    // 3. Yield to let IndexedDB finalize pending transactions after close().
+    //    db.close() is synchronous but the connection isn't fully released
+    //    until all in-flight transactions complete. Without this yield,
+    //    deleteDatabase() fires onblocked.
+    console.log('[Sphere.clear] Yielding 50ms for IDB transaction settlement...');
+    await new Promise((r) => setTimeout(r, 50));
+
+    // 4. Delete token databases (sphere-token-storage-*)
+    if (tokenStorage?.clear) {
+      console.log('[Sphere.clear] Clearing token storage...');
+      try {
+        await tokenStorage.clear();
+        console.log('[Sphere.clear] Token storage cleared');
+      } catch (err) {
+        console.warn('[Sphere.clear] Token storage clear failed:', err);
+      }
+    } else {
+      console.log('[Sphere.clear] No token storage provider to clear');
+    }
+
+    // 5. Delete KV database (sphere-storage)
+    console.log('[Sphere.clear] Clearing KV storage...');
+    if (!storage.isConnected()) {
+      try {
+        await storage.connect();
+      } catch {
+        // May fail if database was already deleted — that's fine
+      }
+    }
+    if (storage.isConnected()) {
+      await storage.clear();
+      console.log('[Sphere.clear] KV storage cleared');
+    } else {
+      console.log('[Sphere.clear] KV storage not connected, skipping');
+    }
+    console.log('[Sphere.clear] Done');
   }
 
   /**
@@ -1993,9 +2009,14 @@ export class Sphere {
     this._storage.setIdentity(this._identity);
     await this._transport.setIdentity(this._identity);
 
-    // Update token storage providers and re-open databases for new address
-    for (const provider of this._tokenStorageProviders.values()) {
+    // Close current token storage connections, then re-open for new address.
+    // Shutdown first prevents leaked IDB connections that block deleteDatabase.
+    console.log(`[Sphere] switchToAddress(${index}): re-initializing ${this._tokenStorageProviders.size} token storage provider(s)`);
+    for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
+      console.log(`[Sphere] switchToAddress(${index}): shutdown provider=${providerId}`);
+      await provider.shutdown();
       provider.setIdentity(this._identity);
+      console.log(`[Sphere] switchToAddress(${index}): initialize provider=${providerId}`);
       await provider.initialize();
     }
 
@@ -2096,6 +2117,13 @@ export class Sphere {
     await this._communications.load();
     await this._groupChat?.load();
     await this._market?.load();
+
+    // After loading from local storage, sync with remote (IPFS) to restore
+    // tokens that exist remotely but not locally (e.g. after address switch
+    // where the local IndexedDB is empty but IPFS has the data).
+    this._payments.sync().catch((err) => {
+      console.warn('[Sphere] Post-switch sync failed:', err);
+    });
   }
 
   /**
