@@ -345,6 +345,19 @@ MARKET (Intent Bulletin Board):
   market-feed                         Watch the live listing feed (WebSocket)
                                       --rest              Use REST fallback instead of WebSocket
 
+EVENT DAEMON:
+  daemon start [options]              Start persistent event listener
+                                      --config <path>    Config file (default: .sphere-cli/daemon.json)
+                                      --detach           Run in background (fork, PID file, log redirect)
+                                      --log <path>       Override log file path
+                                      --pid <path>       Override PID file path
+                                      --event <type>     Quick mode: subscribe to event (repeatable)
+                                      --action <spec>    Quick mode: auto-receive, bash:cmd, webhook:url, log:path
+                                      --market-feed      Subscribe to market WebSocket feed
+                                      --verbose          Print full event JSON in logs
+  daemon stop                         Stop running daemon
+  daemon status                       Check if daemon is running
+
 ENCRYPTION:
   encrypt <data> <password>         Encrypt data with password
   decrypt <json> <password>         Decrypt encrypted JSON data
@@ -414,6 +427,15 @@ Market Examples:
   npm run cli -- market-close <id>                                   Close an intent
   npm run cli -- market-feed                                         Watch live feed
   npm run cli -- market-feed --rest                                  Fetch recent (REST fallback)
+
+Daemon Examples:
+  npm run cli -- daemon start --event transfer:incoming --action auto-receive
+  npm run cli -- daemon start --event "transfer:*" --action "webhook:https://example.com/hook" --detach
+  npm run cli -- daemon start --event "*" --action "log:./events.jsonl" --verbose
+  npm run cli -- daemon start --event message:dm --action "bash:echo DM from \\$SPHERE_SENDER"
+  npm run cli -- daemon start --config ./my-daemon.json --detach
+  npm run cli -- daemon status
+  npm run cli -- daemon stop
 `);
 }
 
@@ -2344,6 +2366,27 @@ async function main() {
 
           // Prevent the process from exiting
           await new Promise(() => {});
+        }
+        break;
+      }
+
+      case 'daemon': {
+        const sub = args[1] || 'start';
+        const { runDaemon, stopDaemon, statusDaemon } = await import('./daemon.js');
+        switch (sub) {
+          case 'start':
+            await runDaemon(args.slice(2), getSphere, closeSphere);
+            break;
+          case 'stop':
+            await stopDaemon(args.slice(2));
+            break;
+          case 'status':
+            await statusDaemon(args.slice(2));
+            break;
+          default:
+            console.error(`Unknown daemon sub-command: ${sub}`);
+            console.error('Usage: daemon start|stop|status');
+            process.exit(1);
         }
         break;
       }
