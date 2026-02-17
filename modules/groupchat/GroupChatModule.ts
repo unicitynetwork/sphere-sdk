@@ -366,11 +366,16 @@ export class GroupChatModule {
     const groupIds = Array.from(this.groups.keys());
     if (groupIds.length === 0) return;
 
+    // Use the latest message timestamp across all groups as the `since` floor
+    // so the relay only sends events newer than what we already have.
+    const latestTimestamp = this.getLatestMessageTimestamp(groupIds);
+
     // Subscribe to group messages
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': groupIds,
+        ...(latestTimestamp ? { since: latestTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
@@ -397,10 +402,13 @@ export class GroupChatModule {
   private subscribeToGroup(groupId: string): void {
     if (!this.client) return;
 
+    const latestTimestamp = this.getLatestMessageTimestamp([groupId]);
+
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': [groupId],
+        ...(latestTimestamp ? { since: latestTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
@@ -1262,6 +1270,24 @@ export class GroupChatModule {
 
   getMyPublicKey(): string | null {
     return this.keyManager?.getPublicKeyHex() || null;
+  }
+
+  /**
+   * Returns the latest message timestamp (in Nostr seconds) across the given groups,
+   * or 0 if no messages exist.  Used to set `since` on subscriptions so the relay
+   * only sends events we don't already have.
+   */
+  private getLatestMessageTimestamp(groupIds: string[]): number {
+    let latest = 0;
+    for (const gid of groupIds) {
+      const msgs = this.messages.get(gid);
+      if (!msgs) continue;
+      for (const m of msgs) {
+        const ts = Math.floor(m.timestamp / 1000);
+        if (ts > latest) latest = ts;
+      }
+    }
+    return latest;
   }
 
   // ===========================================================================
