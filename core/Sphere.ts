@@ -1345,17 +1345,14 @@ export class Sphere {
    * });
    * ```
    */
-  static async importFromJSON(options: {
+  static async importFromJSON(options: Omit<SphereImportOptions, 'mnemonic' | 'masterKey' | 'chainCode' | 'derivationPath' | 'basePath' | 'derivationMode'> & {
     jsonContent: string;
     password?: string;
-    storage: StorageProvider;
-    transport: TransportProvider;
-    oracle: OracleProvider;
-    tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
-    l1?: L1Config;
   }): Promise<{ success: boolean; mnemonic?: string; error?: string }> {
+    const { jsonContent, password, ...baseOptions } = options;
+
     try {
-      const data = JSON.parse(options.jsonContent) as WalletJSON;
+      const data = JSON.parse(jsonContent) as WalletJSON;
 
       if (data.version !== '1.0' || data.type !== 'sphere-wallet') {
         return { success: false, error: 'Invalid wallet format' };
@@ -1365,22 +1362,22 @@ export class Sphere {
       let mnemonic = data.mnemonic;
       let masterKey = data.wallet.masterPrivateKey;
 
-      if (data.encrypted && options.password) {
+      if (data.encrypted && password) {
         if (mnemonic) {
-          const decrypted = decryptSimple(mnemonic, options.password);
+          const decrypted = decryptSimple(mnemonic, password);
           if (!decrypted) {
             return { success: false, error: 'Failed to decrypt mnemonic - wrong password?' };
           }
           mnemonic = decrypted;
         }
         if (masterKey) {
-          const decrypted = decryptSimple(masterKey, options.password);
+          const decrypted = decryptSimple(masterKey, password);
           if (!decrypted) {
             return { success: false, error: 'Failed to decrypt master key - wrong password?' };
           }
           masterKey = decrypted;
         }
-      } else if (data.encrypted && !options.password) {
+      } else if (data.encrypted && !password) {
         return { success: false, error: 'Password required for encrypted wallet' };
       }
 
@@ -1391,30 +1388,18 @@ export class Sphere {
 
       // Import using mnemonic if available (preferred)
       if (mnemonic) {
-        await Sphere.import({
-          mnemonic,
-          basePath,
-          storage: options.storage,
-          transport: options.transport,
-          oracle: options.oracle,
-          tokenStorage: options.tokenStorage,
-          l1: options.l1,
-        });
+        await Sphere.import({ ...baseOptions, mnemonic, basePath });
         return { success: true, mnemonic };
       }
 
       // Otherwise import using master key
       if (masterKey) {
         await Sphere.import({
+          ...baseOptions,
           masterKey,
           chainCode: data.wallet.chainCode,
           basePath,
           derivationMode: data.derivationMode || (data.wallet.isBIP32 ? 'bip32' : 'wif_hmac'),
-          storage: options.storage,
-          transport: options.transport,
-          oracle: options.oracle,
-          tokenStorage: options.tokenStorage,
-          l1: options.l1,
         });
         return { success: true };
       }
@@ -1458,7 +1443,7 @@ export class Sphere {
    * });
    * ```
    */
-  static async importFromLegacyFile(options: {
+  static async importFromLegacyFile(options: Omit<SphereImportOptions, 'mnemonic' | 'masterKey' | 'chainCode' | 'derivationPath' | 'basePath' | 'derivationMode'> & {
     /** File content - Uint8Array for .dat, string for .txt */
     fileContent: string | Uint8Array;
     /** File name (used for type detection) */
@@ -1467,18 +1452,6 @@ export class Sphere {
     password?: string;
     /** Progress callback for long decryption operations */
     onDecryptProgress?: DecryptionProgressCallback;
-    /** Storage provider instance */
-    storage: StorageProvider;
-    /** Transport provider instance */
-    transport: TransportProvider;
-    /** Oracle provider instance */
-    oracle: OracleProvider;
-    /** Optional token storage provider */
-    tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
-    /** Optional nametag to register */
-    nametag?: string;
-    /** L1 (ALPHA blockchain) configuration */
-    l1?: L1Config;
   }): Promise<{
     success: boolean;
     sphere?: Sphere;
@@ -1486,7 +1459,7 @@ export class Sphere {
     needsPassword?: boolean;
     error?: string;
   }> {
-    const { fileContent, fileName, password, onDecryptProgress } = options;
+    const { fileContent, fileName, password, onDecryptProgress, ...baseOptions } = options;
 
     // Detect file type
     const fileType = Sphere.detectLegacyFileType(fileName, fileContent);
@@ -1502,16 +1475,7 @@ export class Sphere {
         return { success: false, error: 'Invalid mnemonic phrase' };
       }
 
-      const sphere = await Sphere.import({
-        mnemonic,
-        storage: options.storage,
-        transport: options.transport,
-        oracle: options.oracle,
-        tokenStorage: options.tokenStorage,
-        nametag: options.nametag,
-        l1: options.l1,
-      });
-
+      const sphere = await Sphere.import({ ...baseOptions, mnemonic });
       return { success: true, sphere, mnemonic };
     }
 
@@ -1538,21 +1502,14 @@ export class Sphere {
       }
 
       const { masterKey, chainCode, descriptorPath, derivationMode } = parseResult.data;
-
-      // Build base path from descriptor path
       const basePath = descriptorPath ? `m/${descriptorPath}` : DEFAULT_BASE_PATH;
 
       const sphere = await Sphere.import({
+        ...baseOptions,
         masterKey,
         chainCode,
         basePath,
         derivationMode: derivationMode || (chainCode ? 'bip32' : 'wif_hmac'),
-        storage: options.storage,
-        transport: options.transport,
-        oracle: options.oracle,
-        tokenStorage: options.tokenStorage,
-        nametag: options.nametag,
-        l1: options.l1,
       });
 
       return { success: true, sphere };
@@ -1583,20 +1540,14 @@ export class Sphere {
       }
 
       const { masterKey, chainCode, descriptorPath, derivationMode } = parseResult.data;
-
       const basePath = descriptorPath ? `m/${descriptorPath}` : DEFAULT_BASE_PATH;
 
       const sphere = await Sphere.import({
+        ...baseOptions,
         masterKey,
         chainCode,
         basePath,
         derivationMode: derivationMode || (chainCode ? 'bip32' : 'wif_hmac'),
-        storage: options.storage,
-        transport: options.transport,
-        oracle: options.oracle,
-        tokenStorage: options.tokenStorage,
-        nametag: options.nametag,
-        l1: options.l1,
       });
 
       return { success: true, sphere };
@@ -1618,13 +1569,9 @@ export class Sphere {
       // sphere-wallet format — delegate to importFromJSON
       if (parsed.type === 'sphere-wallet') {
         const result = await Sphere.importFromJSON({
+          ...baseOptions,
           jsonContent: content,
           password,
-          storage: options.storage,
-          transport: options.transport,
-          oracle: options.oracle,
-          tokenStorage: options.tokenStorage,
-          l1: options.l1,
         });
 
         if (result.success) {
@@ -1679,30 +1626,16 @@ export class Sphere {
         : (isBIP32 ? "m/84'/1'/0'" : DEFAULT_BASE_PATH);
 
       if (mnemonic) {
-        const sphere = await Sphere.import({
-          mnemonic,
-          basePath,
-          storage: options.storage,
-          transport: options.transport,
-          oracle: options.oracle,
-          tokenStorage: options.tokenStorage,
-          nametag: options.nametag,
-          l1: options.l1,
-        });
+        const sphere = await Sphere.import({ ...baseOptions, mnemonic, basePath });
         return { success: true, sphere, mnemonic };
       }
 
       const sphere = await Sphere.import({
+        ...baseOptions,
         masterKey,
         chainCode,
         basePath,
         derivationMode: (derivationMode as DerivationMode) || (chainCode ? 'bip32' : 'wif_hmac'),
-        storage: options.storage,
-        transport: options.transport,
-        oracle: options.oracle,
-        tokenStorage: options.tokenStorage,
-        nametag: options.nametag,
-        l1: options.l1,
       });
       return { success: true, sphere };
     }
