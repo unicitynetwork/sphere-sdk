@@ -2507,7 +2507,8 @@ export class Sphere {
       await this.trackScannedAddresses(
         transportResult.addresses.map(a => ({
           index: a.index,
-          hidden: false,
+          // Preserve existing hidden state; default to false for newly discovered
+          hidden: this._trackedAddresses.get(a.index)?.hidden ?? false,
           nametag: a.nametag,
         })),
       );
