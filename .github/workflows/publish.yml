@@ -25,8 +25,6 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Update npm
-        run: npm install -g npm@latest
 
       - name: Validate version format
         run: |
@@ -39,7 +37,7 @@ jobs:
         run: npm version ${{ inputs.version }} --no-git-tag-version
 
       - name: Install dependencies (including optional)
-        run: npm install --include=optional --install-peer-deps
+        run: npm install --include=optional
 
       - name: Run tests
         run: npm run test:run
