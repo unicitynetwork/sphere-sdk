@@ -39,7 +39,7 @@ jobs:
         run: npm version ${{ inputs.version }} --no-git-tag-version
 
       - name: Install dependencies (including optional)
-        run: npm install --include=optional
+        run: npm install --include=optional --install-peer-deps
 
       - name: Run tests
         run: npm run test:run
