@@ -148,13 +148,17 @@ These are different d-tags, so they create **separate** replaceable events. A wa
 
 `publishNametagBinding()` queries the relay before publishing. If the nametag is already claimed by a different pubkey, it throws `"already claimed"`. Same pubkey re-publishing (update) is allowed.
 
+**TOCTOU caveat:** There is a race window between the conflict check and the publish. Another user can claim the same nametag in between. This is inherent to Nostr's eventually-consistent relay model — there is no atomic check-and-publish. The mint-before-publish ordering (see below) provides the real enforcement via on-chain state.
+
 ### Resolution Strategy (query-time)
 
 All query methods (`queryPubkeyByNametag`, `queryBindingByNametag`, `queryBindingByAddress`) use a two-level strategy:
 
-1. **First-seen-wins across authors** — if multiple pubkeys claim the same nametag or address tag, the author who published the earliest `created_at` event wins. Prevents hijacking.
+1. **First-seen-wins across authors** — if multiple pubkeys claim the same nametag or address tag, the author who published the earliest `created_at` event wins. Prevents hijacking. Ties are broken deterministically by lexicographic pubkey comparison (lowest wins).
 
 2. **Latest-wins for same author** — if the rightful owner has multiple events (e.g., initial bare binding + later nametag binding), the most recent event is returned. Ensures the most complete data is returned.
+
+3. **Signature verification** — events with invalid signatures are silently skipped. This prevents malicious relays from injecting forged events to hijack nametag resolution.
 
 This is critical for Path C (register nametag after creation). Address-based lookups find both the old bare binding and the newer nametag binding. Without latest-wins-for-same-author, the stale bare binding (without nametag) would be returned.
 
@@ -167,10 +171,10 @@ This is critical for Path C (register nametag after creation). Address-based loo
 
 ## Privacy
 
-- Nametag is **hashed** in all tags: `SHA256('unicity:nametag:' + name)`
-- Addresses are **hashed** in `t` tags: `SHA256('unicity:address:' + address)`
-- Plaintext nametag only appears inside the content JSON
-- `encrypted_nametag` (AES-GCM) allows the private key owner to recover their nametag
+- Nametag is **hashed** in all indexed tags: `SHA256('unicity:nametag:' + name)` — relay operators see hashes, not plaintext
+- Addresses are **hashed** in `t` tags: `SHA256('unicity:address:' + address)` — same relay-level privacy
+- **Plaintext nametag is stored in event content** (`content.nametag`). This is intentional: nametags must be publicly resolvable for the system to work (sending tokens to `@alice` requires resolving her addresses). The tag hashing provides relay-level indexing privacy, while content is publicly readable for kind 30078 events.
+- `encrypted_nametag` (AES-GCM) is a separate copy encrypted with the author's private key, enabling wallet recovery on import without relying on the plaintext field
 - `pubkey` and `l1` tags contain unhashed values for backward-compatible lookups
 
 ## SDK API

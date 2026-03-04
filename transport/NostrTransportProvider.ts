@@ -20,8 +20,6 @@ import {
   NIP44,
   Event as NostrEventClass,
   EventKinds,
-  hashNametag,
-  hashAddressForTag,
   decryptNametag,
   NostrClient,
   Filter,
@@ -1003,29 +1001,17 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
 
-    // No nametag — publish base identity binding with per-identity d-tag
-    const dTagBytes = new TextEncoder().encode('unicity:identity:' + nostrPubkey);
-    const dTag = Buffer.from(sha256Noble(dTagBytes)).toString('hex');
+    // No nametag — delegate to nostr-js-sdk for base identity binding
+    const success = await this.nostrClient!.publishIdentityBinding({
+      publicKey: chainPubkey,
+      l1Address,
+      directAddress,
+    });
 
-    const contentObj: Record<string, unknown> = {
-      public_key: chainPubkey,
-      l1_address: l1Address,
-      direct_address: directAddress,
-    };
-
-    const tags: string[][] = [
-      ['d', dTag],
-      ['t', hashAddressForTag(chainPubkey)],
-      ['t', hashAddressForTag(directAddress)],
-      ['t', hashAddressForTag(l1Address)],
-    ];
-
-    const content = JSON.stringify(contentObj);
-    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, tags);
-    await this.publishEvent(event);
-
-    logger.debug('Nostr', 'Published identity binding (no Unicity ID) for pubkey:', nostrPubkey.slice(0, 16) + '...');
-    return true;
+    if (success) {
+      logger.debug('Nostr', 'Published identity binding (no Unicity ID) for pubkey:', nostrPubkey.slice(0, 16) + '...');
+    }
+    return success;
   }
 
   // Track broadcast subscriptions

@@ -178,6 +178,7 @@ vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
       queryBindingByAddress: mockQueryBindingByAddress,
       queryPubkeyByNametag: vi.fn().mockResolvedValue(null),
       publishNametagBinding: vi.fn().mockResolvedValue(true),
+      publishIdentityBinding: vi.fn().mockResolvedValue(true),
     })),
   };
 });
@@ -632,7 +633,15 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
     );
 
     expect(success).toBe(true);
-    // Without nametag, it publishes directly via publishEvent (identity-based d-tag)
-    expect(publishedEvents.length).toBeGreaterThan(0);
+    // Without nametag, delegates to nostrClient.publishIdentityBinding()
+    const { NostrClient: mockInstance } = await import('@unicitylabs/nostr-js-sdk');
+    const clientInstance = (mockInstance as any).mock.results[0]?.value;
+    expect(clientInstance.publishIdentityBinding).toHaveBeenCalledWith(
+      expect.objectContaining({
+        publicKey: TEST_COMPRESSED_PUBKEY,
+        l1Address: TEST_L1_ADDRESS,
+        directAddress: TEST_DIRECT_ADDRESS,
+      }),
+    );
   });
 });
