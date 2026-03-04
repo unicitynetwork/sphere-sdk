@@ -116,7 +116,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/unicitylabs/sphere-sdk.git"
+    "url": "https://github.com/unicity-sphere/sphere-sdk.git"
   },
   "dependencies": {
     "@noble/curves": "^2.0.1",
