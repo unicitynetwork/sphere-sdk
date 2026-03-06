@@ -94,7 +94,7 @@ InvoiceTerms (serialized into genesis.data.tokenData)
 
 **Creator identity trust model:** The `creator` field is **self-asserted** — the minter can set it to any pubkey. The aggregator does not verify that `creator` matches the minting key. Applications requiring verified creator identity should use out-of-band verification (e.g., receiving the invoice token directly from the claimed creator via authenticated transport). The `creator` field's purpose is local authorization gating for close/cancel, not identity attestation.
 
-**Privacy limitation of anonymous invoices:** Even when `creator` is omitted, the minting process embeds the minter's signing key in the salt derivation and sets the minter's DirectAddress as the `recipient` in genesis data. The minter's on-chain identity is therefore still discoverable. "Anonymous" means the `creator` field is absent from InvoiceTerms (affecting close/cancel authorization), not that the minter's identity is hidden on-chain.
+**Privacy limitation of anonymous invoices:** Even when `creator` is omitted, the minting process embeds the minter's signing key in the salt derivation and sets the minter's DirectAddress as the `recipient` in genesis data. The minter's on-chain identity is therefore still discoverable. Additionally, the deterministic salt (`SHA-256(signingKey || invoiceBytes)`) enables cross-invoice linkability — an observer can determine if two invoices were created by the same wallet. "Anonymous" means the `creator` field is absent from InvoiceTerms (affecting close/cancel authorization), not that the minter's identity is hidden on-chain.
 
 **Anonymous invoice auto-return restriction:** Auto-return is **disabled** for anonymous invoices. The `autoReturn` option in `closeInvoice()` / `cancelInvoice()` is rejected with `INVOICE_ANON_AUTO_RETURN` for anonymous invoices. `setAutoReturn(invoiceId)` for a specific anonymous invoice throws `INVOICE_ANON_AUTO_RETURN`. `setAutoReturn('*', true)` sets the global flag but **silently skips** anonymous invoices during immediate trigger and ongoing processing (no error thrown). This prevents a malicious holder from cancelling an anonymous invoice to trigger auto-return of all accumulated payments. Targets of anonymous invoices may still manually return tokens via `returnInvoicePayment()` (`:B` direction).
 
@@ -250,7 +250,7 @@ Both inbound and outbound transfers are considered. The scan examines the memo f
 ```
 
 Key transitions:
-- **EXPIRED is not terminal.** An expired invoice can still transition to CLOSED if all targets become fully covered and all related tokens are confirmed after the due date. EXPIRED is only reachable from OPEN or PARTIAL — if the invoice is COVERED (all targets met but unconfirmed), it stays COVERED even after the due date passes, and transitions to CLOSED once confirmed.
+- **EXPIRED is not terminal.** An expired invoice can still transition to COVERED/CLOSED if all targets become fully covered (and confirmed) after the due date. EXPIRED is only reachable when not all targets are covered — if the invoice is COVERED (all targets met but unconfirmed), it stays COVERED even after the due date passes, and transitions to CLOSED once confirmed. Note: EXPIRED takes priority over PARTIAL in the status algorithm — a partially covered invoice past its due date shows EXPIRED, not PARTIAL.
 - **EXPIRED detection is passive.** The `invoice:expired` event fires when `getInvoiceStatus()` is called or when an inbound event triggers recomputation — there is no background timer. If no events arrive and no status queries are made after the due date, the `invoice:expired` event will not fire until the next interaction. Applications requiring prompt expiration notification should poll `getInvoiceStatus()` or set a `setTimeout` based on `dueDate - Date.now()`.
 - **Clock skew.** EXPIRED is a local-only state derived from `Date.now() > dueDate`. Different parties may have different system clocks, so they may disagree on whether an invoice is expired. Implementations SHOULD tolerate up to 60 seconds of clock skew in UI presentation (e.g., showing "expiring soon" rather than hard cutoff). The `dueDate` is a signal, not an enforcement mechanism — there is no on-chain expiration.
 - **CANCELLED is terminal (locally).** Once cancelled, the invoice remains cancelled on the local party's side regardless of subsequent payments. Balances are frozen and persisted. See Section 4.4 for cancellation semantics.
@@ -369,7 +369,7 @@ The accounting module wraps all its inbound event processing in try/catch guards
 **Non-serialized (read-only) operations (with one exception):**
 - `getInvoiceStatus()` — read-only in the common case. However, when it detects an implicit close condition (all targets covered + all confirmed), it acquires the per-invoice gate to freeze balances and persist. Inside the gate, **re-verification is a full recomputation from history** — checking both terminal sets (closedSet/cancelledSet, which may have been modified by a concurrent operation) AND recomputing balances from scratch (which may differ if new transfers arrived). Only if the recomputed state still meets the implicit close condition is the freeze performed. This prevents a race between concurrent implicit close detection and explicit `closeInvoice()`/`cancelInvoice()` calls.
 - `getInvoice()`, `getInvoices()`, `getRelatedTransfers()`
-- `payInvoice()` — only reads terminal state to decide whether to block; the actual `send()` call is delegated to PaymentsModule
+- `payInvoice()` — acquires the gate for the terminal-state check only (released before `send()`). A narrow TOCTOU window exists where a concurrent implicit close can terminate the invoice between gate release and send completion. This is an accepted race — see SPEC §5.9 for full rationale and mitigation via auto-return.
 - `parseInvoiceMemo()`
 
 **Implementation:** A `Map<string, Promise<void>>` keyed by invoice ID. Each mutating operation chains onto the existing promise (or creates a new one). This is a lightweight cooperative lock — no OS-level primitives needed in single-threaded JavaScript. The gate ensures that if two events arrive in rapid succession for the same invoice, the second waits for the first to complete before executing. **Cleanup:** After each operation completes, if no further operations are queued, the gate entry is deleted from the map to prevent unbounded memory growth over thousands of invoices.
@@ -510,8 +510,11 @@ this.accounting = createAccountingModule(
 );
 
 // Load persisted invoice tokens + frozen balances + scan history for pre-existing payments
-// Also performs storage reconciliation (orphaned frozen balances from crash)
-// and crash recovery (pending auto-return ledger entries)
+// Also performs storage reconciliation:
+//   - Forward: orphaned frozen balances (written but not in terminal set) -> add to terminal set
+//   - Inverse: orphaned terminal set entries (in set but no frozen balances) -> recompute and freeze
+// And crash recovery (pending auto-return ledger entries -> retry or mark completed)
+// And ledger pruning (remove completed entries older than 30 days)
 await this.accounting.load();
 
 // Cleanup
@@ -619,16 +622,20 @@ All events with a `confirmed` field follow this contract:
 | `pay_invoice` | Payment modal (pre-filled) | Pay an invoice (sends tokens with memo reference) |
 | `close_invoice` | Confirmation modal | Explicitly close an invoice |
 | `cancel_invoice` | Confirmation modal | Cancel an invoice |
+| `return_invoice_payment` | Return modal | Return tokens for an invoice |
+| `set_auto_return` | Confirmation modal | Enable/disable auto-return |
 
 ### 8.3 New Permission Scopes
 
 | Scope | Grants |
 |-------|--------|
-| `invoices:read` | Read invoice list and status |
+| `invoice:read` | Read invoice list and status |
 | `intent:create_invoice` | Create invoice intent |
 | `intent:pay_invoice` | Pay invoice intent |
 | `intent:close_invoice` | Close invoice intent |
 | `intent:cancel_invoice` | Cancel invoice intent |
+| `intent:return_invoice_payment` | Return invoice payment intent |
+| `intent:set_auto_return` | Set auto-return intent |
 
 ## 9. Multi-Party Perspective
 
@@ -653,7 +660,7 @@ Invoice OPEN
 - The recipient can spend those tokens freely (for other invoices, purchases, etc.) without affecting the current invoice's covered balance.
 - The invoice balance is based on the **memo-referenced transfer history**, not on whether the tokens are still in the wallet.
 - The recipient CAN affect the invoice balance by making new transfers that reference the same invoice:
-  - Forward payment to self (`INV:xxx:F`) — increases balance
+  - Forward payment to self (`INV:xxx:F`) — excluded (self-payments are not counted, see §3.6 rule 3)
   - Return payment (`INV:xxx:B`) — decreases balance
 
 ### 9.3 Payer/Sender View
