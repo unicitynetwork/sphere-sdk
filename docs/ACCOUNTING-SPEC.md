@@ -371,7 +371,7 @@ interface AccountingModuleConfig {
   /**
    * Whether to auto-terminate (close/cancel) the local invoice when
    * receiving an auto-return transfer with :RC or :RX direction.
-   * Default: true.
+   * Default: false (opt-in).
    */
   autoTerminateOnReturn?: boolean;
 }
@@ -509,8 +509,11 @@ class AccountingModule {
    * On close:
    * 1. Current balances are computed one final time and frozen (persisted)
    * 2. Invoice ID is added to the closed set in storage
-   * 3. If autoReturn is true, auto-return is enabled for this invoice
-   * 4. Fires 'invoice:closed' event with { explicit: true }
+   * 3. Fires 'invoice:closed' event with { explicit: true }
+   * 4. If autoReturn is true, auto-return is enabled and triggered immediately:
+   *    - Returns SURPLUS ONLY (amount exceeding requested per target:asset)
+   *    - Uses :RC memo direction
+   *    - Fires 'invoice:auto_returned' for each return executed
    *
    * @param invoiceId - The invoice token ID
    * @param options - Optional: { autoReturn?: boolean } — enable auto-return on close
@@ -528,8 +531,11 @@ class AccountingModule {
    * On cancel:
    * 1. Current balances are computed one final time and frozen (persisted)
    * 2. Invoice ID is added to the cancelled set in storage
-   * 3. If autoReturn is true, auto-return is enabled for this invoice
-   * 4. Fires 'invoice:cancelled' event
+   * 3. Fires 'invoice:cancelled' event
+   * 4. If autoReturn is true, auto-return is enabled and triggered immediately:
+   *    - Returns EVERYTHING (all forward payments received)
+   *    - Uses :RX memo direction
+   *    - Fires 'invoice:auto_returned' for each return executed
    *
    * Anonymous invoices (terms.creator is undefined) cannot be cancelled.
    *
@@ -771,7 +777,7 @@ Step  Action                                SDK Class
  * Distinguishes invoice tokens from currency tokens, nametags, etc.
  */
 const INVOICE_TOKEN_TYPE_HEX =
-  sha256(new TextEncoder().encode('unicity.invoice.v1')).toString('hex');
+  bytesToHex(sha256(new TextEncoder().encode('unicity.invoice.v1')));
 ```
 
 ### 3.4 Canonical Serialization
@@ -928,8 +934,11 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
      a. Extract ALL coin entries from the transferred token's coinData.
         A single token may carry multiple coins (multi-asset token).
      b. For EACH coin entry [coinId, amount] in the token:
-        i.  Determine target match: find target where target.address matches
-            the transfer's destination address
+        i.  Determine target match:
+            - For FORWARD payments (F): match target where target.address matches
+              the transfer's DESTINATION address
+            - For RETURN payments (B, RC, RX): match target where target.address matches
+              the transfer's SENDER address (returns flow FROM target TO payer)
         ii. Determine asset match: find coin asset where coinId matches
         iii. If both match -> accumulate into target/asset status
              - forward payment (F): add amount to coveredAmount
@@ -977,7 +986,7 @@ coveredAmount  = SUM(amount) for all transfers WHERE:
 
 returnedAmount = SUM(amount) for all transfers WHERE:
                  - memo matches INV:<invoiceId>:B or :RC or :RX
-                 - destination matches target.address
+                 - sender matches target.address (returns flow FROM target TO payer)
                  - coinId matches asset.coin[0]
 
 netCoveredAmount = coveredAmount - returnedAmount
@@ -1044,7 +1053,8 @@ The status computation uses the wallet's own transaction history, so each party 
 
 EXPIRED is **informational, not terminal**. When `dueDate` has passed:
 - If the invoice is already CLOSED -> stays CLOSED (terminal)
-- If the invoice is COVERED (all covered but not all confirmed) -> stays COVERED (will transition to CLOSED on confirmation)
+- If the invoice is already CANCELLED -> stays CANCELLED (terminal)
+- If the invoice is COVERED (all covered but not all confirmed) -> stays COVERED (will transition to CLOSED on confirmation). EXPIRED is NOT reachable from COVERED.
 - If the invoice is OPEN or PARTIAL -> becomes EXPIRED
 - An EXPIRED invoice can still transition to CLOSED if all targets become covered and confirmed after expiration
 
@@ -1215,6 +1225,8 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
           -> freeze balances and persist
         - Else -> fire 'invoice:covered' { confirmed: false }
      d. If surplus detected -> fire 'invoice:overpayment'
+     e. If terms.dueDate && now > terms.dueDate && state is OPEN or PARTIAL:
+        -> fire 'invoice:expired' { invoiceId }
 
 On PaymentsModule 'transfer:confirmed':
   1. Check if transfer has invoice memo reference
@@ -1434,6 +1446,7 @@ load():
 | Rule | Error |
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
+| Caller must be the creator or a target owner (terms.creator === identity.chainPubkey OR any target.address matches wallet's directAddress) | `INVOICE_NOT_AUTHORIZED` |
 | Invoice must not already be CLOSED | `INVOICE_ALREADY_CLOSED` |
 | Invoice must not already be CANCELLED | `INVOICE_ALREADY_CANCELLED` |
 
@@ -1596,6 +1609,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_NOT_FOUND` | Invoice token not found | Unknown invoiceId |
 | `INVOICE_ANONYMOUS` | Anonymous invoices cannot be cancelled | Cancel on anonymous |
 | `INVOICE_NOT_CREATOR` | Only the creator can cancel an invoice | Cancel by non-creator |
+| `INVOICE_NOT_AUTHORIZED` | Only the creator or a target owner can close an invoice | Close by unauthorized party |
 | `INVOICE_ALREADY_CLOSED` | Invoice is already closed | Close/cancel after CLOSED |
 | `INVOICE_ALREADY_CANCELLED` | Invoice is already cancelled | Close/cancel after CANCELLED |
 | `INVOICE_ORACLE_REQUIRED` | Oracle provider required for invoice minting | No oracle configured |
@@ -1630,10 +1644,12 @@ Creator                    Aggregator              Payer
    |--- mint commitment ----->|                      |
    |<-- inclusion proof ------|                      |
    | scan history (retroactive)                      |
+   | fire retroactive events if pre-existing payments|
    |                          |                      |
    | send invoice token ---------------------------> |
    |                          |                      | importInvoice(token)
    |                          |                      | scan history (retroactive)
+   |                          |                      | fire retroactive events
    |                          |                      |
    |                          |                      | payInvoice(id, params)
    |<---- token transfer ----------------------------|  (memo: INV:id:F)

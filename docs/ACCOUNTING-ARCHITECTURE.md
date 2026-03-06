@@ -26,24 +26,30 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 +-----------------------------------------------------------------+
 |                         Sphere                                   |
 |                                                                  |
-|  +----------------+   reads    +----------------------------+    |
-|  |  Payments      |<-----------|    AccountingModule         |    |
-|  |  Module        |            |                             |    |
-|  |                |  events    |  - createInvoice()          |    |
-|  |  getHistory()  |----------->|  - getInvoiceStatus()       |    |
-|  |  getTokens()   |            |  - getInvoices()            |    |
-|  |  on(transfer)  |            |  - closeInvoice()           |    |
-|  |                |  send()    |  - cancelInvoice()          |    |
-|  |  send()       |<-----------|  - setAutoReturn()           |    |
-|  +-------+--------+  (auto-   |  - payInvoice()             |    |
-|          |          return)    |  - getRelatedTransfers()    |    |
-|  +-------v--------+            +-------------+---------------+    |
-|  |  Oracle         |            |  TokenStorage (per-address)  |    |
-|  |  (Aggregator)   |<-----------|  - Invoice tokens (TXF)      |    |
-|  |                 |  mint      |  (genesis.data.tokenData      |    |
-|  |                 |            |   contains invoice terms)     |    |
-|  +-----------------+            +------------------------------+    |
-+-----------------------------------------------------------------+
+|  +----------------+   reads    +--------------------------------+  |
+|  |  Payments      |<-----------|    AccountingModule             |  |
+|  |  Module        |            |                                 |  |
+|  |                |  events    |  - createInvoice()              |  |
+|  |  getHistory()  |----------->|  - importInvoice()              |  |
+|  |  getTokens()   |            |  - getInvoice()                 |  |
+|  |  on(transfer)  |            |  - getInvoices()                |  |
+|  |                |  send()    |  - getInvoiceStatus()           |  |
+|  |  send()       |<-----------|  - closeInvoice()               |  |
+|  +-------+--------+  (auto-   |  - cancelInvoice()              |  |
+|          |          return)    |  - payInvoice()                 |  |
+|  +-------v--------+            |  - returnInvoicePayment()       |  |
+|  |  Oracle         |            |  - setAutoReturn()              |  |
+|  |  (Aggregator)   |<-----------|  - getAutoReturnSettings()      |  |
+|  |                 |  mint      |  - getRelatedTransfers()        |  |
+|  |                 |            |  - parseInvoiceMemo()            |  |
+|  +-----------------+            |  - load() / destroy()           |  |
+|                                 +-------------+-------------------+  |
+|                                 |  TokenStorage (per-address)     |  |
+|                                 |  - Invoice tokens (TXF)         |  |
+|                                 |  (genesis.data.tokenData         |  |
+|                                 |   contains invoice terms)        |  |
+|                                 +---------------------------------+  |
++----------------------------------------------------------------------+
 ```
 
 ## 3. Invoice Data Model
@@ -156,8 +162,8 @@ The accounting module must handle this:
 For a given invoice target and asset (e.g., target `DIRECT://alice`, asset `UCT`):
 
 ```
-coveredBalance = sum(forward payments referencing this invoice for this target:asset)
-               - sum(back payments referencing this invoice for this target:asset)
+netCoveredAmount = sum(forward payments referencing this invoice for this target:asset)
+                 - sum(back/return payments referencing this invoice for this target:asset)
 ```
 
 Key rules:
@@ -168,7 +174,7 @@ Key rules:
 
 3. **Self-payments are valid.** A recipient may pay themselves with tokens referencing the given invoice, which increases the respective asset balance. This is a legitimate operation (e.g., consolidating tokens).
 
-4. **Return payments decrease balance.** A return payment (`INV:<id>:B`) decreases the covered balance for the matching target:asset. This handles overpayments, refunds, and corrections. Auto-return payments (`INV:<id>:RC` or `INV:<id>:RX`) also decrease the balance, just like manual `:B` returns.
+4. **Return payments decrease balance.** A return payment (`INV:<id>:B`) decreases the net covered amount for the matching target:asset. This handles overpayments, refunds, and corrections. Auto-return payments (`INV:<id>:RC` or `INV:<id>:RX`) also decrease the balance, just like manual `:B` returns. Note: return payments are matched by **sender** address (returns flow FROM target TO payer), unlike forward payments which are matched by destination address.
 
 5. **Only target parties may send return payments.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`). This is enforced by `returnInvoicePayment()` and the auto-return system.
 
@@ -232,11 +238,11 @@ Both inbound and outbound transfers are considered. The scan examines the memo f
               |           ^        + confirmed
               |           |
               | dueDate passed
-         (from OPEN, PARTIAL, or COVERED)
+         (from OPEN or PARTIAL only)
 ```
 
 Key transitions:
-- **EXPIRED is not terminal.** An expired invoice can still transition to CLOSED if all targets become fully covered and all related tokens are confirmed after the due date.
+- **EXPIRED is not terminal.** An expired invoice can still transition to CLOSED if all targets become fully covered and all related tokens are confirmed after the due date. EXPIRED is only reachable from OPEN or PARTIAL — if the invoice is COVERED (all targets met but unconfirmed), it stays COVERED even after the due date passes, and transitions to CLOSED once confirmed.
 - **CANCELLED is terminal (locally).** Once cancelled, the invoice remains cancelled on the local party's side regardless of subsequent payments. Balances are frozen and persisted. See Section 4.4 for cancellation semantics.
 - **CLOSED is terminal (locally).** Two paths to CLOSED: (1) implicit — all targets covered + all tokens confirmed; (2) explicit — creator calls `closeInvoice()` at any time (satisfied with current payments). Balances are frozen and persisted.
 - **Frozen terminal states.** Once CLOSED or CANCELLED, the frozen balance snapshot is persisted. Dynamic recomputation stops. New transfers referencing the invoice may trigger auto-return but do not change the status.
@@ -306,10 +312,10 @@ Similarly, when enabling auto-return globally (`'*'`), the operation is triggere
 - An invoice target can always explicitly return tokens received for any invoice, including non-terminated ones, using `INV:<id>:B`.
 - Manual return is independent of the auto-return setting.
 
-**Recipient-side auto-termination:**
+**Recipient-side auto-termination (opt-in):**
 - When a party receives an auto-return transfer with `:RC`, their accounting module MAY auto-close the invoice locally.
 - When a party receives an auto-return transfer with `:RX`, their accounting module MAY auto-cancel the invoice locally.
-- This propagation is best-effort and configurable. It provides implicit cross-party termination signaling without requiring an explicit broadcast mechanism.
+- This is **opt-in** — controlled by `autoTerminateOnReturn` config (default: `false`). It provides implicit cross-party termination signaling without requiring an explicit broadcast mechanism.
 
 ### 4.6 Non-Blocking Inbound Guarantee
 
@@ -408,7 +414,7 @@ INV:<invoiceId>[:<direction>] [optional free text]
 
 | Direction | Code | Meaning | Affects balance | Auto-returnable | Who can send |
 |-----------|------|---------|-----------------|-----------------|--------------|
-| Forward | `:F` (or omitted) | Payment towards covering the invoice | +coveredAmount | Yes (if invoice terminated) | Anyone |
+| Forward | `:F` (or omitted) | Payment towards covering the invoice | +coveredAmount (increases net) | Yes (if invoice terminated) | Anyone |
 | Back | `:B` | Manual return/refund | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
 | Return-for-closed | `:RC` | Auto-return because invoice is closed | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
 | Return-for-cancelled | `:RX` | Auto-return because invoice is cancelled | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
@@ -444,13 +450,19 @@ Following the established pattern (`PaymentsModule`, `MarketModule`):
 
 ```typescript
 // In Sphere.ts -- module creation
-this.accounting = createAccountingModule({
-  payments: this.payments,
-  tokenStorage: this.tokenStorage,
-  oracle: this.oracle,
-  identity: this.fullIdentity,
-  emitEvent: (type, data) => this.emit(type, data),
-});
+this.accounting = createAccountingModule(
+  { /* AccountingModuleConfig */
+    autoTerminateOnReturn: false,  // opt-in
+  },
+  { /* AccountingModuleDependencies */
+    payments: this.payments,
+    tokenStorage: this.tokenStorage,
+    oracle: this.oracle,
+    identity: this.fullIdentity,
+    storage: this.storage,
+    emitEvent: (type, data) => this.emit(type, data),
+  }
+);
 
 // Load persisted invoice tokens + frozen balances + scan history for pre-existing payments
 await this.accounting.load();
@@ -495,10 +507,10 @@ Additional per-address storage keys:
 
 | Storage Key | Scope | Content |
 |------------|-------|---------|
-| `{addressId}_cancelled_invoices` | Per-address | Set of cancelled invoice IDs (JSON array) |
-| `{addressId}_closed_invoices` | Per-address | Set of explicitly closed invoice IDs (JSON array) |
-| `{addressId}_frozen_balances` | Per-address | Frozen balance snapshots for terminated invoices (JSON map) |
-| `{addressId}_auto_return` | Per-address | Auto-return settings: per-invoice flags and global flag (JSON) |
+| `sphere_{addressId}_cancelled_invoices` | Per-address | Set of cancelled invoice IDs (JSON array) |
+| `sphere_{addressId}_closed_invoices` | Per-address | Set of explicitly closed invoice IDs (JSON array) |
+| `sphere_{addressId}_frozen_balances` | Per-address | Frozen balance snapshots for terminated invoices (JSON map) |
+| `sphere_{addressId}_auto_return` | Per-address | Auto-return settings: per-invoice flags and global flag (JSON) |
 
 Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`:
 
