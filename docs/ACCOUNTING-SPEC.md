@@ -932,10 +932,18 @@ function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
   // Invoice IDs are always stored and compared in lowercase hex.
   // TokenId.fromData() produces lowercase hex; this normalization ensures
   // that case-insensitive memo input matches storage lookups.
+  // Truncate inbound freeText to 1024 code points. buildInvoiceMemo() caps
+  // outbound at 256, but inbound memos from untrusted senders may be
+  // arbitrarily long. Truncation bounds index cache and event payload size.
+  const rawFreeText = match[3] || undefined;
+  const freeText = rawFreeText
+    ? Array.from(rawFreeText).slice(0, 1024).join('')
+    : undefined;
+
   return {
     invoiceId: match[1].toLowerCase(),
     direction,
-    freeText: match[3] || undefined,
+    freeText,
   };
 }
 ```
@@ -1033,6 +1041,10 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
         the in-memory invoice-transfer index which preserves full coinData
         from the time of initial processing (see §5.4, §7.6 index cache).
      b. For EACH coin entry [coinId, amount] in the token:
+        (Skip coin entries where amount is "0" — they carry no economic value
+         and should not produce InvoiceTransferRef entries, fire events, or
+         consume index cache storage. This prevents low-cost spam via
+         zero-amount transfers.)
         i.  Determine target match:
             - For FORWARD payments (F): match target where target.address matches
               the transfer's DESTINATION address
@@ -1095,6 +1107,8 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
 ```
 
 ### 5.2 Balance Computation Details
+
+**Arithmetic requirement:** All amount fields in invoices and transfers are strings representing non-negative integers (e.g., `"1000000"`). All arithmetic operations (sums, comparisons, differences) MUST use `BigInt` or equivalent arbitrary-precision integer parsing — **never** lexicographic string comparison or floating-point conversion. Amount strings MUST be validated on input: parseable as a non-negative integer, no leading zeros (except `"0"` itself), no whitespace, no decimal points, no sign prefix. Invalid amount strings are rejected with `INVOICE_INVALID_AMOUNT`.
 
 **The core formula for each target:asset:**
 
@@ -1223,7 +1237,11 @@ All state-mutating operations on a given invoice are serialized through a **per-
   over-return is direct fund loss with no automatic recovery. Serialization
   prevents two concurrent returns from both passing the balance check before
   either's send completes. Returns are infrequent, so the blocking cost is
-  acceptable.
+  acceptable. **Timeout:** Implementations SHOULD apply a timeout to the
+  `send()` call within the gate (recommended: 60 seconds). If the timeout
+  fires, release the gate and reject the return with a timeout error. The
+  dedup ledger is NOT written until after send succeeds, so a timed-out
+  return leaves no ledger entry and can be safely retried by the caller.
 
 **Non-serialized** (read-only, with one exception):
 - `getInvoiceStatus()` — read-only in the common case. However, when it detects
@@ -1655,10 +1673,18 @@ interface AutoReturnLedger {
    *
    * **Secondary dedup (defense-in-depth):** Before executing any auto-return
    * send, check `getHistory()` for an existing outbound `:RC`/`:RX` transfer
-   * matching the same `(invoiceId, originalSenderAddress, coinId)`. If found,
+   * whose memo freeText contains the `originalTransferId`. The match tuple is
+   * `(invoiceId, originalTransferId)` — derived by parsing the outbound memo
+   * and extracting the freeText field which auto-return populates with the
+   * original transfer ID (see §4.5 buildInvoiceMemo). If a match is found,
    * skip the send and write the ledger entry as `completed` with the existing
    * return transfer ID. This prevents duplicate returns when ledger entries
    * have been pruned (e.g., Nostr re-delivery after 30+ days offline).
+   *
+   * **Why not (invoiceId, senderAddress, coinId)?** A coarse tuple would
+   * falsely suppress a legitimate second auto-return when the same sender
+   * sends two separate forward payments for the same coinId. The per-transfer
+   * match ensures each forward payment is independently trackable.
    */
   entries: Record<string, AutoReturnLedgerEntry>;
 }
@@ -1761,7 +1787,13 @@ load():
   1. Enumerate tokens from tokenStorage
   2. Filter by tokenType === INVOICE_TOKEN_TYPE_HEX
   3. Parse InvoiceTerms from each token's genesis.data.tokenData
-  4. Load cancelled set, closed set, frozen balances, auto-return settings, and dedup ledger from storage
+  4. Load cancelled set, closed set, frozen balances, auto-return settings, and dedup ledger from storage.
+     **Corruption resilience:** If any storage key fails to parse (JSON.parse throws),
+     treat the value as empty/missing and log a warning. For FROZEN_BALANCES corruption:
+     affected invoices fall through to the inverse reconciliation path (step 4c) which
+     recomputes balances from history. For terminal set corruption: perform a forward
+     scan of FROZEN_BALANCES to rebuild the missing terminal set (each frozen entry
+     contains a `state` field indicating CLOSED or CANCELLED).
   4b. **Storage reconciliation (forward):** Scan FROZEN_BALANCES for any invoiceId
       that exists in frozen balances but NOT in the corresponding terminal set
       (CLOSED_INVOICES or CANCELLED_INVOICES). This handles crash between
@@ -1877,11 +1909,13 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
 | Caller's wallet address must match one of the invoice targets | `INVOICE_NOT_TARGET` |
-| Return amount must not exceed the effective returnable amount for the specified target:coinId. For non-terminal invoices: computed from current history (`netCoveredAmount`). For terminal invoices: `frozenNetCoveredAmount - sum(all post-freeze return transfers for this target:coinId)`, where post-freeze returns are discovered via `getRelatedTransfers()` filtered to `:B`/`:RC`/`:RX` transfers with `timestamp > frozenAt`. This accounts for auto-returns and manual returns that occurred after the balance was frozen. | `INVOICE_RETURN_EXCEEDS_BALANCE` |
+| Return amount must not exceed the effective returnable amount for the specified target:coinId. For non-terminal invoices: computed from current history (`netCoveredAmount`). For terminal invoices: `frozenNetCoveredAmount - sum(all post-freeze return transfers for this target:coinId)`, where post-freeze returns are discovered via `getRelatedTransfers()` filtered to `:B`/`:RC`/`:RX` transfers with `timestamp > frozenAt`. This accounts for auto-returns and manual returns that occurred after the balance was frozen. **Note:** This balance check executes inside the per-invoice gate (§5.9), ensuring the in-memory index read by `getRelatedTransfers()` is consistent — no concurrent return can modify the index between this check and the subsequent `send()`. | `INVOICE_RETURN_EXCEEDS_BALANCE` |
 
 ---
 
 ## 9. Connect Protocol Extensions
+
+**Teardown ordering:** Wallet hosts MUST stop dispatching new Connect RPC calls to the AccountingModule before calling `accounting.destroy()`. In-flight operations that already acquired the per-invoice gate will complete normally (destroy awaits all gate tails), but new operations entering after the `destroyed` flag is set will bail immediately.
 
 ### 9.1 New Query Methods
 
@@ -1911,11 +1945,16 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 // query/intent separation. The side effect only occurs once per invoice
 // (subsequent calls return the frozen snapshot).
 //
-// WALLET HOST GUIDANCE: Auto-return sends triggered by implicit close inside
-// a Connect query are deferred to a background microtask — they do NOT block
-// the query response. Wallet hosts SHOULD rate-limit sphere_getInvoiceStatus
-// calls from dApps (e.g., max 1 call/second per invoiceId) to prevent a
-// malicious dApp from rapidly triggering implicit close across many invoices.
+// WALLET HOST GUIDANCE: When getInvoiceStatus triggers implicit close, the
+// entire operation — including surplus auto-return sends — completes inside
+// the per-invoice gate before the query returns. This ensures atomicity: no
+// other operation can interleave between freeze and auto-return. The Connect
+// query blocks until the full close+auto-return sequence finishes. Wallet
+// hosts SHOULD rate-limit sphere_getInvoiceStatus calls from dApps (e.g.,
+// max 1 call/second per invoiceId) to prevent a malicious dApp from rapidly
+// triggering expensive implicit close across many invoices. Wallet hosts
+// MUST stop accepting new Connect RPC calls before calling
+// accounting.destroy() to avoid in-flight operations racing with teardown.
 {
   method: 'sphere_getInvoiceStatus',
   params: { invoiceId: 'abc123...' }
