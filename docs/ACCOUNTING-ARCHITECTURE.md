@@ -586,7 +586,9 @@ Additional per-address storage keys:
 | `sphere_{addressId}_frozen_balances` | Per-address | Frozen balance snapshots for terminated invoices (JSON map) |
 | `sphere_{addressId}_auto_return` | Per-address | Auto-return settings: per-invoice flags and global flag (JSON) |
 | `sphere_{addressId}_auto_return_ledger` | Per-address | Auto-return deduplication ledger: tracks which transfers have been returned (JSON) |
-| `sphere_{addressId}_invoice_transfer_refs` | Per-address | Invoice-transfer index cache: preserves multi-asset coinData across restarts (JSON) |
+| `sphere_{addressId}_inv_ledger_index` | Per-address | Invoice ledger directory: `Record<invoiceId, { terminated, frozenAt? }>` |
+| `sphere_{addressId}_inv_ledger:{invoiceId}` | Per-address, per-invoice | Partitioned invoice-transfer index: `InvoiceTransferRef[]` for one invoice |
+| `sphere_{addressId}_processed_history_keys` | Per-address | History scan watermark: processed `HistoryRecord.dedupKey` values (JSON array) |
 
 Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`:
 
@@ -596,7 +598,9 @@ CLOSED_INVOICES: 'closed_invoices',
 FROZEN_BALANCES: 'frozen_balances',
 AUTO_RETURN: 'auto_return',
 AUTO_RETURN_LEDGER: 'auto_return_ledger',
-INVOICE_TRANSFER_REFS: 'invoice_transfer_refs',
+// INV_LEDGER prefix: 'inv_ledger:',  // per-invoice partitioned key
+INV_LEDGER_INDEX: 'inv_ledger_index',
+PROCESSED_HISTORY_KEYS: 'processed_history_keys',
 ```
 
 ### 7.5 New Events

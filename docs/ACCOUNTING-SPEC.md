@@ -840,8 +840,8 @@ Step  Action                                SDK Class
 11    Create Token (with or without          Token.mint() or Token.fromJSON()
       verification based on config)
 12    Store token via TokenStorageProvider   tokenStorage.saveToken()
-13    Scan full history for pre-existing     AccountingModule
-      payments referencing this invoice
+13    Scan history for pre-existing payments  AccountingModule
+      via processTransfer() (§5.4.3)
 14    Fire 'invoice:created' event +        emitEvent()
       retroactive payment/coverage events
 ```
@@ -1922,7 +1922,7 @@ AUTO_RETURN_LEDGER: 'auto_return_ledger',
 ```
 createInvoice():
   1. tokenStorage.saveToken(invoiceToken)       // TXF token with InvoiceTerms in tokenData
-  2. Scan full history for pre-existing payments // retroactive evaluation
+  2. Scan history for pre-existing payments     // retroactive via processTransfer() (§5.4.3)
   3. If immediately reaches CLOSED (all covered + all confirmed):
      -> acquire per-invoice gate, re-verify by full recomputation,
         freeze balances and persist to FROZEN_BALANCES,
@@ -1931,7 +1931,7 @@ createInvoice():
 
 importInvoice():
   1. tokenStorage.saveToken(invoiceToken)       // same as any received token
-  2. Scan full history for pre-existing payments // retroactive evaluation
+  2. Scan history for pre-existing payments     // retroactive via processTransfer() (§5.4.3)
   3. If immediately reaches CLOSED:
      -> acquire per-invoice gate, re-verify, freeze balances and persist,
         trigger surplus auto-return if enabled
