@@ -16,6 +16,7 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 | **Local-first accounting** | Each party computes invoice status from its own token inventory — no shared on-chain state, no consensus needed. Status is **never** stored; it is always derived on-demand. |
 | **Memo-referenced balances** | Invoice balances are derived **exclusively** from transaction history entries whose memo references the invoice. Physical token inventory (whether tokens still exist or have been spent further) is irrelevant to invoice accounting. |
 | **Read-only dependency on PaymentsModule** | AccountingModule reads from `PaymentsModule` (getHistory, getTokens, events) but never calls `send()` or modifies payment state directly |
+| **Non-blocking observer** | Accounting errors MUST NEVER break the token transfer flow. Transfers are atomic — they either happen fully or not at all. The accounting module is a side-effect observer that processes transfers after the fact. |
 | **Idempotent event re-firing** | The same event (with the same or updated `confirmed` flag) may fire multiple times for the same underlying transfer. Event consumers MUST be idempotent — handling a re-fired event must produce the same result as handling it once. This is the fundamental contract. |
 
 ## 2. Architecture Diagram
@@ -73,6 +74,7 @@ InvoiceTerms (serialized into genesis.data.tokenData)
 +-- createdAt: number                   // ms timestamp
 +-- dueDate?: number                    // optional deadline (ms timestamp)
 +-- memo?: string                       // free-text or URL
++-- deliveryMethods?: string[]          // ordered list of delivery URLs (highest priority first) -- PLACEHOLDER
 +-- targets: InvoiceTarget[]            // what needs to be paid, to whom
     +-- address: string                 // DIRECT:// address of recipient
     +-- assets: InvoiceRequestedAsset[] // requested assets for this address
@@ -81,6 +83,8 @@ InvoiceTerms (serialized into genesis.data.tokenData)
 ```
 
 **Anonymous invoices:** The `creator` field is optional. Anyone can create an invoice without identifying themselves. When `creator` is omitted, the invoice is anonymous — it cannot be cancelled (cancellation requires creator identity verification), but it can still be paid and closed normally.
+
+**Delivery methods:** The `deliveryMethods` field is an optional ordered list of URLs specifying how payments should be delivered, in priority order (first URL = highest priority). This is a **placeholder** for future use — the current SDK uses the Nostr-based delivery network exclusively. When delivery method support is implemented, a payer should attempt delivery to the first URL, falling back to subsequent URLs on failure.
 
 ### 3.2 Shared Asset Types: CoinEntry and NFTEntry
 
@@ -133,7 +137,17 @@ Invoice status (OPEN, PARTIAL, COVERED, CLOSED, etc.) is a **dynamic property** 
 
 This is a fundamental design principle — there is no state to get out of sync.
 
-### 3.5 Balance Computation Model
+### 3.5 Multi-Asset Tokens
+
+A single token in Unicity can carry **multiple coin entries** in its genesis `coinData` field (e.g., `[["UCT", "500"], ["USDU", "1000"]]`). When such a multi-asset token is transferred with an invoice memo, the transfer covers **multiple assets simultaneously** for the target address.
+
+The accounting module must handle this:
+
+1. **Single transfer, multiple asset updates.** When a transfer carries a token with `coinData = [["UCT", "500"], ["USDU", "1000"]]` and memo `INV:abc:F`, both the UCT and USDU balances for the matching target are updated.
+2. **Per-asset accounting.** Each coin entry in the token's `coinData` is matched independently against the invoice target's requested assets. One coin may match (relevant) while another may not (irrelevant for that target).
+3. **InvoiceTransferRef per coin.** A single transfer involving a multi-asset token produces one `InvoiceTransferRef` per coin entry in the token, each with its own `coinId` and `amount`.
+
+### 3.6 Balance Computation Model
 
 **Invoice balances are derived from transaction history, not token inventory.**
 
@@ -156,7 +170,7 @@ Key rules:
 
 5. **Frozen at terminal states.** Once an invoice reaches CLOSED or CANCELLED, its balances are frozen — no further computation is performed. New transfers referencing a terminated invoice are still recorded but do not affect the terminal status.
 
-### 3.6 History Scanning
+### 3.7 History Scanning
 
 To compute invoice balances, the module scans the **full transaction history** of all active and sent tokens. This includes:
 
@@ -212,9 +226,38 @@ Both inbound and outbound transfers are considered. The scan examines the memo f
 
 Key transitions:
 - **EXPIRED is not terminal.** An expired invoice can still transition to CLOSED if all targets become fully covered and all related tokens are confirmed after the due date.
-- **CANCELLED is terminal.** Once cancelled, the invoice remains cancelled regardless of subsequent payments. Balances are frozen.
-- **CLOSED is terminal.** All targets covered + all tokens confirmed. Balances are frozen.
+- **CANCELLED is terminal (locally).** Once cancelled, the invoice remains cancelled on the local party's side regardless of subsequent payments. Balances are frozen locally. See Section 4.4 for cancellation semantics.
+- **CLOSED is terminal (locally).** All targets covered + all tokens confirmed from this party's perspective. Balances are frozen locally. Other parties may not yet consider this invoice closed.
 - **Frozen terminal states.** Once CLOSED or CANCELLED, no further balance computation occurs. Subsequent transfers referencing the invoice are recorded but do not change the status.
+
+### 4.4 Cancellation and Closure Semantics (Local-Only)
+
+**Cancellation and closure are strictly local operations.** No other party learns about a local cancellation or closure. Each party independently maintains its own view of invoice state.
+
+Key implications:
+
+1. **No broadcast.** There is no mechanism to notify other parties of cancellation or closure. The invoice token remains valid on-chain; only the local state changes.
+
+2. **Outbound payment restriction.** When paying out, the local party MUST NOT reference a locally closed or cancelled invoice. If the local party considers an invoice terminated, it should not create new transfers with `INV:<id>:F` memos for that invoice. This is enforced by the accounting module as a local guard (but does NOT block the underlying token transfer — see Section 4.5).
+
+3. **Auto-return on cancelled invoices.** A recipient who has cancelled an invoice may choose to auto-return all incoming payments referencing it. This is an application-level policy, not enforced by the accounting module itself. The module fires `invoice:payment` events even for cancelled invoices (the transfer still happened), but the application can use this to trigger automatic `INV:<id>:B` return payments.
+
+4. **Perspective divergence.** Your CLOSED does not mean others' CLOSED. Sender and recipient may have different views:
+   - Sender sees CLOSED (all their payments confirmed) while recipient sees PARTIAL (hasn't received all payments yet due to network delay)
+   - Recipient sees CANCELLED locally, but payer doesn't know and keeps sending payments
+
+### 4.5 Non-Blocking Error Guarantee
+
+**Accounting errors MUST NEVER break the token transfer flow.**
+
+Token transfers are atomic — they either happen fully or not at all. The accounting module is a **post-hoc observer** that processes transfers after they complete. Specifically:
+
+- If memo parsing fails, the transfer proceeds normally — accounting just doesn't track it.
+- If invoice lookup fails, the transfer proceeds — `invoice:unknown_reference` fires but the transfer is not affected.
+- If status computation throws, the transfer is already complete — only the event firing is skipped.
+- If storage of accounting data fails, the transfer data is still in `PaymentsModule` history and will be picked up on next recomputation.
+
+The accounting module wraps all its event processing in try/catch guards. No exception from the accounting layer propagates to the payment layer.
 
 ### 4.3 Status Computation
 
@@ -491,15 +534,19 @@ Time 2: Recipient imports invoice token abc
 
 ## 10. Error Handling
 
+**Fundamental rule: accounting errors MUST NOT interrupt token transfers.** All accounting processing is wrapped in try/catch guards. The transfer layer is never blocked or rolled back by accounting failures.
+
 | Error | Handling |
 |-------|---------|
-| Mint failure | Return `{ success: false, error }` — same pattern as `NametagMinter` |
-| Unknown invoice in memo | Fire `invoice:unknown_reference` event — do not block the transfer |
-| Irrelevant payment | Fire `invoice:irrelevant` event — transfer references invoice but doesn't match any target |
+| Mint failure | Return `{ success: false, error }` — same pattern as `NametagMinter`. No transfer is involved. |
+| Unknown invoice in memo | Fire `invoice:unknown_reference` event — transfer proceeds normally |
+| Irrelevant payment | Fire `invoice:irrelevant` event — transfer proceeds normally |
 | Malformed memo | Ignore — treat as a regular transfer with no invoice association |
 | Duplicate invoice | Aggregator rejects with `REQUEST_ID_EXISTS` — use deterministic salt for idempotent re-mint |
 | Token data parsing failure | Log warning, skip — corrupted tokenData does not crash the module |
 | Cancel of anonymous invoice | Reject — anonymous invoices (no `creator` field) cannot be cancelled |
+| Event processing failure | Log error, continue — transfer is already complete, accounting catches up on next recomputation |
+| Status computation failure | Return error to caller — does not affect any transfer in progress |
 
 ## 11. Future Extensions
 

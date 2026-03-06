@@ -98,6 +98,17 @@ interface InvoiceTerms {
   readonly dueDate?: number;
   /** Optional memo — free text or URL describing the reason */
   readonly memo?: string;
+  /**
+   * Optional ordered list of delivery method URLs, highest priority first.
+   *
+   * PLACEHOLDER — not used by the current SDK. The SDK currently uses
+   * the Nostr-based delivery network exclusively. When delivery method
+   * support is implemented, a payer should attempt delivery to the first
+   * URL, falling back to subsequent URLs on failure.
+   *
+   * Examples: ["https://pay.example.com/inv/abc", "wss://relay.example.com"]
+   */
+  readonly deliveryMethods?: string[];
   /** Payment targets — at least one required */
   readonly targets: InvoiceTarget[];
 }
@@ -113,6 +124,11 @@ interface CreateInvoiceRequest {
   readonly dueDate?: number;
   /** Optional memo — free text or URL describing the reason for the invoice */
   readonly memo?: string;
+  /**
+   * Optional ordered list of delivery method URLs, highest priority first.
+   * PLACEHOLDER — not used by current SDK (Nostr delivery only).
+   */
+  readonly deliveryMethods?: string[];
   /**
    * Whether to include the creator's chain pubkey in the invoice terms.
    * Default: true. Set to false to create an anonymous invoice.
@@ -195,6 +211,11 @@ interface InvoiceTargetStatus {
 
 /**
  * Reference to a transfer that contributes to (or is related to) an invoice.
+ *
+ * IMPORTANT: A single token transfer may carry multiple coin entries
+ * (multi-asset tokens). In that case, one InvoiceTransferRef is produced
+ * per coin entry in the token's coinData. They share the same transferId
+ * but have different coinId/amount values.
  */
 interface InvoiceTransferRef {
   /** Transfer/history entry ID */
@@ -203,9 +224,15 @@ interface InvoiceTransferRef {
   readonly direction: 'inbound' | 'outbound';
   /** Invoice payment direction (from memo) */
   readonly paymentDirection: 'forward' | 'back';
-  /** Coin ID of the transferred token */
+  /**
+   * Coin ID for this specific coin entry.
+   * A multi-asset token transfer produces one InvoiceTransferRef per coin.
+   */
   readonly coinId: string;
-  /** Amount transferred (smallest units) */
+  /**
+   * Amount for this specific coin entry (smallest units).
+   * A multi-asset token transfer produces one InvoiceTransferRef per coin.
+   */
   readonly amount: string;
   /** Destination address of the transfer */
   readonly destinationAddress: string;
@@ -596,6 +623,7 @@ function canonicalSerialize(terms: InvoiceTerms): Uint8Array {
   // Within each target, sort assets: coins first (sorted by coinId), then NFTs (sorted by tokenId)
   const sorted: Record<string, unknown> = {
     createdAt: terms.createdAt,
+    deliveryMethods: terms.deliveryMethods ?? null,
     dueDate: terms.dueDate ?? null,
     memo: terms.memo ?? null,
     targets: [...terms.targets]
@@ -697,15 +725,20 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, history):
      Filter for entries where parseInvoiceMemo(entry.memo)?.invoiceId === invoiceId
 
   4. For each matching transfer:
-     a. Determine target match: find target where target.address matches
-        the transfer's destination address
-     b. Determine asset match: find coin asset where coinId matches
-     c. If both match -> accumulate into target/asset status
-        - forward payment: add to coveredAmount
-        - back payment: add to returnedAmount
-     d. If address matches but coinId doesn't -> irrelevant (unknown_asset)
-     e. If coinId matches but address doesn't -> irrelevant (unknown_address)
-     f. If neither matches -> irrelevant (unknown_address_and_asset)
+     a. Extract ALL coin entries from the transferred token's coinData.
+        A single token may carry multiple coins (multi-asset token).
+     b. For EACH coin entry [coinId, amount] in the token:
+        i.  Determine target match: find target where target.address matches
+            the transfer's destination address
+        ii. Determine asset match: find coin asset where coinId matches
+        iii. If both match -> accumulate into target/asset status
+             - forward payment: add amount to coveredAmount
+             - back payment: add amount to returnedAmount
+        iv.  If address matches but coinId doesn't -> irrelevant (unknown_asset)
+        v.   If coinId matches but address doesn't -> irrelevant (unknown_address)
+        vi.  If neither matches -> irrelevant (unknown_address_and_asset)
+     c. Produce one InvoiceTransferRef per coin entry (same transferId,
+        different coinId/amount)
 
   5. Compute per-coin-asset coverage:
      netCovered = coveredAmount - returnedAmount
@@ -756,8 +789,22 @@ surplusAmount    = max(0, netCoveredAmount - asset.coin[1])
 - **Spending tokens is independent.** If Alice receives 500 UCT with memo `INV:abc:F`, then spends that 500 UCT on something else (no `INV:abc` memo), the invoice `abc` still shows 500 UCT covered. The spent token's outbound transfer has no invoice memo, so it doesn't affect the invoice.
 - **Self-payments affect balance.** If a target address owner sends tokens to themselves with memo `INV:abc:F`, the forward payment increases the covered balance. If they send with `INV:abc:B`, it decreases the balance. This is intentional and valid.
 - **Terminal state freeze.** Once CLOSED or CANCELLED, `getInvoiceStatus()` returns the frozen state. New transfers referencing the invoice are still visible via `getRelatedTransfers()` but do not change the status or balances.
+- **Multi-asset tokens.** A single token may carry multiple coin entries (e.g., `coinData = [["UCT", "500"], ["USDU", "1000"]]`). When such a token is transferred with an invoice memo, each coin entry is matched independently against the invoice targets. One transfer of a multi-asset token may cover multiple requested assets for the same target simultaneously.
 
-### 5.3 History Scanning Scope
+### 5.3 Multi-Asset Token Handling
+
+When a transfer involves a multi-asset token:
+
+1. Extract all `[coinId, amount]` pairs from the token's `coinData`.
+2. For each pair, independently match against the invoice target's address and requested assets.
+3. Produce one `InvoiceTransferRef` per coin entry (they share the same `transferId` but have distinct `coinId`/`amount`).
+4. Each coin entry may match a different requested asset, or some may be irrelevant.
+
+Example: A token with `coinData = [["UCT", "500"], ["USDU", "1000"]]` transferred to `DIRECT://alice` with memo `INV:abc:F`:
+- If the invoice target for alice requests UCT and USDU: both are matched as forward payments.
+- If the invoice target for alice only requests UCT: the UCT entry matches, the USDU entry is irrelevant (`unknown_asset`).
+
+### 5.4 History Scanning Scope
 
 The status computation scans the **full transaction history** from `PaymentsModule.getHistory()`. This includes:
 
@@ -767,7 +814,7 @@ The status computation scans the **full transaction history** from `PaymentsModu
 
 This ensures that all memo-referenced transfers are captured regardless of whether the underlying tokens are still in the inventory.
 
-### 5.4 Confirmation Tracking
+### 5.5 Confirmation Tracking
 
 A transfer is `confirmed` if:
 - The token involved has a full proof chain (all `TxfTransaction.inclusionProof` are non-null)
@@ -776,7 +823,7 @@ A transfer is `confirmed` if:
 
 This is determined by checking `TokenStatus === 'confirmed'` for the related tokens in `PaymentsModule.getTokens()`.
 
-### 5.5 Perspective Handling
+### 5.6 Perspective Handling
 
 The same invoice viewed by different parties:
 
@@ -788,7 +835,7 @@ The same invoice viewed by different parties:
 
 The status computation uses the wallet's own transaction history, so each party naturally gets their perspective.
 
-### 5.6 EXPIRED State Semantics
+### 5.7 EXPIRED State Semantics
 
 EXPIRED is **informational, not terminal**. When `dueDate` has passed:
 - If the invoice is already CLOSED -> stays CLOSED (terminal)
@@ -797,6 +844,27 @@ EXPIRED is **informational, not terminal**. When `dueDate` has passed:
 - An EXPIRED invoice can still transition to CLOSED if all targets become covered and confirmed after expiration
 
 This means: due date is a signal to participants, not an enforcement mechanism. The on-chain tokens don't enforce deadlines.
+
+### 5.8 Cancellation and Closure Semantics (Local-Only)
+
+**Cancellation and closure are strictly local.** No other party learns about them.
+
+- **Outbound guard.** The accounting module provides a local guard: when paying out, the caller SHOULD NOT reference a locally closed or cancelled invoice. However, this guard MUST NOT block the underlying token transfer (see Section 5.9). It is advisory — the application layer decides whether to enforce it.
+- **Auto-return policy.** A recipient who has cancelled an invoice may choose to auto-return incoming payments referencing it via `INV:<id>:B` return payments. This is application-level policy, not enforced by the module.
+- **Perspective divergence.** Your CLOSED does not imply others' CLOSED. Different parties have different transaction histories and may compute different states for the same invoice at any given time.
+
+### 5.9 Non-Blocking Error Guarantee
+
+**Accounting errors MUST NEVER break the token transfer flow.**
+
+Token transfers are atomic — they either happen fully or not at all. The accounting module is a post-hoc observer. All event processing is wrapped in try/catch:
+
+- Memo parsing failure -> transfer proceeds, accounting ignores it
+- Invoice lookup failure -> transfer proceeds, `invoice:unknown_reference` fires (best-effort)
+- Status computation error -> transfer already complete, event firing skipped
+- Storage failure -> transfer data persists in PaymentsModule history, accounting catches up on next recomputation
+
+No exception from the accounting layer may propagate to or interrupt the payment layer.
 
 ---
 
@@ -1155,6 +1223,8 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_ALREADY_CANCELLED` | Invoice is already cancelled | Double cancel |
 | `INVOICE_ORACLE_REQUIRED` | Oracle provider required for invoice minting | No oracle configured |
 
+**IMPORTANT:** All error codes above apply to the accounting module's own operations (createInvoice, cancelInvoice, getInvoiceStatus, etc.). Accounting errors during transfer event processing are caught internally and logged — they NEVER propagate to or interrupt the token transfer flow.
+
 ---
 
 ## Appendix A: File Structure
@@ -1254,4 +1324,55 @@ Time 3: Alice receives another 500 UCT with memo INV:abc:F
 
 Time 4: Alice sends 200 UCT back with memo INV:abc:B
         -> Invoice abc: target[alice] UCT covered = 1000, returned = 200, net = 800
+```
+
+## Appendix F: Multi-Asset Token Transfer
+
+```
+Invoice abc:
+  Target: DIRECT://alice
+    - coin: ["UCT", "1000"]
+    - coin: ["USDU", "500"]
+
+Time 1: Payer sends a MULTI-ASSET token with
+        coinData = [["UCT", "600"], ["USDU", "500"]]
+        memo: INV:abc:F
+        destination: DIRECT://alice
+
+        -> AccountingModule extracts both coin entries:
+           - InvoiceTransferRef { transferId: "tx1", coinId: "UCT", amount: "600" }
+           - InvoiceTransferRef { transferId: "tx1", coinId: "USDU", amount: "500" }
+        -> UCT: coveredAmount = 600, net = 600 (needs 1000 -- not yet covered)
+        -> USDU: coveredAmount = 500, net = 500 (needs 500 -- COVERED)
+        -> Fires: invoice:payment (x2, one per coin)
+        -> Fires: invoice:asset_covered for USDU
+        -> State: PARTIAL (UCT still uncovered)
+
+Time 2: Payer sends another token with coinData = [["UCT", "400"]]
+        memo: INV:abc:F
+        -> UCT: coveredAmount = 1000, net = 1000 -- COVERED
+        -> Fires: invoice:asset_covered for UCT
+        -> Fires: invoice:target_covered for alice
+        -> Fires: invoice:covered
+        -> ... all confirmed -> invoice:closed
+```
+
+## Appendix G: Local Cancellation Behavior
+
+```
+Recipient cancels invoice abc locally:
+  -> Fires invoice:cancelled
+  -> Balances frozen (locally)
+  -> Sender does NOT know about cancellation
+
+Sender sends 500 UCT with memo INV:abc:F (unaware of cancellation):
+  -> Token transfer succeeds (accounting NEVER blocks transfers)
+  -> Recipient's AccountingModule sees the transfer
+  -> Invoice is CANCELLED locally -> no balance update, no coverage events
+  -> Transfer is visible via getRelatedTransfers() but status stays CANCELLED
+
+Recipient application-level policy (optional):
+  -> Detect incoming payment on cancelled invoice
+  -> Auto-send return: 500 UCT with memo INV:abc:B
+  -> This is application behavior, NOT enforced by the module
 ```
