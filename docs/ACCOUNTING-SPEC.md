@@ -167,7 +167,7 @@ type InvoiceState = 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'E
  *   coveredAmount = sum of all forward payment amounts referencing this invoice for this target:coinId
  *   returnedAmount = sum of all back/return payment amounts referencing this invoice for this target:coinId
  *                    (includes :B, :RC, and :RX directions)
- *   netCoveredAmount = coveredAmount - returnedAmount
+ *   netCoveredAmount = max(0, coveredAmount - returnedAmount)   // floored at zero
  *
  * Note: These balances reflect memo-referenced transfers only.
  * Whether the underlying tokens are still in the wallet is irrelevant.
@@ -179,7 +179,7 @@ interface InvoiceCoinAssetStatus {
   readonly coveredAmount: string;
   /** Total back/return payments for this asset (smallest units, includes :B, :RC, :RX) */
   readonly returnedAmount: string;
-  /** Net covered = coveredAmount - returnedAmount */
+  /** Net covered = max(0, coveredAmount - returnedAmount), floored at zero */
   readonly netCoveredAmount: string;
   /** Whether requested amount is fully met (netCovered >= requested) */
   readonly isCovered: boolean;
@@ -336,7 +336,7 @@ interface GetInvoicesOptions {
   readonly limit?: number;
   /** Offset for pagination */
   readonly offset?: number;
-  /** Sort order */
+  /** Sort order. When sortBy is 'dueDate', invoices without a dueDate sort last (null-last). */
   readonly sortBy?: 'createdAt' | 'dueDate';
   readonly sortOrder?: 'asc' | 'desc';
 }
@@ -405,6 +405,8 @@ interface AccountingModuleDependencies {
   oracle: OracleProvider;
   /** Current wallet identity */
   identity: FullIdentity;
+  /** All tracked wallet addresses — used for creator check in close/cancel (checks all HD addresses, not just current) */
+  getActiveAddresses: () => TrackedAddress[];
   /** Event emitter (from Sphere) */
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
   /** General storage for cancelled/closed sets, frozen balances, auto-return settings */
@@ -509,7 +511,8 @@ class AccountingModule {
   async getInvoices(options?: GetInvoicesOptions): Promise<InvoiceRef[]>;
 
   /**
-   * Get a single invoice by token ID.
+   * Get a single invoice by token ID. Synchronous — cancelled/closed sets
+   * are kept in memory after load(), so no async storage reads are needed.
    *
    * @param invoiceId - The invoice token ID
    * @returns InvoiceRef or null if not found
@@ -537,6 +540,7 @@ class AccountingModule {
    * @param invoiceId - The invoice token ID
    * @param options - Optional: { autoReturn?: boolean } — enable auto-return on close
    * @throws SphereError with INVOICE_NOT_CREATOR if not the creator (non-anonymous)
+   * @throws SphereError with INVOICE_ANON_AUTO_RETURN if autoReturn is true and invoice is anonymous
    * @throws SphereError if not found, already closed, or already cancelled
    */
   async closeInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
@@ -562,6 +566,7 @@ class AccountingModule {
    *
    * @param invoiceId - The invoice token ID
    * @param options - Optional: { autoReturn?: boolean } — enable auto-return on cancel
+   * @throws SphereError with INVOICE_ANON_AUTO_RETURN if autoReturn is true and invoice is anonymous
    * @throws SphereError if not creator (non-anonymous), not found, or already closed/cancelled
    */
   async cancelInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
@@ -682,23 +687,26 @@ class AccountingModule {
    * Called by Sphere.destroy().
    *
    * Sequence:
-   * 1. Unsubscribe from all PaymentsModule events (prevents new gate entries)
-   * 2. Set internal `destroyed` flag
+   * 1. Set internal `destroyed` flag (FIRST — prevents new operations immediately)
+   * 2. Unsubscribe from all PaymentsModule events (prevents new event-driven entries)
    * 3. Await the current promise-chain tail for ALL active gate entries
    *    (captures the map snapshot at flag-set time)
    *
-   * The `destroyed` flag is checked at the TOP of every gate `fn` body.
-   * If set, the fn returns immediately without storage writes. This
-   * guarantees that:
-   * - Operations that were in-flight when destroy was called complete normally
-   * - Operations that were queued (chained but not started) execute their fn
-   *   but bail out immediately on the destroyed check — no storage writes
-   * - Operations chained AFTER step 1 are impossible (events unsubscribed)
-   *   except for direct API calls, which are the caller's responsibility
+   * The `destroyed` flag is checked in TWO places:
+   * - At the TOP of every PUBLIC METHOD (getInvoiceStatus, payInvoice,
+   *   closeInvoice, cancelInvoice, returnInvoicePayment, setAutoReturn).
+   *   If set, the method throws immediately without entering the gate.
+   * - At the TOP of every gate `fn` body. If set, the fn returns immediately
+   *   without storage writes (catches operations queued before flag was set).
+   *
+   * Setting the flag BEFORE unsubscribing (step 1 before step 2) closes the
+   * race window where a direct API call could enter the gate between unsubscribe
+   * and flag-set. The `withInvoiceGate()` helper also rejects immediately if
+   * `destroyed` is true, before chaining onto the promise — preventing new
+   * operations from extending the gate tail after step 3's snapshot.
    *
    * Net guarantee: after destroy() resolves, no further storage writes will
-   * occur from event-driven gate operations. Direct API calls after destroy
-   * are a caller error and will bail via the destroyed flag.
+   * occur from any source. Direct API calls after destroy throw immediately.
    */
   async destroy(): Promise<void>;
 }
@@ -778,7 +786,7 @@ export * from './types';
 
 ### 3.1 Token ID Derivation
 
-The invoice token ID is derived deterministically from the invoice content, ensuring that the same invoice parameters always produce the same token ID (enabling idempotent re-minting).
+The invoice token ID is derived deterministically from the invoice content, ensuring that the same invoice parameters always produce the same token ID (enabling idempotent re-minting). **Known constraint:** Two `createInvoice()` calls with identical parameters in the same millisecond are treated as the same invoice (idempotent). To create distinct invoices with identical terms, callers must ensure at least 1ms separation or include distinguishing text in the `memo` field.
 
 ```typescript
 // Deterministic token ID from canonical invoice terms
@@ -812,7 +820,10 @@ Step  Action                                SDK Class
 6     Create MintCommitment                 MintCommitment.create()
 7     Submit to aggregator (3 retries)      client.submitMintCommitment()
       - SUCCESS -> continue
-      - REQUEST_ID_EXISTS -> continue (idempotent)
+      - REQUEST_ID_EXISTS -> continue (idempotent re-mint by same wallet).
+        NOTE: REQUEST_ID_EXISTS only returns a success status, NOT the original
+        inclusion proof. A different wallet cannot obtain a usable proof by
+        guessing invoice terms — they would need the original minter's proof.
 8     Wait for inclusion proof              waitInclusionProof()
 9     Create genesis transaction            commitment.toTransaction()
 10    Create UnmaskedPredicate + TokenState  UnmaskedPredicate.create()
@@ -825,7 +836,7 @@ Step  Action                                SDK Class
       retroactive payment/coverage events
 ```
 
-**Privacy note on anonymous invoices:** Even when `creator` is omitted, the minting process uses the minter's signing key for salt derivation (step 4) and sets the minter's DirectAddress as the `recipient` in the genesis data (step 5). This means the minter's identity is still embedded in the token's on-chain data. Additionally, since `salt = SHA-256(signingKey || invoiceBytes)` uses a constant signing key, any observer who can see multiple invoice tokens on-chain can determine whether two invoices were created by the same wallet by testing candidate keys against the salt — the salt is an additional cross-invoice linkability vector beyond the `recipient` field. True anonymity would require a random nonce in salt derivation and a different recipient strategy. For v1, "anonymous" means the `creator` field is absent from `InvoiceTerms` (affecting close/cancel authorization), not that the minter's on-chain identity is hidden.
+**Privacy note on anonymous invoices:** Even when `creator` is omitted, the minting process uses the minter's signing key for salt derivation (step 4) and sets the minter's DirectAddress as the `recipient` in the genesis data (step 5). This means the minter's identity is still embedded in the token's on-chain data. Additionally, since `salt = SHA-256(signingKey || invoiceBytes)` uses a constant signing key, any observer who can see multiple invoice tokens on-chain can determine whether two invoices were created by the same wallet by testing candidate keys against the salt — the salt is a cross-invoice linkability vector. However, this vector is **strictly dominated** by the `recipient` field exposure — the recipient DirectAddress directly identifies the minter without any brute-forcing. The salt linkability is therefore redundant with existing exposure. True anonymity would require changing BOTH the recipient strategy AND salt derivation (random nonce). For v1, "anonymous" means the `creator` field is absent from `InvoiceTerms` (affecting close/cancel authorization), not that the minter's on-chain identity is hidden.
 
 ### 3.3 Invoice Token Type Constant
 
@@ -870,7 +881,9 @@ function canonicalSerialize(terms: InvoiceTerms): Uint8Array {
   if (terms.creator !== undefined) {
     sorted.creator = terms.creator; // inserted between createdAt and deliveryMethods
   }
-  sorted.deliveryMethods = terms.deliveryMethods ?? null;
+  // Normalize empty array to null for canonical equivalence:
+  // deliveryMethods: [] and deliveryMethods: undefined produce the same serialization.
+  sorted.deliveryMethods = (terms.deliveryMethods?.length ? terms.deliveryMethods : null);
   sorted.dueDate = terms.dueDate ?? null;
   sorted.memo = terms.memo ?? null;
   sorted.targets = sortedTargets;
@@ -1242,6 +1255,12 @@ All state-mutating operations on a given invoice are serialized through a **per-
   fires, release the gate and reject the return with a timeout error. The
   dedup ledger is NOT written until after send succeeds, so a timed-out
   return leaves no ledger entry and can be safely retried by the caller.
+  **Index update:** After a successful `send()` inside the gate,
+  `returnInvoicePayment()` MUST synchronously update the in-memory
+  invoice-transfer index with the new outbound return transfer BEFORE
+  releasing the gate. This ensures the next serialized operation's balance
+  check (via `getRelatedTransfers()`) sees the return. Do not rely on the
+  async event path (transfer:confirmed) for intra-gate consistency.
 
 **Non-serialized** (read-only, with one exception):
 - `getInvoiceStatus()` — read-only in the common case. However, when it detects
@@ -1527,7 +1546,7 @@ Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`:
 ```typescript
 /** Cancelled invoice IDs (JSON string array) */
 CANCELLED_INVOICES: 'cancelled_invoices',
-/** Explicitly closed invoice IDs (JSON string array) */
+/** Closed invoice IDs — both explicit closeInvoice() and implicit all-covered+confirmed (JSON string array) */
 CLOSED_INVOICES: 'closed_invoices',
 /** Frozen balance snapshots for terminated invoices (JSON map: invoiceId -> FrozenInvoiceBalances) */
 FROZEN_BALANCES: 'frozen_balances',
@@ -1620,12 +1639,16 @@ interface AutoReturnStorage {
 interface AutoReturnLedgerEntry {
   /** When the intent was recorded */
   readonly intentAt: number;
-  /** 'pending' = intent recorded, send not yet confirmed; 'completed' = send confirmed */
-  readonly status: 'pending' | 'completed';
+  /** 'pending' = intent recorded, send not yet confirmed; 'completed' = send confirmed; 'failed' = max retries exceeded */
+  readonly status: 'pending' | 'completed' | 'failed';
   /** Return transfer ID (set when status = 'completed') */
   readonly returnTransferId?: string;
   /** When the return was completed (set when status = 'completed') */
   readonly completedAt?: number;
+  /** Number of retry attempts (incremented on each crash-recovery retry) */
+  readonly retryCount?: number;
+  /** Timestamp of last retry attempt */
+  readonly lastRetryAt?: number;
   /**
    * Fields required for crash recovery retry (populated at intent time):
    * Without these, a 'pending' entry found on load() cannot be retried
@@ -1815,8 +1838,14 @@ load():
   5. **Crash recovery:** Scan dedup ledger for 'pending' entries. For each:
      - Check if the return transfer landed (via getHistory())
      - If found -> update to 'completed'
-     - If not found -> retry using persisted recipient/amount/coinId/memo
-       fields from the ledger entry (within per-invoice gate)
+     - If not found AND retryCount < 5 -> increment retryCount, set lastRetryAt,
+       retry using persisted recipient/amount/coinId/memo fields (within per-invoice gate)
+     - If not found AND retryCount >= 5 -> transition to 'failed' status,
+       fire 'invoice:auto_return_failed' with reason 'max_retries_exceeded'.
+       The user can manually retry via returnInvoicePayment() or re-enable
+       auto-return via setAutoReturn(invoiceId, true) which re-triggers
+       failed entries (resets retryCount to 0, status back to 'pending').
+     'failed' entries are never pruned (unlike 'completed' entries).
   6. Build in-memory invoice-transfer index (see below)
   7. Subscribe to PaymentsModule events
   8. Scan full history for pre-existing payments -> fire retroactive events
@@ -1903,13 +1932,30 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 | `targetIndex` must be valid | `INVOICE_INVALID_TARGET` |
 | `assetIndex` must be valid (if provided) | `INVOICE_INVALID_ASSET_INDEX` |
 
+**Downstream errors:** `payInvoice()` and `returnInvoicePayment()` delegate to `PaymentsModule.send()`, which may throw its own errors (insufficient balance, network failure, etc.). These errors pass through to the caller unchanged — the accounting module does not wrap them.
+
 ### 8.6 Return Invoice Payment Validation
 
 | Rule | Error |
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
 | Caller's wallet address must match one of the invoice targets | `INVOICE_NOT_TARGET` |
-| Return amount must not exceed the effective returnable amount for the specified target:coinId. For non-terminal invoices: computed from current history (`netCoveredAmount`). For terminal invoices: `frozenNetCoveredAmount - sum(all post-freeze return transfers for this target:coinId)`, where post-freeze returns are discovered via `getRelatedTransfers()` filtered to `:B`/`:RC`/`:RX` transfers with `timestamp > frozenAt`. This accounts for auto-returns and manual returns that occurred after the balance was frozen. **Note:** This balance check executes inside the per-invoice gate (§5.9), ensuring the in-memory index read by `getRelatedTransfers()` is consistent — no concurrent return can modify the index between this check and the subsequent `send()`. | `INVOICE_RETURN_EXCEEDS_BALANCE` |
+| Return amount must not exceed the effective returnable amount for the specified target:coinId. For non-terminal invoices: computed from current history (`netCoveredAmount`). For terminal invoices: `frozenNetCoveredAmount - sum(all post-freeze return transfers for this target:coinId)`, where post-freeze returns are discovered via `getRelatedTransfers()` filtered to `:B`/`:RC`/`:RX` transfers with local arrival timestamp > `frozenAt` (use the transfer's indexing time, not the sender-controlled timestamp, to prevent backdating attacks). This accounts for auto-returns and manual returns that occurred after the balance was frozen. **Note:** This balance check executes inside the per-invoice gate (§5.9), ensuring the in-memory index read by `getRelatedTransfers()` is consistent — no concurrent return can modify the index between this check and the subsequent `send()`. | `INVOICE_RETURN_EXCEEDS_BALANCE` |
+
+### 8.7 setAutoReturn Validation
+
+| Rule | Error |
+|------|-------|
+| For specific invoiceId (not `'*'`): invoice token must exist locally | `INVOICE_NOT_FOUND` |
+| For specific invoiceId: if invoice is anonymous (`terms.creator` undefined), reject | `INVOICE_ANON_AUTO_RETURN` |
+
+### 8.8 getInvoiceStatus / getRelatedTransfers Validation
+
+| Rule | Error |
+|------|-------|
+| Invoice token must exist locally | `INVOICE_NOT_FOUND` |
+
+**Note:** `getRelatedTransfers()` throws `INVOICE_NOT_FOUND` for unknown invoices rather than returning an empty array, consistent with `getInvoiceStatus()`. This prevents silent failures when callers pass an incorrect invoice ID. `getInvoice()` returns `null` for unknown invoices (non-throwing, lightweight lookup).
 
 ---
 
@@ -1923,6 +1969,7 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 // sphere_getInvoices
 // Returns: InvoiceRef[] (without computed status)
 // Params: GetInvoicesOptions (optional)
+// Requires: invoice:read permission scope
 {
   method: 'sphere_getInvoices',
   params: { state: 'OPEN', createdByMe: true, limit: 10 }
@@ -1931,6 +1978,7 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 // sphere_getInvoiceStatus
 // Returns: InvoiceStatus (computed fresh for non-terminal, frozen for terminal)
 // Params: { invoiceId: string }
+// Requires: invoice:read permission scope
 //
 // NOTE: sphere_getRelatedTransfers is intentionally NOT exposed via Connect.
 // It returns detailed per-transfer data that should be consumed via
@@ -1951,8 +1999,9 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 // other operation can interleave between freeze and auto-return. The Connect
 // query blocks until the full close+auto-return sequence finishes. Wallet
 // hosts SHOULD rate-limit sphere_getInvoiceStatus calls from dApps (e.g.,
-// max 1 call/second per invoiceId) to prevent a malicious dApp from rapidly
-// triggering expensive implicit close across many invoices. Wallet hosts
+// max 1 call/second per invoiceId, AND max 10 calls/second aggregate across
+// all invoiceIds per session) to prevent a malicious dApp from enumerating
+// invoices via sphere_getInvoices and triggering implicit close cascades. Wallet hosts
 // MUST stop accepting new Connect RPC calls before calling
 // accounting.destroy() to avoid in-flight operations racing with teardown.
 {
