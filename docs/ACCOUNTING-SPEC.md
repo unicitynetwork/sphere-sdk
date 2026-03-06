@@ -192,14 +192,18 @@ interface InvoiceCoinAssetStatus {
 }
 
 /**
- * Status of a single NFT line item (placeholder).
+ * Status of a single NFT line item (placeholder — not implemented in v1).
+ * In v1, `received` is always `false` and `confirmed` is always `false`.
+ * NFT coverage is excluded from the target `isCovered` check until NFT
+ * matching logic is implemented. The `isCovered` computation in §5.1 step 6
+ * considers only coin assets in v1.
  */
 interface InvoiceNFTAssetStatus {
   /** The NFT entry from the invoice target */
   readonly nft: NFTEntry;
-  /** Whether the NFT has been received */
+  /** Whether the NFT has been received (always false in v1) */
   readonly received: boolean;
-  /** Whether the received token is confirmed */
+  /** Whether the received token is confirmed (always false in v1) */
   readonly confirmed: boolean;
 }
 
@@ -504,6 +508,12 @@ class AccountingModule {
    * (but not returned -- caller must call getInvoiceStatus() separately).
    * Because state filtering requires async status computation, this method
    * is async.
+   *
+   * Pagination: offset and limit are applied AFTER all filters (state,
+   * createdByMe, targetingMe). offset=10 means skip the first 10 invoices
+   * that pass all filters. Implementations MAY optimize terminal-state
+   * filtering by reading directly from the in-memory cancelled/closed sets
+   * without full status recomputation.
    *
    * @param options - Filter/sort/pagination options
    * @returns Array of InvoiceRef objects
@@ -1079,7 +1089,8 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
      surplus = max(0, netCovered - requestedAmount)
 
   6. Compute per-target coverage:
-     isCovered = all coin assets isCovered AND all NFTs received
+     isCovered = all coin assets isCovered
+     (NFT coverage is excluded in v1 — see InvoiceNFTAssetStatus)
 
   7. Determine state (order matters):
      a. if cancelled -> CANCELLED (terminal, already handled in step 2)
@@ -1093,6 +1104,8 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
            freeze recomputed balances with `explicitClose: false`,
            persist to FROZEN_BALANCES, add to closedSet,
            fire 'invoice:closed' { explicit: false }
+        -> **Event ordering:** 'invoice:closed' fires BEFORE any 'invoice:auto_returned'
+           events, for both explicit and implicit close paths.
         -> after freeze: if auto-return is enabled (perInvoice[id] ?? global)
            AND wallet is a target AND invoice is not anonymous,
            trigger surplus auto-return (same as explicit close with autoReturn).
@@ -1429,7 +1442,7 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
 'invoice:auto_return_failed': {
   invoiceId: string;
   transferId: string;                     // the inbound transfer that could not be returned
-  reason: 'sender_unresolvable' | 'send_failed';
+  reason: 'sender_unresolvable' | 'send_failed' | 'max_retries_exceeded';
 };
 ```
 
@@ -1465,7 +1478,8 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
         AND wallet is a target:
         -> **acquire per-invoice gate** (entire auto-return block is serialized)
         -> inside gate:
-           - check dedup ledger for (invoiceId, transferId) — skip if status='completed'
+           - check dedup ledger for (invoiceId, transferId) — skip if status='completed' or 'failed'
+             ('failed' entries are terminal until explicitly re-enabled via setAutoReturn())
            - write dedup ledger entry with status='pending' (intent log)
            - invoke auto-return: send entire incoming amount back
              (any new forward payment to a terminated invoice is surplus by definition)
@@ -1823,6 +1837,9 @@ load():
       writing frozen balances and updating the terminal set. For each orphan:
       - Read `FrozenInvoiceBalances.state` ('CLOSED' or 'CANCELLED')
       - Add the invoiceId to the matching terminal set and persist
+      - Fire the corresponding retroactive terminal event:
+        'invoice:closed' (with explicit from frozen data) or 'invoice:cancelled'
+        (consumers that missed the event due to the original crash now receive it)
   4c. **Storage reconciliation (inverse):** Scan CLOSED_INVOICES and
       CANCELLED_INVOICES for any invoiceId that exists in a terminal set but
       has NO entry in FROZEN_BALANCES. This handles the crash between writing
@@ -1849,6 +1866,11 @@ load():
   6. Build in-memory invoice-transfer index (see below)
   7. Subscribe to PaymentsModule events
   8. Scan full history for pre-existing payments -> fire retroactive events
+
+**Required ordering:** Steps 4-6 (reconciliation, crash recovery, index build) MUST
+complete before step 7 (event subscription). This prevents races between recovery
+retries and incoming event processing for the same transfer — both would enter the
+per-invoice gate, but recovery must finish first to populate the dedup ledger.
 ```
 
 #### Performance: In-Memory Invoice-Transfer Index
@@ -1861,7 +1883,7 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 ```
 
 - **Built on `load()`:** Full history scan populates the index for all known invoices.
-- **Updated incrementally:** Each `transfer:incoming` / `transfer:confirmed` event with an invoice memo adds/updates the entry. **This includes transfers for terminal invoices** — the index is a complete record of all invoice-related transfers regardless of terminal state. Frozen balances are a separate point-in-time snapshot that does not reflect post-termination activity. The index and frozen balances serve different purposes: the index powers `getRelatedTransfers()` (complete picture), while frozen balances power `getInvoiceStatus()` for terminal invoices (snapshot at termination).
+- **Updated incrementally (idempotent):** Each `transfer:incoming` / `transfer:confirmed` event with an invoice memo adds/updates the entry. Updates are **idempotent by (transferId, coinId)**: if the index already contains an entry with the same transferId and coinId, the event-driven update is a no-op (not an append). This is critical because `returnInvoicePayment()` synchronously updates the index after `send()` (§5.9), and the subsequent async event for the same transfer must not produce a duplicate entry. **This includes transfers for terminal invoices** — the index is a complete record of all invoice-related transfers regardless of terminal state. Frozen balances are a separate point-in-time snapshot that does not reflect post-termination activity. The index and frozen balances serve different purposes: the index powers `getRelatedTransfers()` (complete picture), while frozen balances power `getInvoiceStatus()` for terminal invoices (snapshot at termination).
 - **Used by `getInvoiceStatus()`:** Instead of re-scanning full history, reads from the index.
 - **Invalidated on `createInvoice()` / `importInvoice()`:** A full rescan rebuilds the entry for the new invoice (to catch retroactive payments).
 - **Persisted as cache:** The index is backed by a lightweight storage cache (key: `invoice_transfer_refs` in `STORAGE_KEYS_ADDRESS`) to preserve multi-asset coinData across restarts. On `load()`, the cache is loaded first, then supplemented by a history scan for any new entries. The cache is rebuilt from scratch on `createInvoice()` / `importInvoice()` when full token data is available. The cache is also updated when post-termination transfers are indexed.
@@ -1908,7 +1930,7 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 | Rule | Error |
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
-| Caller must be the creator (`terms.creator === identity.chainPubkey`). For anonymous invoices (`terms.creator` undefined), any party holding the invoice may close it. The creator check uses **all tracked addresses** (`getActiveAddresses()`), not just the current active address. | `INVOICE_NOT_CREATOR` |
+| Caller must be the creator: `terms.creator` must match the `chainPubkey` of ANY tracked address from `getActiveAddresses()`, not just the current active identity. For anonymous invoices (`terms.creator` undefined), any party holding the invoice may close it. | `INVOICE_NOT_CREATOR` |
 | Invoice must not already be CLOSED | `INVOICE_ALREADY_CLOSED` |
 | Invoice must not already be CANCELLED | `INVOICE_ALREADY_CANCELLED` |
 | If `options.autoReturn` is `true` and invoice is anonymous (`terms.creator` undefined): reject. Auto-return is not allowed for anonymous invoices (abuse vector — any holder could cancel and trigger return of all payments). | `INVOICE_ANON_AUTO_RETURN` |
@@ -1918,7 +1940,7 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 | Rule | Error |
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
-| If non-anonymous: caller must be the creator (`terms.creator === identity.chainPubkey`). The creator check uses **all tracked addresses** (`getActiveAddresses()`), not just the current active address. For anonymous invoices (`terms.creator` undefined), any party holding the invoice may cancel it. | `INVOICE_NOT_CREATOR` |
+| If non-anonymous: `terms.creator` must match the `chainPubkey` of ANY tracked address from `getActiveAddresses()`, not just the current active identity. For anonymous invoices (`terms.creator` undefined), any party holding the invoice may cancel it. | `INVOICE_NOT_CREATOR` |
 | Invoice must not already be CLOSED (computed) | `INVOICE_ALREADY_CLOSED` |
 | Invoice must not already be cancelled | `INVOICE_ALREADY_CANCELLED` |
 | If `options.autoReturn` is `true` and invoice is anonymous (`terms.creator` undefined): reject. Auto-return is not allowed for anonymous invoices. | `INVOICE_ANON_AUTO_RETURN` |
@@ -2004,6 +2026,11 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 // invoices via sphere_getInvoices and triggering implicit close cascades. Wallet hosts
 // MUST stop accepting new Connect RPC calls before calling
 // accounting.destroy() to avoid in-flight operations racing with teardown.
+//
+// LATENCY: When implicit close triggers auto-return for multiple target:coinId
+// pairs, each requires a PaymentsModule.send() network call. The query may block
+// for up to N * 60s (where N = number of surplus pairs, 60s = send timeout).
+// Connect hosts SHOULD set response timeouts accordingly (recommended: 120s).
 {
   method: 'sphere_getInvoiceStatus',
   params: { invoiceId: 'abc123...' }

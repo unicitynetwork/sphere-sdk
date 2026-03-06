@@ -315,13 +315,13 @@ Similarly, when enabling auto-return globally (`'*'`), the operation is triggere
 
 **Auto-return deduplication (intent log pattern):** Each auto-return is tracked in a persistent ledger (`auto_return_ledger`) keyed by `(invoiceId, originalTransferId)`. The auto-return operation follows a write-first intent log pattern to prevent duplicate sends on crash recovery:
 
-1. Check ledger for `(invoiceId, originalTransferId)` — if entry exists with `status: 'completed'`, skip (already returned).
+1. Check ledger for `(invoiceId, originalTransferId)` — if entry exists with `status: 'completed'` or `'failed'`, skip. (`failed` entries are terminal until re-enabled via `setAutoReturn()`).
 2. **Write intent:** Write ledger entry with `status: 'pending'` and persist.
 3. **Send:** Call `PaymentsModule.send()` to return tokens.
 4. **Complete:** Update ledger entry to `status: 'completed'` with `returnTransferId`.
 5. Fire `invoice:auto_returned` event.
 
-On crash recovery (during `load()`), scan the ledger for `pending` entries. For each, check if the return transfer actually landed (via `getHistory()`): if found, update to `completed`; if not found, retry using the persisted `recipient`, `amount`, `coinId`, and `memo` fields from the ledger entry. These fields are written at intent time (step 2) specifically to enable retry without re-deriving from the original transfer. This makes duplicate returns impossible — the intent is recorded before the send, so re-delivery of the original event hits step 1 and skips. All steps execute within the per-invoice serialization gate.
+On crash recovery (during `load()`), scan the ledger for `pending` entries. For each, check if the return transfer actually landed (via `getHistory()`): if found, update to `completed`; if not found and `retryCount < 5`, increment retryCount and retry using the persisted `recipient`, `amount`, `coinId`, and `memo` fields from the ledger entry; if `retryCount >= 5`, transition to `failed` status and fire `invoice:auto_return_failed` with reason `'max_retries_exceeded'`. Failed entries are terminal until re-enabled via `setAutoReturn(invoiceId, true)` which resets retryCount and status to `pending`. These fields are written at intent time (step 2) specifically to enable retry without re-deriving from the original transfer. This makes duplicate returns impossible — the intent is recorded before the send, so re-delivery of the original event hits step 1 and skips. All steps execute within the per-invoice serialization gate.
 
 **Secondary dedup (defense-in-depth):** Before executing any auto-return send, check `getHistory()` for an existing outbound `:RC`/`:RX` transfer matching `(invoiceId, originalTransferId)` — the `originalTransferId` is stored in the auto-return memo's freeText field and extracted via `parseInvoiceMemo()`. This per-transfer match prevents false-positive dedup when the same sender makes multiple forward payments for the same coinId. Catches duplicates when ledger entries have been pruned (completed entries are pruned after 30 days on `load()`).
 
@@ -365,7 +365,7 @@ The accounting module wraps all its inbound event processing in try/catch guards
 **Serialized operations (per invoice):**
 - `closeInvoice()`
 - `cancelInvoice()`
-- `returnInvoicePayment()` — holds gate through validation+send to prevent concurrent double-return on terminal invoices (over-return is fund loss, unlike over-payment which is benign). Implementations SHOULD apply a 60-second timeout to the send() call within the gate to prevent starvation of other serialized operations on the same invoice.
+- `returnInvoicePayment()` — holds gate through validation+send to prevent concurrent double-return on terminal invoices (over-return is fund loss, unlike over-payment which is benign). After successful send(), synchronously updates the in-memory invoice-transfer index before releasing the gate (ensures next serialized operation sees the return). Implementations SHOULD apply a 60-second timeout to the send() call within the gate to prevent starvation of other serialized operations on the same invoice.
 - Implicit close (all targets covered + confirmed)
 - Auto-return execution (both immediate and ongoing)
 - `setAutoReturn()` immediate trigger
@@ -376,6 +376,8 @@ The accounting module wraps all its inbound event processing in try/catch guards
 - `getInvoice()`, `getInvoices()`, `getRelatedTransfers()`
 - `payInvoice()` — acquires the gate for the terminal-state check only (released before `send()`). A narrow TOCTOU window exists where a concurrent implicit close can terminate the invoice between gate release and send completion. This is an accepted race — see SPEC §5.9 for full rationale and mitigation via auto-return.
 - `parseInvoiceMemo()`
+
+**Shutdown:** `destroy()` sets the `destroyed` flag first (before unsubscribing from events), then unsubscribes, then awaits all active gate tails. The destroyed check appears at the entry point of every public method AND inside every gate fn body. See SPEC §2.1 for the full sequence.
 
 **Implementation:** A `Map<string, Promise<void>>` keyed by invoice ID. Each mutating operation chains onto the existing promise (or creates a new one). This is a lightweight cooperative lock — no OS-level primitives needed in single-threaded JavaScript. The gate ensures that if two events arrive in rapid succession for the same invoice, the second waits for the first to complete before executing. **Cleanup:** After each operation completes, if no further operations are queued, the gate entry is deleted from the map to prevent unbounded memory growth over thousands of invoices.
 
