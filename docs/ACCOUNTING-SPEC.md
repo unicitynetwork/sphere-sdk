@@ -564,22 +564,42 @@ class AccountingModule {
    * This is always allowed regardless of invoice terminal state.
    * Uses :B direction code in the memo.
    *
+   * RESTRICTION: Only callable when the local wallet's address matches
+   * one of the invoice targets. Non-target parties cannot send return
+   * payments — they can only make forward payments. Throws INVOICE_NOT_TARGET
+   * if the wallet is not an invoice target.
+   *
    * @param invoiceId - The invoice token ID
    * @param params - { recipient, amount, coinId, freeText? }
    * @returns TransferResult from PaymentsModule.send()
+   * @throws SphereError with INVOICE_NOT_TARGET if wallet is not an invoice target
    */
   async returnInvoicePayment(invoiceId: string, params: ReturnPaymentParams): Promise<TransferResult>;
 
   /**
    * Enable or disable auto-return for terminated invoices.
    *
-   * When auto-return is enabled and an incoming forward payment references a
-   * terminated invoice, the module automatically returns the tokens to the sender.
+   * When auto-return is enabled, two things happen:
+   *
+   * 1. **Immediate trigger:** If the invoice (or any terminated invoice for '*')
+   *    is already terminated, auto-return is executed immediately:
+   *    - CLOSED invoice: return the SURPLUS ONLY (amount exceeding requested).
+   *      If no surplus exists, nothing is returned.
+   *    - CANCELLED invoice: return EVERYTHING (all forward payments received).
+   *
+   * 2. **Ongoing:** Future incoming forward payments referencing the terminated
+   *    invoice are automatically returned to the sender:
+   *    - CLOSED: entire incoming amount returned (any new payment is surplus).
+   *    - CANCELLED: entire incoming amount returned (deal is abandoned).
+   *
    * The return memo uses :RC (return-for-closed) or :RX (return-for-cancelled).
    *
    * Auto-return ONLY applies to terminated invoices (CLOSED or CANCELLED).
    * Calling this on a non-terminated invoice stores the preference but has
    * no effect until the invoice terminates.
+   *
+   * RESTRICTION: Auto-return only executes if the local wallet's address
+   * matches one of the invoice targets. Non-target parties cannot return tokens.
    *
    * Return payments (:B, :RC, :RX) are NEVER auto-returned (prevents loops).
    *
@@ -802,14 +822,16 @@ free-text     = *CHAR
 
 ### 4.2 Direction Codes
 
-| Code | Constant | Meaning | Balance effect | Auto-returnable |
-|------|----------|---------|----------------|-----------------|
-| `F` (or omitted) | `'forward'` | Forward payment towards covering the invoice | +coveredAmount | Yes |
-| `B` | `'back'` | Manual return/refund | +returnedAmount | **No** |
-| `RC` | `'return_closed'` | Auto-return because invoice is closed | +returnedAmount | **No** |
-| `RX` | `'return_cancelled'` | Auto-return because invoice is cancelled | +returnedAmount | **No** |
+| Code | Constant | Meaning | Balance effect | Auto-returnable | Who can send |
+|------|----------|---------|----------------|-----------------|--------------|
+| `F` (or omitted) | `'forward'` | Forward payment towards covering the invoice | +coveredAmount | Yes | Anyone |
+| `B` | `'back'` | Manual return/refund | +returnedAmount | **No** | **Target only** |
+| `RC` | `'return_closed'` | Auto-return because invoice is closed | +returnedAmount | **No** | **Target only** |
+| `RX` | `'return_cancelled'` | Auto-return because invoice is cancelled | +returnedAmount | **No** | **Target only** |
 
 All return directions (`:B`, `:RC`, `:RX`) have the same effect on balance computation — they increase `returnedAmount`. The distinction is semantic.
+
+**Sender restriction:** Only a party whose wallet address matches one of the invoice targets may send return payments (`:B`, `:RC`, `:RX`). Non-target parties can only make forward payments (`:F`). The `returnInvoicePayment()` method and auto-return system enforce this with `INVOICE_NOT_TARGET`.
 
 ### 4.3 Regex
 
@@ -968,6 +990,7 @@ surplusAmount    = max(0, netCoveredAmount - asset.coin[1])
 - **Only memo-referenced transfers count.** A token received without an `INV:` memo does not affect any invoice balance, even if sent to a target address with a matching coin.
 - **Spending tokens is independent.** If Alice receives 500 UCT with memo `INV:abc:F`, then spends that 500 UCT on something else (no `INV:abc` memo), the invoice `abc` still shows 500 UCT covered. The spent token's outbound transfer has no invoice memo, so it doesn't affect the invoice.
 - **Self-payments affect balance.** If a target address owner sends tokens to themselves with memo `INV:abc:F`, the forward payment increases the covered balance. If they send with `INV:abc:B`, it decreases the balance. This is intentional and valid.
+- **Only target parties may return.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`).
 - **Terminal state freeze.** Once CLOSED or CANCELLED, balances are frozen and persisted. `getInvoiceStatus()` returns the persisted snapshot. No recomputation occurs. New transfers referencing the invoice are still visible via `getRelatedTransfers()`.
 - **Multi-asset tokens.** A single token may carry multiple coin entries (e.g., `coinData = [["UCT", "500"], ["USDU", "1000"]]`). When such a token is transferred with an invoice memo, each coin entry is matched independently against the invoice targets. One transfer of a multi-asset token may cover multiple requested assets for the same target simultaneously.
 
@@ -1171,8 +1194,10 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
      -> return
   4. If invoice is in terminal state (CLOSED or CANCELLED):
      -> fire 'invoice:payment' (transfer is still recorded)
-     -> if direction is 'forward' AND auto-return enabled:
-        - invoke auto-return (send tokens back with :RC or :RX)
+     -> if direction is 'forward' AND auto-return enabled AND wallet is a target:
+        - invoke auto-return: send entire incoming amount back
+          (any new forward payment to a terminated invoice is surplus by definition)
+        - use :RC for CLOSED, :RX for CANCELLED
         - fire 'invoice:auto_returned'
      -> do not fire balance-related events (frozen)
      -> return
@@ -1326,16 +1351,24 @@ closeInvoice():
   1. Compute current balances one final time
   2. Persist frozen balances to FROZEN_BALANCES storage
   3. Add invoiceId to CLOSED_INVOICES set in storage
-  4. Optionally enable auto-return (if options.autoReturn)
+  4. If options.autoReturn:
+     -> enable auto-return for this invoice
+     -> immediately return SURPLUS ONLY (per target:asset, amount exceeding requested)
+     -> use :RC memo direction
   5. Fire 'invoice:closed' { explicit: true }
+  6. Fire 'invoice:auto_returned' for each surplus return (if any)
 
 cancelInvoice():
   1. Load cancelled set from storage
   2. Compute current balances one final time
   3. Persist frozen balances to FROZEN_BALANCES storage
   4. Add invoiceId to CANCELLED_INVOICES set in storage
-  5. Optionally enable auto-return (if options.autoReturn)
+  5. If options.autoReturn:
+     -> enable auto-return for this invoice
+     -> immediately return EVERYTHING (all forward payments received)
+     -> use :RX memo direction
   6. Fire 'invoice:cancelled'
+  7. Fire 'invoice:auto_returned' for each return (if any)
 
 getInvoiceStatus():
   1. Read token from tokenStorage (parse terms from genesis.data.tokenData)
@@ -1349,6 +1382,14 @@ setAutoReturn():
   1. Load AUTO_RETURN from storage
   2. Update global flag or per-invoice entry
   3. Persist to storage
+  4. If enabling (enabled=true), trigger immediate auto-return for applicable invoices:
+     - For specific invoiceId: if terminated AND wallet is a target:
+       - CLOSED -> return surplus only (per target:asset)
+       - CANCELLED -> return everything
+     - For '*': iterate all terminated invoices where wallet is a target:
+       - CLOSED -> return surplus only
+       - CANCELLED -> return everything
+  5. Fire 'invoice:auto_returned' for each return executed
 
 load():
   1. Enumerate tokens from tokenStorage
@@ -1414,6 +1455,13 @@ load():
 | Invoice must NOT be in a terminal state (CLOSED or CANCELLED) | `INVOICE_TERMINATED` |
 | `targetIndex` must be valid | `INVOICE_INVALID_TARGET` |
 | `assetIndex` must be valid (if provided) | `INVOICE_INVALID_ASSET_INDEX` |
+
+### 8.6 Return Invoice Payment Validation
+
+| Rule | Error |
+|------|-------|
+| Invoice token must exist locally | `INVOICE_NOT_FOUND` |
+| Caller's wallet address must match one of the invoice targets | `INVOICE_NOT_TARGET` |
 
 ---
 
@@ -1554,6 +1602,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_TERMINATED` | Cannot pay a terminated invoice (closed or cancelled) | Forward payment to terminated invoice |
 | `INVOICE_INVALID_TARGET` | Invalid target index | Out-of-bounds targetIndex in payInvoice |
 | `INVOICE_INVALID_ASSET_INDEX` | Invalid asset index | Out-of-bounds assetIndex in payInvoice |
+| `INVOICE_NOT_TARGET` | Only invoice target parties can send return payments | Return from non-target wallet address |
 
 **IMPORTANT:** All error codes above apply to the accounting module's own operations. Accounting errors during inbound transfer event processing are caught internally and logged — they NEVER propagate to or interrupt the inbound token transfer flow. The one exception is `INVOICE_TERMINATED` for outbound forward payments, which is thrown intentionally to prevent paying a terminated invoice.
 
@@ -1694,52 +1743,62 @@ Time 2: Payer sends another token with coinData = [["UCT", "400"]]
 ## Appendix G: Termination and Auto-Return
 
 ```
---- Explicit Close with Auto-Return ---
+--- Explicit Close with Auto-Return (surplus only) ---
 
-Recipient closes invoice abc (satisfied with partial payment):
+Invoice abc requests 1000 UCT from DIRECT://alice.
+Alice has received 1200 UCT via INV:abc:F (200 surplus).
+
+Alice closes invoice (satisfied with payments):
   -> closeInvoice('abc', { autoReturn: true })
-  -> Balances frozen and persisted
-  -> Auto-return enabled for abc
-  -> Fires invoice:closed { explicit: true }
-
-Sender sends 500 UCT with memo INV:abc:F (unaware of closure):
-  -> Token transfer succeeds (inbound transfers are NEVER blocked)
-  -> Recipient's AccountingModule sees the transfer
-  -> Invoice is CLOSED locally -> frozen balances unchanged
-  -> Auto-return enabled -> module sends 500 UCT back
+  -> Balances frozen: covered=1200, net=1200, surplus=200
+  -> Auto-return enabled -> IMMEDIATELY returns 200 UCT surplus
      with memo INV:abc:RC (return-for-closed)
+  -> Fires invoice:closed { explicit: true }
+  -> Fires invoice:auto_returned (for the 200 surplus)
+  NOTE: Only the surplus (200) is returned, not the full 1200.
+
+Later, sender sends 500 UCT with memo INV:abc:F (unaware of closure):
+  -> Token transfer succeeds (inbound transfers are NEVER blocked)
+  -> Auto-return enabled -> entire 500 UCT returned with INV:abc:RC
+     (any new forward payment to a CLOSED invoice is surplus by definition)
   -> Fires invoice:auto_returned
 
 Sender receives the auto-return (INV:abc:RC):
   -> Fires invoice:return_received { returnReason: 'closed' }
   -> If autoTerminateOnReturn is true:
      -> Sender's module auto-closes invoice abc locally
-     -> Sender's balances frozen and persisted
 
---- Cancellation with Auto-Return ---
+--- Cancellation with Auto-Return (everything) ---
 
-Recipient cancels invoice abc (abandoning the deal):
+Invoice abc requests 1000 UCT from DIRECT://alice.
+Alice has received 600 UCT via INV:abc:F (no surplus, partially covered).
+
+Alice cancels invoice (abandoning the deal):
   -> cancelInvoice('abc', { autoReturn: true })
-  -> Balances frozen and persisted
-  -> Auto-return enabled for abc
+  -> Balances frozen: covered=600, net=600
+  -> Auto-return enabled -> IMMEDIATELY returns ALL 600 UCT
+     with memo INV:abc:RX (return-for-cancelled)
   -> Fires invoice:cancelled
+  -> Fires invoice:auto_returned (for the full 600)
+  NOTE: Everything is returned, not just surplus.
 
-Sender sends 500 UCT with memo INV:abc:F (unaware of cancellation):
+Later, sender sends 500 UCT with memo INV:abc:F (unaware of cancellation):
   -> Token transfer succeeds (inbound NEVER blocked)
-  -> Auto-return -> 500 UCT back with memo INV:abc:RX (return-for-cancelled)
+  -> Auto-return -> entire 500 UCT back with memo INV:abc:RX
   -> Fires invoice:auto_returned
 
 Sender receives the auto-return (INV:abc:RX):
   -> Fires invoice:return_received { returnReason: 'cancelled' }
   -> Sender's module MAY auto-cancel invoice abc locally
 
---- Manual Return (Always Allowed) ---
+--- Manual Return (Always Allowed, Target Only) ---
 
-At any time, an invoice target can return tokens:
+At any time, an invoice TARGET can return tokens:
   -> returnInvoicePayment('abc', { recipient, amount, coinId })
   -> Sends with memo INV:abc:B
   -> This is independent of auto-return settings
   -> Works for both terminated and non-terminated invoices
+  -> NON-TARGET parties CANNOT return (throws INVOICE_NOT_TARGET)
 
 --- Outbound Forward Payment Blocking ---
 
@@ -1747,6 +1806,21 @@ After sender's invoice abc is locally CLOSED or CANCELLED:
   -> payInvoice('abc', ...) -> throws INVOICE_TERMINATED
   -> The token transfer does NOT happen
   -> Caller must handle the error (show UI message, etc.)
+
+--- Enabling Auto-Return After Termination ---
+
+If auto-return was NOT enabled at termination time, it can be enabled later:
+  -> setAutoReturn('abc', true)
+  -> Triggers immediate auto-return for invoice abc:
+     - If CLOSED: returns surplus only
+     - If CANCELLED: returns everything
+  -> Also enables ongoing auto-return for future incoming payments
+
+Global enable:
+  -> setAutoReturn('*', true)
+  -> Triggers immediate auto-return for ALL terminated invoices
+     where wallet is a target
+  -> Also enables ongoing auto-return for all future terminated invoices
 ```
 
 ## Appendix H: Auto-Return Loop Prevention
@@ -1767,4 +1841,24 @@ Even if Bob has auto-return enabled on his side:
   Bob's auto-return only triggers on incoming :F payments.
   The :RC payment Bob receives is NOT :F, so it is NOT auto-returned.
   -> Still no loop.
+```
+
+## Appendix I: Target-Only Return Restriction
+
+```
+Invoice abc:
+  Target: DIRECT://alice (requests 1000 UCT)
+
+Bob (payer, NOT a target):
+  -> payInvoice('abc', ...) with INV:abc:F -> OK (anyone can make forward payments)
+  -> returnInvoicePayment('abc', ...) -> throws INVOICE_NOT_TARGET
+     (Bob's address doesn't match any invoice target)
+
+Alice (target):
+  -> returnInvoicePayment('abc', ...) with INV:abc:B -> OK (alice IS a target)
+  -> Auto-return also works for Alice (she is a target)
+
+This restriction ensures that only the party who received tokens for an
+invoice can return them. Non-targets have no tokens to return and no
+authority to affect the invoice balance via return payments.
 ```
