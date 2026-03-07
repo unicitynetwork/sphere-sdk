@@ -656,9 +656,11 @@ class AccountingModule {
    *
    * 1. **Immediate trigger:** If the invoice (or any terminated invoice for '*')
    *    is already terminated, auto-return is executed immediately:
-   *    - CLOSED invoice: return the SURPLUS ONLY (amount exceeding requested).
+   *    - CLOSED invoice: return the SURPLUS ONLY to the latest sender (by local
+   *      arrival time). Pre-closure payments are accepted as final (non-returnable).
    *      If no surplus exists, nothing is returned.
-   *    - CANCELLED invoice: return EVERYTHING (all forward payments received).
+   *    - CANCELLED invoice: return EVERYTHING — each sender gets back their full
+   *      per-sender net balance.
    *
    * 2. **Ongoing:** Future incoming forward payments referencing the terminated
    *    invoice are automatically returned to the sender:
@@ -1318,7 +1320,9 @@ senderNetBalance = max(0, senderForwarded - senderReturned)
 - **Self-payments are excluded.** If a target address owner sends tokens to themselves with memo `INV:abc:F` (sender address == destination address == target address), the forward payment is NOT counted toward `coveredAmount`. It is classified as `invoice:irrelevant` with reason `'self_payment'`. This prevents a target from fabricating coverage without external payments. **Limitation:** Self-payment detection compares addresses per-transfer — it does not detect cross-HD-address self-payments within the same wallet (e.g., address 0 paying address 1 where both belong to the same mnemonic). Each HD address is treated as an independent party, consistent with the SDK's address-level isolation model.
 - **Only target parties may return.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`).
 - **Per-sender return cap (INVARIANT).** For non-terminal invoices, returns to a specific sender are **strictly prevented** from exceeding what that sender has forwarded (net of previous returns to them). `returnInvoicePayment()` throws `INVOICE_RETURN_EXCEEDS_BALANCE` before the transfer happens. This guarantees that `returnedAmount` never exceeds `coveredAmount` at the per-sender level — the `max(0, ...)` floor in the formula is a defensive safeguard, not a normal code path. This applies to both manual `returnInvoicePayment()` and auto-return.
-- **Terminal state freeze.** Once CLOSED or CANCELLED, balances are frozen and persisted. `getInvoiceStatus()` returns the persisted snapshot. No recomputation occurs. New transfers referencing the invoice are still visible via `getRelatedTransfers()`.
+- **Terminal state freeze.** Once CLOSED or CANCELLED, balances are frozen and persisted. Post-termination transfers continue to be tracked per-sender on top of the frozen baseline.
+- **CLOSED resets per-sender balances (payments accepted).** Closing means the creator accepts the payments as final. At freeze time, all pre-closure per-sender balances are reset to zero — **pre-closure payments are non-returnable.** The surplus (if any) is assigned to the **latest sender** (by local arrival timestamp — note: strict global ordering is impossible in an async system, so "latest" means the most recent transfer known to this wallet at freeze time). Post-closure per-sender tracking starts from: surplus for the latest sender, zero for all others. New forward payments after closure are tracked per-sender normally and are fully returnable.
+- **CANCELLED preserves per-sender balances (deal abandoned).** Cancellation preserves all per-sender balances as-is — everything is returnable to each sender. Post-cancellation forwards are tracked per-sender normally (added on top).
 - **Multi-asset tokens.** A single token may carry multiple coin entries (e.g., `coinData = [["UCT", "500"], ["USDU", "1000"]]`). When such a token is transferred with an invoice memo, each coin entry is matched independently against the invoice targets. One transfer of a multi-asset token may cover multiple requested assets for the same target simultaneously.
 
 ### 5.3 Multi-Asset Token Handling
@@ -1999,6 +2003,26 @@ interface FrozenCoinAssetBalances {
   readonly confirmed: boolean;
   /** Individual transfers contributing to this asset (frozen snapshot) */
   readonly transfers: InvoiceTransferRef[];
+  /**
+   * Per-sender balance baseline after freeze. This is the starting point for
+   * post-termination per-sender tracking.
+   *
+   * For CLOSED: all entries are zero EXCEPT the latest sender gets the surplus.
+   *   Pre-closure payments are accepted as final (non-returnable).
+   *   latestSender = sender of the most recent forward transfer by local arrival time.
+   * For CANCELLED: each sender's full pre-cancellation senderNetBalance is preserved.
+   *   Everything is returnable.
+   *
+   * Post-termination forwards and returns are tracked on top of these baselines.
+   */
+  readonly frozenSenderBalances: FrozenSenderBalance[];
+}
+
+interface FrozenSenderBalance {
+  readonly senderAddress: string;
+  readonly senderPubkey?: string;
+  /** Returnable balance baseline at freeze time */
+  readonly netBalance: string;
 }
 
 // Storage format: Record<string, FrozenInvoiceBalances>
@@ -2130,29 +2154,34 @@ importInvoice():
 
 closeInvoice():
   1. Compute current balances one final time
-  2. Persist frozen balances to FROZEN_BALANCES storage with `explicitClose: true`
-     (MUST complete before step 3)
-  3. Add invoiceId to CLOSED_INVOICES set in storage
-  4. If options.autoReturn:
+  2. Reset per-sender balances for frozen snapshot:
+     a. Set all pre-closure per-sender netBalance to '0' (payments accepted as final)
+     b. If surplusAmount > 0 for any target:coinId:
+        - Identify the latest sender: the sender of the most recent forward
+          transfer for that target:coinId, by local arrival timestamp
+        - Assign surplusAmount as that sender's frozenSenderBalance.netBalance
+     c. Store frozenSenderBalances[] in FrozenCoinAssetBalances
+  3. Persist frozen balances to FROZEN_BALANCES storage with `explicitClose: true`
+     (MUST complete before step 4)
+  4. Add invoiceId to CLOSED_INVOICES set in storage
+  5. If options.autoReturn:
      -> enable auto-return for this invoice
-     -> immediately return SURPLUS ONLY: decompose into individual returns
-        per sender. For each target:coinId with non-zero surplusAmount,
-        iterate senders in FIFO order (earliest forward payment first).
-        For each sender with senderNetBalance > 0, return
-        min(senderNetBalance, remaining_surplus) to that sender.
-        Each individual return uses a synthetic dedup key:
-        `(invoiceId, "CLOSE_IMMEDIATE:<targetAddress>:<senderAddress>:<coinId>")`
-        and follows the same intent-log pattern as ongoing auto-return (§7.5).
+     -> immediately return SURPLUS ONLY to the latest sender (from step 2b).
+        This is a single return per target:coinId with surplus.
+        Dedup key: `(invoiceId, "CLOSE_IMMEDIATE:<targetAddress>:<senderAddress>:<coinId>")`
+        follows the same intent-log pattern as ongoing auto-return (§7.5).
      -> use :RC memo direction
      -> Partial failure semantics: same as cancelInvoice() — completed returns
         are recorded, failed returns remain as 'pending' for crash recovery retry.
-  5. Fire 'invoice:closed' { explicit: true }
-  6. Fire 'invoice:auto_returned' for each successful surplus return (if any)
-  7. Fire 'invoice:auto_return_failed' for each failed return
+  6. Fire 'invoice:closed' { explicit: true }
+  7. Fire 'invoice:auto_returned' for each successful surplus return (if any)
+  8. Fire 'invoice:auto_return_failed' for each failed return
 
 cancelInvoice():
   1. Load cancelled set from storage
   2. Compute current balances one final time
+     Per-sender balances are PRESERVED as-is (unlike closeInvoice which resets them).
+     Each sender's full senderNetBalance is stored in frozenSenderBalances[].
   3. Persist frozen balances to FROZEN_BALANCES storage (MUST complete before step 4)
   4. Add invoiceId to CANCELLED_INVOICES set in storage
   5. If options.autoReturn:
@@ -2397,7 +2426,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
 | Caller's wallet address must match one of the invoice targets | `INVOICE_NOT_TARGET` |
-| Return amount must not exceed the per-sender net balance for the `(target=caller's address, sender=params.recipient, coinId=params.coinId)` tuple. For non-terminal invoices: `senderNetBalance` from the live balance index. For terminal invoices: frozen `senderNetBalance` minus any post-freeze returns to that specific sender (discovered via `getRelatedTransfers()` filtered to `:B`/`:RC`/`:RX` transfers from the caller's target address to `params.recipient`, with local arrival timestamp > `frozenAt`; use the transfer's indexing time, not the sender-controlled timestamp, to prevent backdating attacks). This accounts for auto-returns and manual returns to that sender that occurred after the balance was frozen. **Note:** This balance check executes inside the per-invoice gate (§5.9), ensuring the in-memory index is consistent — no concurrent return can modify it between this check and the subsequent `send()`. | `INVOICE_RETURN_EXCEEDS_BALANCE` |
+| Return amount must not exceed the effective per-sender net balance for `(target=caller's address, sender=params.recipient, coinId=params.coinId)`. **For non-terminal invoices:** `senderNetBalance` from the live balance index. **For CLOSED invoices:** the frozen baseline starts at zero for all senders except the latest sender who gets the surplus (see §7.6 `closeInvoice()` step 2). The effective returnable is: `frozenSenderBalance.netBalance + sum(post-freeze forwards from this sender) - sum(post-freeze returns to this sender)`. Pre-closure payments are non-returnable. **For CANCELLED invoices:** the frozen baseline preserves each sender's full pre-cancellation balance. The effective returnable is: `frozenSenderBalance.netBalance + sum(post-freeze forwards from this sender) - sum(post-freeze returns to this sender)`. Post-freeze transfers are discovered from the invoice-transfer index (entries with indexing timestamp > `frozenAt`). **Note:** This balance check executes inside the per-invoice gate (§5.9), ensuring the in-memory index is consistent — no concurrent return can modify it between this check and the subsequent `send()`. | `INVOICE_RETURN_EXCEEDS_BALANCE` |
 
 ### 8.7 setAutoReturn Validation
 
@@ -2772,43 +2801,54 @@ Time 2: Payer sends another token with coinData = [["UCT", "400"]]
 ## Appendix G: Termination and Auto-Return
 
 ```
---- Explicit Close with Auto-Return (surplus only) ---
+--- Explicit Close with Auto-Return (surplus only, per-sender) ---
 
 Invoice abc requests 1000 UCT from DIRECT://alice.
-Alice has received 1200 UCT via INV:abc:F (200 surplus).
+S1 sends 700 UCT (INV:abc:F) to alice.
+S2 sends 500 UCT (INV:abc:F) to alice.
+Total covered = 1200 UCT, surplus = 200 UCT.
+S2 is the latest sender (by local arrival time).
 
 Alice closes invoice (satisfied with payments):
   -> closeInvoice('abc', { autoReturn: true })
-  -> Balances frozen: covered=1200, net=1200, surplus=200
-  -> Auto-return enabled -> IMMEDIATELY returns 200 UCT surplus
-     with memo INV:abc:RC (return-for-closed)
+  -> Per-sender balances RESET: S1=0, S2=0 (pre-closure payments accepted)
+  -> Surplus 200 UCT assigned to latest sender S2
+  -> frozenSenderBalances = [{ S1: netBalance="0" }, { S2: netBalance="200" }]
+  -> Auto-return: returns 200 UCT to S2 with memo INV:abc:RC
   -> Fires invoice:closed { explicit: true }
-  -> Fires invoice:auto_returned (for the 200 surplus)
-  NOTE: Only the surplus (200) is returned, not the full 1200.
+  -> Fires invoice:auto_returned (200 UCT to S2)
+  NOTE: S1's 700 is non-returnable (accepted). Only S2's surplus is returned.
 
-Later, sender sends 500 UCT with memo INV:abc:F (unaware of closure):
+Later, S1 sends 500 UCT with memo INV:abc:F (unaware of closure):
   -> Token transfer succeeds (inbound transfers are NEVER blocked)
-  -> Auto-return enabled -> entire 500 UCT returned with INV:abc:RC
-     (any new forward payment to a CLOSED invoice is surplus by definition)
+  -> Post-closure per-sender balance: S1 now has 500 (0 baseline + 500 new)
+  -> Auto-return enabled -> entire 500 UCT returned to S1 with INV:abc:RC
   -> Fires invoice:auto_returned
+
+Later, S3 sends 300 UCT with INV:abc:F:
+  -> Post-closure: S3 has 300 (new sender, 0 baseline + 300 new)
+  -> Auto-return -> 300 UCT returned to S3 with INV:abc:RC
 
 Sender receives the auto-return (INV:abc:RC):
   -> Fires invoice:return_received { returnReason: 'closed' }
   -> If autoTerminateOnReturn is true:
      -> Sender's module auto-closes invoice abc locally
 
---- Cancellation with Auto-Return (everything) ---
+--- Cancellation with Auto-Return (everything, per-sender) ---
 
 Invoice abc requests 1000 UCT from DIRECT://alice.
-Alice has received 600 UCT via INV:abc:F (no surplus, partially covered).
+S1 sends 400 UCT (INV:abc:F) to alice.
+S2 sends 200 UCT (INV:abc:F) to alice.
+Total covered = 600 UCT (partially covered).
 
 Alice cancels invoice (abandoning the deal):
   -> cancelInvoice('abc', { autoReturn: true })
-  -> Balances frozen: covered=600, net=600
-  -> Auto-return enabled -> IMMEDIATELY returns ALL 600 UCT
+  -> Per-sender balances PRESERVED: S1=400, S2=200
+  -> frozenSenderBalances = [{ S1: netBalance="400" }, { S2: netBalance="200" }]
+  -> Auto-return: returns 400 UCT to S1, 200 UCT to S2 (each gets their full balance)
      with memo INV:abc:RX (return-for-cancelled)
   -> Fires invoice:cancelled
-  -> Fires invoice:auto_returned (for the full 600)
+  -> Fires invoice:auto_returned (400 to S1, 200 to S2)
   NOTE: Everything is returned, not just surplus.
 
 Later, sender sends 500 UCT with memo INV:abc:F (unaware of cancellation):
