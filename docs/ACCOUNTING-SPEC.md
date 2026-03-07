@@ -989,6 +989,14 @@ function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessageP
   try {
     const bytes = hexToBytes(messageHex);
     const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    // Type-guard the inv field: id must be string, dir must be string (if present).
+    // A malicious memo could pass JSON.parse but contain wrong types
+    // (e.g., { inv: { id: 123, dir: true } }). Reject non-string fields.
+    if (parsed.inv) {
+      if (typeof parsed.inv.id !== 'string' || (parsed.inv.dir !== undefined && typeof parsed.inv.dir !== 'string')) {
+        return null; // malformed inv shape — treat as no invoice reference
+      }
+    }
     // Truncate inbound txt to 1024 code points to bound index cache and
     // event payload size. Outbound is capped at 256 by buildInvoiceMemo(),
     // but inbound messages from untrusted senders may be arbitrarily long.
@@ -1323,7 +1331,7 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
 
 ### 5.2 Balance Computation Details
 
-**Arithmetic requirement:** All amount fields in invoices and transfers are strings representing non-negative integers (e.g., `"1000000"`). All arithmetic operations (sums, comparisons, differences) MUST use `BigInt` or equivalent arbitrary-precision integer parsing — **never** lexicographic string comparison or floating-point conversion. Amount strings MUST be validated on input: parseable as a non-negative integer, no leading zeros (except `"0"` itself), no whitespace, no decimal points, no sign prefix. Invalid amount strings are rejected with `INVOICE_INVALID_AMOUNT`.
+**Arithmetic requirement:** All amount fields in invoices and transfers are strings representing non-negative integers (e.g., `"1000000"`). All arithmetic operations (sums, comparisons, differences) MUST use `BigInt` or equivalent arbitrary-precision integer parsing — **never** lexicographic string comparison or floating-point conversion. Amount strings MUST be validated on input: parseable as a non-negative integer, no leading zeros (except `"0"` itself), no whitespace, no decimal points, no sign prefix. **Length limit:** Amount strings MUST NOT exceed 78 digits (sufficient to represent 2^256, the maximum for any practical token amount). Strings exceeding this length are rejected before `BigInt` parsing to prevent CPU exhaustion from adversarial inputs. Invalid amount strings are rejected with `INVOICE_INVALID_AMOUNT`.
 
 **The core formula for each target:asset:**
 
@@ -1477,7 +1485,10 @@ processTokenTransactions(token: Token, startIndex: number):
   txf = JSON.parse(token.sdkData) as TxfToken
   coinData = txf.genesis.data.coinData   // multi-asset: [string, string][]
 
-  For each transaction tx at index i in txf.transactions[startIndex..]:
+  // NOTE: `absIdx` is the ABSOLUTE index into txf.transactions[].
+  // The loop starts at startIndex and increments. All array accesses use
+  // absIdx directly — no double-offsetting (startIndex + i).
+  For each transaction tx at absolute index absIdx in txf.transactions[startIndex..]:
     1. Decode invoice reference from on-chain message (§4.1):
        payload = decodeTransferMessage(tx)
        If payload?.inv is present:
@@ -1525,9 +1536,18 @@ processTokenTransactions(token: Token, startIndex: number):
        // (reset tokenScanState) is sufficient to re-derive all transferIds.
        //
        // Reconstruction from tx.data:
+       //   tx.data in TxfTransaction is a Record<string, unknown> parsed from
+       //   the TXF JSON. The SDK provides TransferTransactionData.fromJSON()
+       //   which accepts this shape. Note: despite the field being CBOR-encoded
+       //   on-chain, the TXF serializer has already decoded it to JSON by the
+       //   time it reaches TxfTransaction.data.
        //   const txData = TransferTransactionData.fromJSON(tx.data);
        //   const hash = await txData.calculateHash();
        //   transferId = bytesToHex(hash.data);  // 64-char hex
+       //
+       // IMPORTANT: Use fromJSON(), NOT fromCBOR(). The TxfTransaction.data
+       // field is the JSON-decoded form. fromCBOR() expects raw CBOR bytes
+       // and would fail on the already-decoded object.
        transferId = bytesToHex((await TransferTransactionData.fromJSON(tx.data).calculateHash()).data)
        // Edge case: TxfTransaction.data is typed as optional (Record<string, unknown> | undefined).
        // If tx.data is missing, skip this transaction — it cannot be linked to an invoice
@@ -1541,12 +1561,16 @@ processTokenTransactions(token: Token, startIndex: number):
        // previous transaction, or the genesis recipient for the first tx.
        //
        // Sender derivation:
-       //   - For transaction at index 0: sender = genesis.data.recipient
+       //   - For transaction at absIdx 0: sender = genesis.data.recipient
        //     (the original minter/owner)
-       //   - For transaction at index N > 0: sender = derived from
+       //   - For transaction at absIdx N > 0: sender = derived from
        //     txf.transactions[N-1].predicate via UnmaskedPredicate.fromCBOR()
        //     (the predicate set by transaction N-1 identifies the owner
        //     before transaction N transferred the token)
+       //
+       // NOTE: absIdx is the ABSOLUTE index into txf.transactions[].
+       // The guard uses absIdx === 0 (not relative to startIndex).
+       // The previous-predicate lookup uses absIdx - 1 (no double-offset).
        //
        // Extract the public key from the predicate, then derive the
        // DIRECT:// address from it.
@@ -1556,12 +1580,12 @@ processTokenTransactions(token: Token, startIndex: number):
        // set senderAddress to null and classify the transfer as irrelevant
        // (reason: 'sender_unresolvable') downstream if sender is required
        // (e.g., for return matching or self-payment detection).
-       senderAddress = (i === 0)
+       senderAddress = (absIdx === 0)
          ? txf.genesis.data.recipient
          : (() => {
              try {
                return deriveDIRECTAddress(UnmaskedPredicate.fromCBOR(
-                 hexToBytes(txf.transactions[startIndex + i - 1].predicate)
+                 hexToBytes(txf.transactions[absIdx - 1].predicate)
                ).publicKey);
              } catch {
                return null;  // masked predicate — sender unknown
@@ -1579,7 +1603,13 @@ processTokenTransactions(token: Token, startIndex: number):
           - coinId, amount
           - senderAddress (may be null if predicate was masked),
             recipientAddress
-          - timestamp: tx.inclusionProof?.authenticator timestamp or Date.now()
+          - timestamp: Date.now()
+            // NOTE: TxfAuthenticator does not have a timestamp field.
+            // Use the local clock when the transaction is first processed.
+            // For confirmed transactions, the inclusion proof provides ordering
+            // via its position in the SMT, but no extractable timestamp.
+            // The timestamp is informational (display/sorting) — all balance
+            // computation and ordering uses the TXF transaction chain index.
           - confirmed: tx.inclusionProof !== null
           NOTE: If senderAddress is null (masked predicate), the entry is
           still indexed. Self-payment detection (§5.2) skips entries with
@@ -1753,15 +1783,19 @@ All state-mutating operations on a given invoice are serialized through a **per-
   over-return is direct fund loss with no automatic recovery. Serialization
   prevents two concurrent returns from both passing the balance check before
   either's send completes. Returns are infrequent, so the blocking cost is
-  acceptable. **Timeout:** Implementations SHOULD apply a timeout to the
-  `send()` call within the gate (recommended: 60 seconds). If the timeout
+  acceptable. **Timeout:** Implementations MUST apply a 60-second timeout to the
+  `send()` call within the gate. If the timeout
   fires, release the gate and reject the return with a timeout error. The
   dedup ledger is NOT written until after send succeeds, so a timed-out
   return leaves no ledger entry and can be safely retried by the caller.
   **Index update:** After a successful `send()` inside the gate,
   `returnInvoicePayment()` MUST synchronously update the in-memory
   invoice-transfer index with the new outbound return transfer BEFORE
-  releasing the gate. This ensures the next serialized operation's balance
+  releasing the gate. The update sequence inside the gate is:
+  (1) call `send()` → (2) update invoice-transfer index (synchronous) →
+  (3) write dedup ledger entry as 'completed' → (4) invalidate balanceCache →
+  (5) release gate.
+  This ensures the next serialized operation's balance
   check (via `getRelatedTransfers()`) sees the return. Do not rely on the
   async event path (transfer:confirmed) for intra-gate consistency.
 
@@ -2194,6 +2228,11 @@ interface FrozenCoinAssetBalances {
    *   Everything is returnable.
    *
    * Post-termination forwards and returns are tracked on top of these baselines.
+   * Post-termination identification: A transfer is "post-termination" if its
+   * entry was NOT in the frozen snapshot (i.e., it was added to the live
+   * invoiceLedger after the freeze). This is determined by set difference
+   * (live ledger keys minus frozen transfer IDs), NOT by timestamp comparison.
+   * The frozenAt timestamp is informational only — not used for filtering.
    */
   readonly frozenSenderBalances: FrozenSenderBalance[];
   /**
@@ -2422,6 +2461,9 @@ setAutoReturn():
        the next call or on future inbound events. This prevents unbounded
        execution time when thousands of terminated invoices exist. Progress is
        tracked via the dedup ledger (completed entries are skipped on retry).
+       **Cooldown:** Implementations MUST enforce a minimum 5-second cooldown
+       between `setAutoReturn('*')` calls to prevent tight-loop abuse.
+       Calls within the cooldown window are rejected with `RATE_LIMITED`.
        The caller receives the count of invoices processed and remaining via
        the returned promise (future: consider returning a progress object).
        - CLOSED -> return surplus only
@@ -2542,7 +2584,7 @@ private balanceCache: Map<string, InvoiceBalanceSnapshot>;
 
 **Key properties:**
 
-- **Persistent and partitioned:** Each invoice's transfer entries are stored under a separate key (`inv_ledger:{invoiceId}`). This allows targeted reads/writes without loading the entire dataset.
+- **Persistent and partitioned:** Each invoice's transfer entries are stored under a separate key (`inv_ledger:{invoiceId}`). This allows targeted reads/writes without loading the entire dataset. **Growth bound:** For invoices with very high transfer counts (thousands of micro-payments), the per-invoice key may grow large. Implementations SHOULD monitor per-key size and log a warning when an `inv_ledger:{invoiceId}` entry exceeds 1MB. No automatic compaction is specified — the partitioned design ensures that large invoices do not impact reads of other invoices.
 - **Idempotent updates by (transferId, coinId):** The composite dedup key ensures that reprocessing the same transfer is a no-op. This is critical because `returnInvoicePayment()` synchronously updates the index after `send()` (§5.9), and the subsequent async event must not produce a duplicate.
 - **Terminal invoices included:** The index records ALL invoice-related transfers regardless of terminal state. Frozen balances are a separate point-in-time snapshot. The index powers `getRelatedTransfers()` (complete picture); frozen balances power `getInvoiceStatus()` for terminal invoices (snapshot at termination).
 - **Multi-asset correctness:** Each transfer is expanded into per-coin entries at processing time using the token's full `coinData` from `TxfToken.genesis.data.coinData`. Once captured, no token lookup is needed at query time.
@@ -2585,7 +2627,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Each target must have a valid DIRECT:// address | `INVOICE_INVALID_ADDRESS` |
 | Each target must have at least one asset | `INVOICE_NO_ASSETS` |
 | Each asset must have exactly one of `coin` or `nft` set | `INVOICE_INVALID_ASSET` |
-| Each coin asset's amount (tuple index 1) must be a positive integer string | `INVOICE_INVALID_AMOUNT` |
+| Each coin asset's amount (tuple index 1) must be a positive integer string, max 78 digits | `INVOICE_INVALID_AMOUNT` |
 | Each coin asset's coinId (tuple index 0) must be non-empty, alphanumeric only (`/^[A-Za-z0-9]+$/`), max 20 characters | `INVOICE_INVALID_COIN` |
 | Each NFT asset's tokenId must be non-empty (64-char hex) | `INVOICE_INVALID_NFT` |
 | `dueDate` (if provided) must be in the future | `INVOICE_PAST_DUE_DATE` |
@@ -2703,11 +2745,16 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 // the per-invoice gate before the query returns. This ensures atomicity: no
 // other operation can interleave between freeze and auto-return. The Connect
 // query blocks until the full close+auto-return sequence finishes. Wallet
-// hosts SHOULD rate-limit sphere_getInvoiceStatus calls from dApps (e.g.,
-// max 1 call/second per invoiceId, AND max 10 calls/second aggregate across
-// all invoiceIds per session) to prevent a malicious dApp from:
+// hosts MUST rate-limit sphere_getInvoiceStatus calls from dApps:
+// - Max 1 call/second per invoiceId
+// - Max 10 calls/second aggregate across all invoiceIds per session
+// This is REQUIRED (not optional) to prevent a malicious dApp from:
 // (a) triggering implicit close cascades by rapidly querying all invoices,
 // (b) draining wallet funds via auto-return sends triggered by queries.
+// A dApp with invoice:read permission can trigger fund-moving operations
+// (auto-return sends) purely through queries — rate limiting is the primary
+// defense against abuse. Without it, a polling loop can close every invoice
+// and drain surplus funds without user confirmation.
 // Note: getInvoiceStatus is classified as a QUERY (invoice:read permission),
 // but its implicit close side effect can trigger token sends (auto-return).
 // This is a known design trade-off — alternatives (separate explicit trigger,
@@ -2884,6 +2931,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_TOO_MANY_ASSETS` | Target exceeds maximum of 50 assets | Too many assets in a single target |
 | `INVOICE_MEMO_TOO_LONG` | Invoice memo exceeds maximum of 4096 characters | InvoiceTerms.memo too long |
 | `INVOICE_TERMS_TOO_LARGE` | Serialized invoice terms exceed 64 KB limit | Aggregate size of all targets, assets, memo, deliveryMethods too large |
+| `RATE_LIMITED` | Operation rate-limited, try again later | `setAutoReturn('*')` called within 5-second cooldown |
 
 Note: `INVOICE_INVALID_ID` and `INVOICE_MINT_FAILED` are thrown from internal utilities (`buildInvoiceMemo` and the minting flow respectively), not from §8 validation tables. They are included here for completeness.
 

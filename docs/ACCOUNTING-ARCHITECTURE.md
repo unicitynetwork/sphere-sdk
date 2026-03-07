@@ -422,7 +422,7 @@ The accounting module wraps all its inbound event processing in try/catch guards
 **Serialized operations (per invoice):**
 - `closeInvoice()`
 - `cancelInvoice()`
-- `returnInvoicePayment()` — holds gate through validation+send to prevent concurrent double-return on terminal invoices (over-return is fund loss, unlike over-payment which is benign). After successful send(), synchronously updates the in-memory invoice-transfer index before releasing the gate (ensures next serialized operation sees the return). Implementations SHOULD apply a 60-second timeout to the send() call within the gate to prevent starvation of other serialized operations on the same invoice.
+- `returnInvoicePayment()` — holds gate through validation+send to prevent concurrent double-return on terminal invoices (over-return is fund loss, unlike over-payment which is benign). After successful send(), synchronously updates the in-memory invoice-transfer index before releasing the gate (ensures next serialized operation sees the return). Implementations MUST apply a 60-second timeout to the send() call within the gate to prevent starvation of other serialized operations on the same invoice.
 - Implicit close (all targets covered + confirmed)
 - Auto-return execution (both immediate and ongoing)
 - `setAutoReturn()` immediate trigger
@@ -628,7 +628,7 @@ Additional per-address storage keys (the `StorageProvider` handles key scoping �
 | Storage Key (logical) | Scope | Content |
 |------------|-------|---------|
 | `cancelled_invoices` | Per-address | Set of cancelled invoice IDs (JSON array) |
-| `closed_invoices` | Per-address | Set of closed invoice IDs — both explicit `closeInvoice()` and implicit all-covered+confirmed (JSON array) |
+| `closed_invoices` | Per-address | Set of closed invoice IDs — explicit `closeInvoice()`, implicit all-covered+confirmed (triggered by `getInvoiceStatus()` or inbound event processing), and sender-side `autoTerminateOnReturn` (JSON array) |
 | `frozen_balances` | Per-address | Frozen balance snapshots for terminated invoices (JSON map) |
 | `auto_return` | Per-address | Auto-return settings: per-invoice flags and global flag (JSON) |
 | `auto_return_ledger` | Per-address | Auto-return deduplication ledger: tracks which transfers have been returned (JSON) |
