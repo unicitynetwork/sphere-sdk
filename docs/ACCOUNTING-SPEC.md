@@ -8,7 +8,7 @@
 1. [Types](#1-types)
 2. [Module API](#2-module-api)
 3. [Invoice Minting](#3-invoice-minting)
-4. [Memo Format](#4-memo-format)
+4. [Invoice Reference Encoding](#4-invoice-reference-encoding)
 5. [Status Computation](#5-status-computation)
 6. [Events](#6-events)
 7. [Storage](#7-storage)
@@ -759,8 +759,8 @@ class AccountingModule {
 interface InvoiceMemoRef {
   /** Invoice token ID (64-char hex) */
   readonly invoiceId: string;
-  /** Payment direction */
-  readonly direction: 'forward' | 'back' | 'return_closed' | 'return_cancelled';
+  /** Payment direction (matches InvoiceTransferRef.paymentDirection values) */
+  readonly paymentDirection: 'forward' | 'back' | 'return_closed' | 'return_cancelled';
   /** Optional free text after the structured prefix */
   readonly freeText?: string;
 }
@@ -1001,6 +1001,11 @@ function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessageP
       if (typeof parsed.inv.id !== 'string' || (parsed.inv.dir !== undefined && typeof parsed.inv.dir !== 'string')) {
         return null; // malformed inv shape — treat as no invoice reference
       }
+      // Normalize id to lowercase before validation — matches parseInvoiceMemo()
+      // behavior. Without this, an on-chain message with uppercase hex would fail
+      // validation here, causing the fallback to the transport memo to activate
+      // with a different authority source (split-brain indexing risk).
+      parsed.inv.id = parsed.inv.id.toLowerCase();
       // Format validation: id must be 64-char lowercase hex, dir must be known value
       if (!/^[0-9a-f]{64}$/.test(parsed.inv.id)) {
         return null; // invalid invoice ID format
@@ -1063,7 +1068,7 @@ function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
   const match = memo.match(INVOICE_MEMO_REGEX);
   if (!match) return null;
 
-  let direction: InvoiceMemoRef['direction'];
+  let direction: InvoiceMemoRef['paymentDirection'];
   switch (match[2]) {
     case 'B':  direction = 'back'; break;
     case 'RC': direction = 'return_closed'; break;
@@ -1084,7 +1089,7 @@ function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
 
   return {
     invoiceId: match[1].toLowerCase(),
-    direction,
+    paymentDirection: direction,
     freeText,
   };
 }
@@ -1126,14 +1131,22 @@ function buildInvoiceMemo(
 
 **PaymentsModule.send() MUST be modified** to encode the `TransferRequest.memo` into BOTH the Nostr transport payload AND the on-chain `TransferTransactionData.message` field. Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter — this must change.
 
+> **PREREQUISITE:** The upstream `@unicitylabs/state-transition-sdk` must be modified
+> to add a `message: Uint8Array | null` parameter to `TransferCommitment.create()`.
+> The current SDK signature is `(token, address, salt, recipientData, recipientDataHash,
+> signingService)` with no `message` parameter. The BEFORE/AFTER code below assumes
+> this upstream change has been made. The `message` parameter position shown below
+> (after `recipientDataHash`) is illustrative — the actual position will be determined
+> by the upstream API change.
+
 **Required change to PaymentsModule.send():**
 
 ```typescript
-// BEFORE (current code — message always null):
+// BEFORE (current code — no message parameter; recipientData and recipientDataHash are null):
 const commitment = await TransferCommitment.create(
   sdkToken, recipientAddress, salt,
+  null,  // recipientData
   null,  // recipientDataHash
-  null,  // message  ← ALWAYS NULL
   signingService
 );
 
@@ -1165,7 +1178,7 @@ function parseInvoiceMemoForOnChain(memo: string | undefined): Uint8Array | null
     // Invoice-related: encode as structured TransferMessagePayload
     const dirMap = { forward: 'F', back: 'B', return_closed: 'RC', return_cancelled: 'RX' } as const;
     const payload: TransferMessagePayload = {
-      inv: { id: ref.invoiceId, dir: dirMap[ref.direction] },
+      inv: { id: ref.invoiceId, dir: dirMap[ref.paymentDirection] },
       ...(ref.freeText ? { txt: ref.freeText } : {}),
     };
     return new TextEncoder().encode(JSON.stringify(payload));
@@ -1652,13 +1665,19 @@ processTokenTransactions(token: Token, startIndex: number):
        // coin types will have trailing entries silently ignored. In practice,
        // tokens carry 1-3 coin types. The cap is a defense against adversarial
        // tokens with thousands of entries causing O(N) processing per transaction.
-       a. Skip if !/^[1-9][0-9]*$/.test(amount) or amount.length > 78
+       a. Skip if amount.length > 78 or !/^[1-9][0-9]*$/.test(amount)
+          // LENGTH CHECK FIRST (short-circuit): prevents regex engine from
+          // scanning multi-million-character adversarial strings before rejection.
           // Rejects: "0", negative ("-500"), non-numeric ("abc"), decimals ("12.5"),
           // leading zeros ("007"), whitespace, empty strings, and strings > 78 digits.
           // This is the INBOUND validation — token coinData is adversarial input.
           // Only positive integer strings survive to BigInt balance computation.
        b. entryKey = `${transferId}::${coinId}`
        c. invoiceMap = invoiceLedger.get(ref.invoiceId)
+          // Lazy creation: if invoiceLedger does not have an entry for
+          // ref.invoiceId (e.g., cold start with stale inv_ledger_index),
+          // create an empty Map before proceeding.
+          if (!invoiceMap) { invoiceMap = new Map(); invoiceLedger.set(ref.invoiceId, invoiceMap); }
        d. If invoiceMap.has(entryKey): continue  // dedup
        e. Create InvoiceTransferRef:
           - transferId
@@ -1666,7 +1685,7 @@ processTokenTransactions(token: Token, startIndex: number):
             senderAddress/destinationAddress against this wallet's addresses
             (from getActiveAddresses()). If senderAddress matches a wallet
             address → 'outbound'; otherwise → 'inbound'.
-          - paymentDirection: ref.direction  // 'forward' | 'back' | 'return_closed' | 'return_cancelled'
+          - paymentDirection: ref.paymentDirection  // 'forward' | 'back' | 'return_closed' | 'return_cancelled'
           - coinId, amount
           - senderAddress (may be null if predicate was masked),
             destinationAddress
@@ -1984,7 +2003,7 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
 'invoice:payment': {
   invoiceId: string;
   transfer: InvoiceTransferRef;
-  direction: 'forward' | 'back' | 'return_closed' | 'return_cancelled';
+  paymentDirection: 'forward' | 'back' | 'return_closed' | 'return_cancelled';
   confirmed: boolean;
 };
 
@@ -2071,11 +2090,16 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
 
 ```
 On PaymentsModule 'transfer:incoming' or 'history:updated':
-  1. Parse memo -> get invoiceId, direction
+  1. Parse memo -> get invoiceId, paymentDirection (from InvoiceMemoRef)
   2. If invoiceId not in local token storage:
      -> fire 'invoice:unknown_reference' { invoiceId, transfer }
      -> return
-  3. If direction is 'return_closed' or 'return_cancelled':
+  3. If paymentDirection is 'return_closed' or 'return_cancelled':
+     -> Process transfer into index via processTokenTransactions() (§5.4.3)
+        FIRST, before gate acquisition. This ensures the return transfer is
+        indexed in invoiceLedger (updating returnedAmount) regardless of
+        whether the gate body terminates the invoice. The returned
+        InvoiceTransferRef entries are passed to subsequent steps.
      -> **acquire per-invoice gate** (serializes all return processing for
         this invoice; released at end of step 3 or on early return)
      a. **Validate sender:** check that the transfer's sender address matches
@@ -2112,7 +2136,9 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
         (if already terminated, returns immediately — no double-freeze).
         It performs the same steps as closeInvoice()/cancelInvoice()
         (compute balances, freeze, persist to terminal set) but skips
-        the outer gate acquisition.
+        the outer gate acquisition. **Write order:** terminal set FIRST,
+        frozen balances SECOND — matching closeInvoice()/cancelInvoice()
+        (see §7.6 crash recovery rationale).
         **Trust note:** A legitimate target CAN send :RC/:RX even if the
         invoice is not actually closed/cancelled on their side. The payer's
         `autoTerminateOnReturn` trusts the target's direction code at face
@@ -2123,14 +2149,16 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
      -> return (releasing gate)
   4. Process transfer into index via processTokenTransactions() (§5.4.3)
      This builds InvoiceTransferRef entries and updates invoiceLedger.
+     Returns the list of newly-created InvoiceTransferRef entries for use
+     by subsequent steps (including transferId, coinId, amount, senderAddress).
      NOTE: This step runs for ALL invoices (terminal and non-terminal) so that
      post-termination transfers are captured in the index for getRelatedTransfers().
   5. If invoice is in terminal state (CLOSED or CANCELLED):
      -> fire 'invoice:payment' (transfer is still recorded)
-     -> if direction is 'forward' AND auto-return enabled (perInvoice[id] ?? global)
+     -> if paymentDirection is 'forward' AND auto-return enabled (perInvoice[id] ?? global)
         AND wallet is a target:
         -> **acquire per-invoice gate** (entire auto-return block is serialized)
-        -> inside gate:
+        -> inside gate (using InvoiceTransferRef entries returned by step 4):
            - check dedup ledger for (invoiceId, transferId) — skip if status='completed'
              ('failed' entries are also skipped here — they are only retried via
              setAutoReturn(), which explicitly resets them to 'pending' first)
@@ -2143,13 +2171,16 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
              (Any new forward payment to a terminated invoice is surplus by
              definition; return is always to the specific sender.)
            - use :RC for CLOSED, :RX for CANCELLED
+             The freeText parameter MUST be set to the originalTransferId
+             (from the InvoiceTransferRef returned by step 4) to enable
+             secondary dedup matching (§7.5).
            - update dedup ledger entry to status='completed'
            - fire 'invoice:auto_returned'
      -> do not fire balance-related events (frozen)
      -> return
   6. (Non-terminal invoices only) Match transfer against invoice targets (using index entries):
      a. If matches target + asset:
-        -> fire 'invoice:payment' { invoiceId, transfer, direction, confirmed }
+        -> fire 'invoice:payment' { invoiceId, transfer, paymentDirection, confirmed }
      b. If doesn't match any target/asset:
         -> fire 'invoice:irrelevant' { invoiceId, transfer, reason, confirmed }
   7. (Non-terminal invoices only) Recompute status:

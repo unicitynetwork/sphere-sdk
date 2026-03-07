@@ -406,7 +406,7 @@ When an invoice transitions to a terminal state (CLOSED or CANCELLED), multiple 
 1. **Terminal set FIRST:** Add invoiceId to `closed_invoices` or `cancelled_invoices` set and persist.
 2. **Frozen balances SECOND:** Compute balance snapshot and persist to `frozen_balances`.
 
-**Rationale:** If the process crashes between steps 1 and 2, recovery (during `load()`) detects the orphaned terminal set entry (no corresponding frozen balance) and recomputes the frozen balance from the live index. The inverse crash (frozen balance written but not in terminal set) is handled by forward reconciliation: orphaned frozen balances are matched to their terminal set. See SPEC §5.9 for full crash recovery semantics.
+**Rationale:** If the process crashes between steps 1 and 2, recovery (during `load()`) detects the orphaned terminal set entry (no corresponding frozen balance) and recomputes the frozen balance from the live index. The inverse crash (frozen balance written but not in terminal set) is handled by forward reconciliation: orphaned frozen balances are matched to their terminal set. See SPEC §7.6 for full crash recovery semantics.
 
 ### 4.7 Non-Blocking Inbound Guarantee
 
@@ -457,7 +457,7 @@ Status is **computed on-demand** for non-terminal invoices. For terminal invoice
 
 1. Reads the invoice terms from the token's genesis `tokenData`
 2. Checks if the invoice is in a terminal state (CLOSED or CANCELLED) — if so, returns the persisted frozen status (but `allConfirmed` is still dynamically derived)
-3. Reads from the **in-memory invoice-transfer index** (`invoiceLedger`) — NOT from `PaymentsModule.getHistory()`. The index is populated at load time and kept current by `transfer:incoming` / `transfer:confirmed` event handlers (see §3.7.2)
+3. Reads from the **in-memory invoice-transfer index** (`invoiceLedger`) — NOT from `PaymentsModule.getHistory()`. The index is populated at load time and kept current by `transfer:incoming` / `transfer:confirmed` event handlers (see SPEC §5.4.5)
 4. Aggregates forward and back/return payments per target per asset from the index entries
 5. Computes `netCoveredAmount = max(0, coveredAmount - returnedAmount)` for each target:asset
 6. Determines which targets are covered, partially covered, or untouched
@@ -564,7 +564,7 @@ The AccountingModule registers a memo parser that extracts:
 - `direction` — `'forward'` (F or default), `'back'` (B), `'return_closed'` (RC), or `'return_cancelled'` (RX)
 - `freeText` — remaining memo content
 
-No changes to `TransferRequest` or the transport layer are needed. However, `PaymentsModule.send()` **must be modified** to encode `TransferRequest.memo` into the on-chain `TransferTransactionData.message` field (see §3.7.1).
+No changes to `TransferRequest` or the transport layer are needed. However, `PaymentsModule.send()` **must be modified** to encode `TransferRequest.memo` into the on-chain `TransferTransactionData.message` field (see SPEC §4.7).
 
 **Memo injection defense:** The `INV:` memo field is user-controlled — any sender can write any memo. The canonical parser (`parseInvoiceMemo()`) is the sole authority for extracting invoice references. The parser validates the invoice ID format (64-char hex `[0-9a-fA-F]{64}` — guaranteed colon-free and space-free by the SHA-256 derivation), rejects malformed prefixes, and normalizes direction codes. Invalid or unrecognized formats are ignored (treated as non-invoice transfers). Direction codes from untrusted senders are validated against sender identity (see §6.2 sender restriction) before being accepted. Applications MUST NOT parse invoice memos manually — always use `parseInvoiceMemo()`.
 
@@ -668,7 +668,7 @@ Added to `SphereEventType` and `SphereEventMap`:
 | Event | Payload | When |
 |-------|---------|------|
 | `invoice:created` | `{ invoiceId, confirmed }` | Invoice token minted |
-| `invoice:payment` | `{ invoiceId, transfer, direction, confirmed }` | Payment matched to invoice (forward or back/return) |
+| `invoice:payment` | `{ invoiceId, transfer, paymentDirection, confirmed }` | Payment matched to invoice (forward or back/return) |
 | `invoice:asset_covered` | `{ invoiceId, address, coinId, confirmed }` | One asset fully covered for one target |
 | `invoice:target_covered` | `{ invoiceId, address, confirmed }` | All assets for one target covered |
 | `invoice:covered` | `{ invoiceId, confirmed }` | All targets covered (may be unconfirmed) |
@@ -703,7 +703,7 @@ All events with a `confirmed` field follow this contract:
 | `sphere_getInvoices` | List invoices (with optional filters) |
 | `sphere_getInvoiceStatus` | Get computed status of a specific invoice |
 
-**Rate-limiting requirement for `sphere_getInvoiceStatus`:** This query has an implicit close side effect — when it detects all targets covered + all confirmed, it acquires the per-invoice gate and triggers freeze + auto-return. Wallet hosts MUST rate-limit calls from dApps: max 1 call/second per invoiceId and max 10 calls/second aggregate per session. Without rate limiting, a malicious dApp with `invoice:read` permission can trigger fund-moving operations (auto-return sends) purely through rapid query polling. See SPEC §8.2 for full rationale.
+**Rate-limiting requirement for `sphere_getInvoiceStatus`:** This query has an implicit close side effect — when it detects all targets covered + all confirmed, it acquires the per-invoice gate and triggers freeze + auto-return. Wallet hosts MUST rate-limit calls from dApps: max 1 call/second per invoiceId and max 10 calls/second aggregate per session. Without rate limiting, a malicious dApp with `invoice:read` permission can trigger fund-moving operations (auto-return sends) purely through rapid query polling. See SPEC §9.1 for full rationale.
 
 ### 8.2 New Intent Actions
 
@@ -751,7 +751,7 @@ Invoice OPEN
 - The recipient can spend those tokens freely (for other invoices, purchases, etc.) without affecting the current invoice's covered balance.
 - The invoice balance is based on the **memo-referenced transfer history**, not on whether the tokens are still in the wallet.
 - The recipient CAN affect the invoice balance by making new transfers that reference the same invoice:
-  - Forward payment to self (`INV:xxx:F`) — excluded (self-payments are not counted, see §3.6 rule 3)
+  - Forward payment to self (`INV:xxx:F`) — excluded (self-payments are not counted, see SPEC §5.2)
   - Return payment (`INV:xxx:B`) — decreases balance
 
 ### 9.3 Payer/Sender View
