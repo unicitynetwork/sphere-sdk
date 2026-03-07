@@ -1470,17 +1470,29 @@ processTokenTransactions(token: Token, startIndex: number):
        continue
 
     4. Derive transferId from tx:
-       // ALWAYS use the deterministic fallback hash as the canonical transferId.
-       // This ensures the ID is STABLE across sessions — if a token is first
-       // seen unconfirmed (inclusionProof === null) and later confirmed
-       // (inclusionProof added), the transferId does not change.
-       // Using transactionHash would cause the dedup key to change on
-       // confirmation, producing duplicate index entries.
-       transferId = sha256(tx.previousStateHash + ':' + (tx.newStateHash ?? ''))
-       // The inclusionProof.transactionHash is NOT used for transferId because
-       // it is unavailable for unconfirmed transactions and would create an
-       // unstable key. The previousStateHash + newStateHash pair is unique per
-       // state transition and available immediately.
+       // Use the SDK's own TransferTransactionData hash — the canonical identity
+       // of a state transition. Recompute on demand from tx.data; NEVER store
+       // separately (avoids confusion if stored hash diverges from actual data).
+       //
+       // tx.data contains the serialized TransferTransactionData fields.
+       // Reconstruct the TransferTransactionData object from tx.data, then call
+       // calculateHash() which computes SHA256(TransferTransactionData.toCBOR()).
+       //
+       // This hash is STABLE: it is computed from the transaction data itself
+       // (sourceState, recipient, salt, message, nametags), which is immutable
+       // once the transaction is created. It does NOT depend on the inclusion
+       // proof — the same hash is produced whether the transaction is confirmed
+       // or unconfirmed. It is the same value that appears in
+       // inclusionProof.transactionHash after confirmation.
+       //
+       // Reconstruction from tx.data:
+       //   const txData = TransferTransactionData.fromJSON(tx.data);
+       //   const hash = await txData.calculateHash();
+       //   transferId = bytesToHex(hash.data);  // 64-char hex
+       transferId = bytesToHex((await TransferTransactionData.fromJSON(tx.data).calculateHash()).data)
+       // Edge case: TxfTransaction.data is typed as optional (Record<string, unknown> | undefined).
+       // If tx.data is missing, skip this transaction — it cannot be linked to an invoice
+       // without its transaction data. This should not occur for well-formed tokens.
 
     5. Resolve sender/recipient from tx and token state:
        recipientAddress = (tx.data as any)?.recipient   // TransferTransactionData.recipient
