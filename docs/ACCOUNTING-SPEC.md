@@ -907,9 +907,83 @@ function canonicalSerialize(terms: InvoiceTerms): Uint8Array {
 
 ---
 
-## 4. Memo Format
+## 4. Invoice Reference Encoding
 
-### 4.1 Grammar
+Invoice references are recorded in **two places** for every invoice-related transfer:
+
+1. **On-chain (primary, authoritative):** The `TransferTransactionData.message` field in the token's proof chain carries a structured `TransferMessagePayload`. This is embedded in the aggregator's Sparse Merkle Tree and is verifiable. The accounting module reads invoice references from token transaction histories.
+
+2. **Transport memo (secondary, display):** The `TransferRequest.memo` field carried via Nostr transport uses the `INV:` text format. This provides human-readable context and backward compatibility. It is NOT the authoritative source for invoice linking.
+
+### 4.1 On-Chain Format: TransferMessagePayload (Primary)
+
+The `TransferTransactionData.message` field (`Uint8Array | null`) carries a UTF-8 encoded JSON payload:
+
+```typescript
+/**
+ * Structured payload for the on-chain TransferTransactionData.message field.
+ * This is the AUTHORITATIVE source for linking a token transfer to an invoice.
+ *
+ * Encoding: new TextEncoder().encode(JSON.stringify(payload))
+ * Decoding: JSON.parse(new TextDecoder().decode(messageBytes))
+ *
+ * The `inv` field is RESERVED for invoice references. Other fields may be
+ * added in future versions. Unknown fields MUST be ignored by parsers.
+ */
+interface TransferMessagePayload {
+  /** Invoice reference (present only for invoice-related transfers) */
+  readonly inv?: {
+    /** Invoice token ID (64-char hex, lowercase) */
+    readonly id: string;
+    /** Direction code: F=forward, B=back, RC=return-closed, RX=return-cancelled */
+    readonly dir: 'F' | 'B' | 'RC' | 'RX';
+  };
+  /** Human-readable text (optional, max 256 code points) */
+  readonly txt?: string;
+}
+```
+
+**Encoding:**
+
+```typescript
+function encodeTransferMessage(payload: TransferMessagePayload): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify(payload));
+}
+```
+
+**Decoding from TxfTransaction:**
+
+```typescript
+function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessagePayload | null {
+  const messageHex = (txfTransaction.data as any)?.message;
+  if (!messageHex || typeof messageHex !== 'string') return null;
+  try {
+    const bytes = hexToBytes(messageHex);
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null; // malformed or non-JSON message — treat as no invoice reference
+  }
+}
+```
+
+**Validation:** The `inv.id` field MUST be a 64-char lowercase hex string. The `inv.dir` field MUST be one of `'F'`, `'B'`, `'RC'`, `'RX'`. Payloads failing validation are treated as non-invoice transfers (no error thrown, silently ignored).
+
+### 4.2 Direction Codes
+
+| Code | Constant | Meaning | Balance effect | Auto-returnable | Who can send |
+|------|----------|---------|----------------|-----------------|--------------|
+| `F` | `'forward'` | Forward payment towards covering the invoice | +coveredAmount | Yes | Anyone |
+| `B` | `'back'` | Manual return/refund | +returnedAmount | **No** | **Target only** |
+| `RC` | `'return_closed'` | Auto-return because invoice is closed | +returnedAmount | **No** | **Target only** |
+| `RX` | `'return_cancelled'` | Auto-return because invoice is cancelled | +returnedAmount | **No** | **Target only** |
+
+All return directions (`B`, `RC`, `RX`) have the same effect on balance computation — they increase `returnedAmount`. The distinction is semantic.
+
+**Sender restriction:** Only a party whose wallet address matches one of the invoice targets may send return payments (`B`, `RC`, `RX`). Non-target parties can only make forward payments (`F`). The `returnInvoicePayment()` method and auto-return system enforce this with `INVOICE_NOT_TARGET`.
+
+### 4.3 Transport Memo Format (Secondary)
+
+The Nostr transport memo uses a text format for human-readable display and backward compatibility with pre-accounting-module transfers:
 
 ```
 invoice-memo  = "INV:" invoice-id [ ":" direction ] [ " " free-text ]
@@ -918,26 +992,13 @@ direction     = "F" / "B" / "RC" / "RX"
 free-text     = *CHAR
 ```
 
-### 4.2 Direction Codes
-
-| Code | Constant | Meaning | Balance effect | Auto-returnable | Who can send |
-|------|----------|---------|----------------|-----------------|--------------|
-| `F` (or omitted) | `'forward'` | Forward payment towards covering the invoice | +coveredAmount | Yes | Anyone |
-| `B` | `'back'` | Manual return/refund | +returnedAmount | **No** | **Target only** |
-| `RC` | `'return_closed'` | Auto-return because invoice is closed | +returnedAmount | **No** | **Target only** |
-| `RX` | `'return_cancelled'` | Auto-return because invoice is cancelled | +returnedAmount | **No** | **Target only** |
-
-All return directions (`:B`, `:RC`, `:RX`) have the same effect on balance computation — they increase `returnedAmount`. The distinction is semantic.
-
-**Sender restriction:** Only a party whose wallet address matches one of the invoice targets may send return payments (`:B`, `:RC`, `:RX`). Non-target parties can only make forward payments (`:F`). The `returnInvoicePayment()` method and auto-return system enforce this with `INVOICE_NOT_TARGET`.
-
-### 4.3 Regex
+### 4.4 Transport Memo Regex
 
 ```typescript
 const INVOICE_MEMO_REGEX = /^INV:([0-9a-fA-F]{64})(?::(F|B|RC|RX))?(?: (.+))?$/;
 ```
 
-### 4.4 Parsing Implementation
+### 4.5 Transport Memo Parsing
 
 ```typescript
 function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
@@ -971,7 +1032,7 @@ function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
 }
 ```
 
-### 4.5 Constructing Invoice Memos
+### 4.6 Constructing Invoice Memos
 
 ```typescript
 const INVOICE_ID_REGEX = /^[0-9a-fA-F]{64}$/;
@@ -1003,40 +1064,79 @@ function buildInvoiceMemo(
 }
 ```
 
-### 4.6 Integration with PaymentsModule.send()
+### 4.7 Integration with PaymentsModule.send()
 
-No changes to `PaymentsModule.send()` are required. The caller constructs the memo using `buildInvoiceMemo()` and passes it via the existing `TransferRequest.memo` field:
+**PaymentsModule.send() MUST be modified** to encode the `TransferRequest.memo` into BOTH the Nostr transport payload AND the on-chain `TransferTransactionData.message` field. Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter — this must change.
+
+**Required change to PaymentsModule.send():**
 
 ```typescript
-await sphere.payments.send({
-  recipient: invoiceTarget.address,
-  amount: invoiceAsset.coin![1], // amount from CoinEntry tuple
-  coinId: invoiceAsset.coin![0], // coinId from CoinEntry tuple
-  memo: buildInvoiceMemo(invoiceId, 'forward', 'Order #1234'),
-});
+// BEFORE (current code — message always null):
+const commitment = await TransferCommitment.create(
+  sdkToken, recipientAddress, salt,
+  null,  // recipientDataHash
+  null,  // message  ← ALWAYS NULL
+  signingService
+);
+
+// AFTER (required change — encode memo into on-chain message):
+const messageBytes = request.memo
+  ? new TextEncoder().encode(request.memo)  // UTF-8 encode the memo string
+  : null;
+const commitment = await TransferCommitment.create(
+  sdkToken, recipientAddress, salt,
+  null,  // recipientDataHash
+  messageBytes,  // ← now carries the memo on-chain
+  signingService
+);
 ```
 
-For auto-return, the accounting module internally calls:
+**This change applies to ALL transfer paths in PaymentsModule:**
+- `PaymentsModule.createTransferCommitment()` (direct send)
+- `TokenSplitExecutor.execute()` (split-and-send)
+- `InstantSplitExecutor.createTransferCommitmentFromMintData()` (V5 instant split)
+
+**The accounting module constructs memos for both channels:**
 
 ```typescript
+// For payInvoice() and auto-return, the module constructs:
+const payload: TransferMessagePayload = {
+  inv: { id: invoiceId, dir: 'F' },
+  txt: freeText,  // optional human-readable text
+};
+const memo = buildInvoiceMemo(invoiceId, 'forward', freeText);  // for Nostr display
+
 await this.deps.payments.send({
-  recipient: originalSenderAddress,
-  amount: tokenAmount,
-  coinId: tokenCoinId,
-  memo: buildInvoiceMemo(invoiceId, invoiceIsClosed ? 'return_closed' : 'return_cancelled'),
+  recipient: invoiceTarget.address,
+  amount: invoiceAsset.coin![1],
+  coinId: invoiceAsset.coin![0],
+  // memo carries BOTH the INV: text format (for Nostr transport display)
+  // AND the structured payload is encoded via PaymentsModule.send() into
+  // TransferTransactionData.message (for on-chain proof chain).
+  // PaymentsModule.send() encodes request.memo → message bytes.
+  memo: buildInvoiceMemo(invoiceId, 'forward', freeText),
 });
 ```
 
-### 4.7 Memo Injection Defense
+**Backward compatibility:** Transfers made before this change have `message: null` in their on-chain data. The accounting module MUST fall back to `HistoryRecord.memo` (Nostr transport) when `TxfTransaction.data.message` is null or unparseable. See §5.4.3 for the fallback logic.
 
-The `INV:` memo field is user-controlled — any sender can write any memo string. The canonical parser (`parseInvoiceMemo()`) is the **sole authority** for extracting invoice references. Security measures:
+### 4.8 Reference Resolution Priority
 
-- **Invoice ID validation:** Only 64-char hex strings (`[0-9a-fA-F]{64}`) are accepted as invoice IDs. This is guaranteed by the token ID derivation (SHA-256 hash) — invoice IDs cannot contain colons, spaces, or other characters that would conflict with memo parsing. Other formats are rejected (treated as non-invoice transfers).
-- **Direction code enforcement:** Only `:F`, `:B`, `:RC`, `:RX` are recognized by the regex. Memos with unrecognized suffixes (e.g., `INV:abc...:Z`) do not match the regex and are treated as non-invoice transfers (ignored entirely).
-- **Sender validation for returns:** Inbound `:B`/`:RC`/`:RX` transfers are validated against invoice target addresses before being accepted as return payments (see §6.2 step 3).
+When resolving invoice references for a transfer, the accounting module uses this priority:
+
+1. **On-chain `TransferTransactionData.message`** — decode `TransferMessagePayload`, check `inv` field. This is the authoritative source because it is embedded in the cryptographic proof chain and verifiable against the aggregator's SMT root.
+2. **Fallback: `HistoryRecord.memo`** — parse `INV:` format via `parseInvoiceMemo()`. Used only when the on-chain message is null (legacy pre-change transfers) or unparseable.
+3. If neither source contains an invoice reference, the transfer is not invoice-related.
+
+### 4.9 Security
+
+- **On-chain references are tamper-evident.** The `TransferTransactionData.message` is included in the transaction data hash committed to the aggregator. Modifying it would invalidate the inclusion proof.
+- **Invoice ID validation:** Only 64-char lowercase hex strings are accepted. Guaranteed by SHA-256 token ID derivation.
+- **Direction code enforcement:** Only `F`, `B`, `RC`, `RX` are recognized. Unrecognized values cause the reference to be ignored.
+- **Sender validation for returns:** Inbound `B`/`RC`/`RX` transfers are validated against invoice target addresses (see §6.2 step 3).
 - **Self-payment exclusion:** Forward payments where sender == destination == target are excluded (see §5.2).
-- **Untrusted string sanitization:** Multiple fields in the accounting system contain arbitrary user input from untrusted parties. Applications MUST sanitize these before rendering in HTML/DOM contexts to prevent XSS: (1) `freeText` in invoice memos, (2) `InvoiceTerms.memo` (set by the invoice creator), (3) `deliveryMethods` URLs (could contain `javascript:` if validation is bypassed), (4) `senderNametag`/`recipientNametag` in `InvoiceTransferRef`. The SDK does not sanitize these — it passes raw strings through. Applications using React (like Sphere) get automatic escaping via JSX; other rendering contexts must apply their own sanitization.
-- Applications **MUST NOT** parse invoice memos manually — always use `parseInvoiceMemo()`.
+- **Untrusted string sanitization:** `txt` field in `TransferMessagePayload`, `InvoiceTerms.memo`, `deliveryMethods` URLs, and `senderNametag`/`recipientNametag` in `InvoiceTransferRef` contain untrusted user input. Applications MUST sanitize before HTML/DOM rendering. React (JSX) provides automatic escaping; other contexts must apply their own.
+- Applications MUST use the SDK's decoding functions — never parse on-chain messages or transport memos manually.
 
 ---
 
@@ -1191,11 +1291,13 @@ Example: A token with `coinData = [["UCT", "500"], ["USDU", "1000"]]` transferre
 
 Invoice balance computation reads from a **persistent invoice-transfer index**, NOT from `PaymentsModule.getHistory()` on every query. The index is the primary data source for all non-terminal invoice status computation.
 
-#### 5.4.1 Why Not getHistory()?
+#### 5.4.1 Why Token Transaction Histories?
 
-`PaymentsModule.getHistory()` returns `HistoryRecord` entries with a **single** `coinId` and `amount` per entry. For multi-asset tokens (`coinData = [["UCT", "500"], ["USDU", "1000"]]`), the history record captures only the primary coin — the other coin entries are invisible. The full multi-asset `coinData` is only available from the token itself (`Token.sdkData` → `TxfToken.genesis.data.coinData`) or from the `transfer:incoming` event payload (`IncomingTransfer.tokens[]`).
+The **authoritative source** for invoice references is the on-chain `TransferTransactionData.message` field embedded in each token's proof chain (`TxfToken.transactions[]`). This is cryptographically committed to the aggregator's SMT and cannot be tampered with.
 
-Additionally, rescanning the full history on every `getInvoiceStatus()` call is O(H) where H is total history size — unacceptable at scale.
+`PaymentsModule.getHistory()` returns `HistoryRecord` entries with a **single** `coinId` and `amount` per entry — multi-asset data is invisible. The full `coinData` and the on-chain message are only available from the token itself (`Token.sdkData` → `TxfToken`).
+
+Additionally, rescanning all token transactions on every `getInvoiceStatus()` call is O(T×N) where T=tokens and N=avg transactions per token — unacceptable at scale.
 
 #### 5.4.2 Index Architecture
 
@@ -1210,11 +1312,12 @@ The index captures **expanded per-coin entries** at the time each transfer is pr
 // Persisted: one storage key per invoice (see §7.2)
 private invoiceLedger: Map<string, Map<string, InvoiceTransferRef>>;
 
-// Level 2: History scan watermark (tracks processing progress)
-// In-memory: Map<dedupKey, true>
+// Level 2: Token scan watermark (tracks processing progress per token)
+// In-memory: Map<tokenId, number>  — value = number of transactions processed
 // Persisted: single storage key (see §7.2)
-// Tracks which HistoryRecord.dedupKey values have been processed.
-private processedHistoryKeys: Map<string, true>;
+// For each token, tracks how many TxfToken.transactions[] entries have been
+// scanned for invoice references. Incremental updates process only the tail.
+private tokenScanState: Map<string, number>;
 ```
 
 **Secondary in-memory index (not persisted, rebuilt on load):**
@@ -1233,108 +1336,130 @@ private tokenInvoiceMap: Map<string, Set<string>>; // tokenId → Set<invoiceId>
 private balanceCache: Map<string, Map<string, { covered: bigint; returned: bigint }>>;
 ```
 
-#### 5.4.3 Transfer Processing: `processTransfer()`
+#### 5.4.3 Token Transaction Processing: `processTokenTransactions()`
 
-This is the core function called by both cold-start and incremental updates. It takes a `HistoryRecord` + optional token data, extracts invoice-relevant information, and updates the index.
+This is the core function called by both cold-start and incremental updates. It scans a token's transaction history for invoice references in the on-chain `TransferTransactionData.message` field.
 
 ```
-processTransfer(historyEntry: HistoryRecord, tokenCoinData?: [string, string][]):
-  1. If processedHistoryKeys.has(historyEntry.dedupKey): return  // already processed
-  2. Parse memo: ref = parseInvoiceMemo(historyEntry.memo)
-     If no match: mark as processed, return
-  3. If ref.invoiceId not in local invoice token storage: return
-     (unknown invoice — fire invoice:unknown_reference from caller, not here)
+processTokenTransactions(token: Token, startIndex: number):
+  txf = JSON.parse(token.sdkData) as TxfToken
+  coinData = txf.genesis.data.coinData   // multi-asset: [string, string][]
 
-  4. Resolve full coinData:
-     a. If tokenCoinData provided (from event payload): use it
-     b. Else if historyEntry.tokenId: look up token via getTokens(),
-        extract token.sdkData.genesis.data.coinData
-     c. Else: fall back to single-coin from historyEntry:
-        coinData = [[historyEntry.coinId, historyEntry.amount]]
-     // NOTE: Fallback (c) loses multi-asset data. This path is only hit
-     // for archived tokens on cold-start when the token is no longer
-     // available AND the index was not previously populated. For active
-     // tokens and event-driven updates, (a) or (b) always succeeds.
+  For each transaction tx at index i in txf.transactions[startIndex..]:
+    1. Decode invoice reference from on-chain message (§4.1):
+       payload = decodeTransferMessage(tx)
+       If payload?.inv is present:
+         ref = { invoiceId: payload.inv.id, direction: mapDir(payload.inv.dir) }
+       Else:
+         // Fallback for legacy transfers (pre-accounting-module):
+         // Check HistoryRecord.memo via parseInvoiceMemo() if available.
+         // This path handles transfers made before the on-chain message
+         // change was deployed. Once all tokens have been migrated,
+         // this fallback can be removed.
+         ref = null  // try legacy fallback (see §4.8)
 
-  5. For each [coinId, amount] in coinData:
-     a. Skip if amount === "0"
-     b. entryKey = `${historyEntry.transferId ?? historyEntry.id}::${coinId}`
-     c. invoiceMap = invoiceLedger.get(ref.invoiceId)
-     d. If invoiceMap.has(entryKey): continue  // dedup
-     e. Create InvoiceTransferRef:
-        - transferId: historyEntry.transferId ?? historyEntry.id
-        - tokenId: historyEntry.tokenId
-        - direction: ref.direction
-        - coinId, amount
-        - senderAddress: historyEntry.senderAddress
-        - senderNametag: historyEntry.senderNametag
-        - recipientAddress: historyEntry.recipientAddress
-        - recipientNametag: historyEntry.recipientNametag
-        - timestamp: historyEntry.timestamp
-        - confirmed: determined from token status
-     f. invoiceMap.set(entryKey, entry)
-     g. Update tokenInvoiceMap
-     h. Invalidate balanceCache for ref.invoiceId
-     i. Mark invoice as dirty (needs storage flush)
+    2. If no invoice reference found: continue to next transaction
 
-  6. processedHistoryKeys.set(historyEntry.dedupKey, true)
+    3. If ref.invoiceId not in local invoice token storage:
+       (fire invoice:unknown_reference from caller, not here)
+       continue
+
+    4. Derive transferId from tx:
+       transferId = tx.inclusionProof?.transactionHash
+                 ?? sha256(tx.previousStateHash + ':' + (tx.newStateHash ?? ''))
+       // The transactionHash from the inclusion proof is the canonical ID.
+       // Fallback hash for uncommitted transactions (inclusionProof === null).
+
+    5. Resolve sender/recipient from tx.data:
+       recipientAddress = (tx.data as any)?.recipient   // TransferTransactionData.recipient
+       senderAddress = derived from tx.predicate or previous state owner
+
+    6. For each [coinId, amount] in coinData:
+       a. Skip if amount === "0"
+       b. entryKey = `${transferId}::${coinId}`
+       c. invoiceMap = invoiceLedger.get(ref.invoiceId)
+       d. If invoiceMap.has(entryKey): continue  // dedup
+       e. Create InvoiceTransferRef:
+          - transferId, tokenId: txf.genesis.data.tokenId
+          - direction: ref.direction
+          - coinId, amount
+          - senderAddress, recipientAddress
+          - timestamp: tx.inclusionProof?.authenticator timestamp or Date.now()
+          - confirmed: tx.inclusionProof !== null
+       f. invoiceMap.set(entryKey, entry)
+       g. Update tokenInvoiceMap(tokenId → invoiceId)
+       h. Invalidate balanceCache for ref.invoiceId
+       i. Mark invoice as dirty (needs storage flush)
+
+  Update tokenScanState: tokenScanState.set(tokenId, txf.transactions.length)
 ```
 
-**Idempotency guarantee:** The composite key `${transferId}::${coinId}` ensures that reprocessing the same transfer (due to event re-delivery, Nostr reconnection, or retroactive scan) is a no-op. The `processedHistoryKeys` watermark provides a fast-path skip before memo parsing.
+**Idempotency guarantee:** The composite key `${transferId}::${coinId}` ensures that reprocessing the same transaction is a no-op. The `tokenScanState` watermark provides a fast-path skip: if `tokenScanState.get(tokenId) >= txf.transactions.length`, the token is fully processed.
+
+**Legacy fallback (§4.8):** For transfers made before the on-chain message change, `TxfTransaction.data.message` is `null`. In this case, `processTokenTransactions()` checks the `HistoryRecord.memo` for the corresponding transfer (matched by tokenId + transaction index). This ensures backward compatibility during the migration period.
 
 #### 5.4.4 Population: Cold Start (`load()`)
 
-Cold start loads persisted state, then fills gaps from current history.
+Cold start loads persisted state, then scans token transaction histories for gaps.
 
 ```
 Phase 1 — Load persisted index:
   1. Load inv_ledger_index → populate invoiceLedger outer map (keys only)
   2. Load inv_ledger:{invoiceId} for each invoice → populate transfer Maps
-  3. Load processed_history_keys → populate processedHistoryKeys
+  3. Load token_scan_state → populate tokenScanState
   4. Rebuild tokenInvoiceMap from loaded entries
 
-Phase 2 — Process new history entries:
-  5. history = PaymentsModule.getHistory()
-  6. For each entry in history (oldest first):
-     a. If processedHistoryKeys.has(entry.dedupKey): skip
-     b. If entry has no invoice memo: mark as processed, skip
-     c. Look up token for full coinData:
-        - Try getTokens() by tokenId
-        - If not found (archived): coinData falls back to single-coin
-     d. Call processTransfer(entry, coinData)
+Phase 2 — Scan token transaction tails:
+  5. allTokens = PaymentsModule.getTokens()
+     // This includes active tokens. Archived tokens are no longer available
+     // via getTokens(), but their data was already captured in the index
+     // during the session when they were active. The tokenScanState entry
+     // (with txCount = final transactions.length) prevents re-scanning.
+  6. For each token T in allTokens:
+     a. txf = JSON.parse(T.sdkData) as TxfToken
+     b. startIndex = tokenScanState.get(T.id) ?? 0
+     c. If txf.transactions.length > startIndex:
+        → processTokenTransactions(T, startIndex)
   7. Flush dirty invoice entries to storage
-  8. Persist updated processedHistoryKeys
+  8. Persist updated tokenScanState
 ```
 
-**Cost analysis:** Phase 1 is O(persisted entries). Phase 2 is O(new history entries since last session) — the watermark ensures only unprocessed entries are examined. On a warm start with no new history, Phase 2 does zero work.
+**Cost analysis:** Phase 1 is O(persisted entries). Phase 2 is O(new transactions since last session) — the watermark ensures only the tail of each token's transaction array is processed. On a warm start with no new transactions, Phase 2 does zero work per token (single Map lookup).
 
 #### 5.4.5 Population: Incremental Updates
 
 **On `transfer:incoming` event** (IncomingTransfer payload):
 ```
-1. Parse memo from IncomingTransfer.memo
-2. If invoice reference found:
-   a. Extract coinData from IncomingTransfer.tokens[0].sdkData.genesis.data.coinData
-   b. Wait for history:updated event (which provides the HistoryRecord)
-      OR construct a synthetic HistoryRecord from the IncomingTransfer payload
-   c. Call processTransfer(historyEntry, coinData)
-   d. Flush dirty entries to storage (async)
-```
-
-**On `history:updated` event** (HistoryRecord payload):
-```
-1. Call processTransfer(historyEntry)
-   - processTransfer will look up token for full coinData
+1. For each token in IncomingTransfer.tokens:
+   a. startIndex = tokenScanState.get(token.id) ?? 0
+   b. txf = JSON.parse(token.sdkData) as TxfToken
+   c. If txf.transactions.length > startIndex:
+      → processTokenTransactions(token, startIndex)
 2. Flush dirty entries to storage (async)
 ```
 
 **On `transfer:confirmed` event** (TransferResult payload):
 ```
 1. For each token in TransferResult.tokens:
-   a. Look up invoices via tokenInvoiceMap.get(token.id)
-   b. For each invoice: update confirmed=true on matching entries
-   c. Invalidate balanceCache for affected invoices
-   d. Mark affected invoices as dirty
+   a. startIndex = tokenScanState.get(token.id) ?? 0
+   b. txf = JSON.parse(token.sdkData) as TxfToken
+   c. If txf.transactions.length > startIndex:
+      → processTokenTransactions(token, startIndex)
+      // New transactions may have appeared (e.g., confirmation proof added)
+   d. Additionally: update confirmed=true for existing entries where
+      tx.inclusionProof was previously null but is now present
+   e. Invalidate balanceCache for affected invoices
+2. Flush dirty entries to storage (async)
+```
+
+**On `history:updated` event** (HistoryRecord payload):
+```
+// Used only as a legacy fallback trigger for pre-change transfers
+// where on-chain message is null:
+1. If historyEntry.tokenId:
+   a. Look up token via getTokens()
+   b. If token found and tokenScanState indicates unprocessed transactions:
+      → processTokenTransactions(token, startIndex)
 2. Flush dirty entries to storage (async)
 ```
 
@@ -1747,12 +1872,12 @@ AUTO_RETURN_LEDGER: 'auto_return_ledger',
  */
 INV_LEDGER_INDEX: 'inv_ledger_index',
 /**
- * History scan watermark — tracks which HistoryRecord.dedupKey values
- * have been processed into the invoice-transfer index. Enables incremental
- * updates on restart: only unprocessed history entries are scanned.
- * Format: string[] (array of processed dedupKey values)
+ * Token scan watermark — tracks how many transactions have been processed
+ * per token. Enables incremental updates: only the tail of each token's
+ * TxfToken.transactions[] array is scanned on restart.
+ * Format: Record<tokenId, number> (tokenId → txCount)
  */
-PROCESSED_HISTORY_KEYS: 'processed_history_keys',
+TOKEN_SCAN_STATE: 'token_scan_state',
 ```
 
 Full key format: `sphere_{addressId}_cancelled_invoices`, etc. The `addressId` value (e.g., `DIRECT_abc123_xyz789`) is guaranteed colon-free and underscore-delimited, so no separator collision is possible.
@@ -2051,23 +2176,23 @@ load():
      a. Load persisted index state:
         - Load INV_LEDGER_INDEX → populate invoiceLedger outer map (keys only)
         - Load inv_ledger:{invoiceId} for each invoice → populate transfer Maps
-        - Load PROCESSED_HISTORY_KEYS → populate processedHistoryKeys set
+        - Load TOKEN_SCAN_STATE → populate tokenScanState
         - Rebuild tokenInvoiceMap from loaded transfer entries
-     b. Process new history entries (gap fill):
-        - history = PaymentsModule.getHistory()
-        - For each entry (oldest first):
-          · If processedHistoryKeys.has(entry.dedupKey): skip
-          · If entry has no invoice memo: mark as processed, skip
-          · Look up token for full coinData via getTokens() by tokenId.
-            If not found (archived): fall back to single-coin from HistoryRecord.
-          · Call processTransfer(entry, coinData) — see §5.4.3
+     b. Scan token transaction tails (gap fill):
+        - allTokens = PaymentsModule.getTokens()
+        - For each token T:
+          · txf = JSON.parse(T.sdkData) as TxfToken
+          · startIndex = tokenScanState.get(T.id) ?? 0
+          · If txf.transactions.length > startIndex:
+            → processTokenTransactions(T, startIndex) — see §5.4.3
         - Flush dirty invoice entries to storage
-        - Persist updated processedHistoryKeys
+        - Persist updated tokenScanState
      c. **Corruption resilience for index:** If INV_LEDGER_INDEX or
-        PROCESSED_HISTORY_KEYS fails to parse, reset to empty and rescan
-        full history. If inv_ledger:{invoiceId} fails to parse, delete the
-        corrupted key and rescan history for that invoice only. Dedup in
-        processTransfer() prevents duplicate entries on rescan.
+        TOKEN_SCAN_STATE fails to parse, reset to empty and rescan all
+        tokens from transaction index 0. If inv_ledger:{invoiceId} fails
+        to parse, delete the corrupted key and reset tokenScanState entries
+        for tokens referencing that invoice. Dedup in processTokenTransactions()
+        prevents duplicate entries on rescan.
   7. Subscribe to PaymentsModule events
   8. Fire retroactive events for any transfers discovered during index gap fill
 
@@ -2086,8 +2211,8 @@ The module maintains a **persistent invoice-transfer index** as the primary data
 // entryKey = `${transferId}::${coinId}` (composite dedup key)
 private invoiceLedger: Map<string, Map<string, InvoiceTransferRef>>;
 
-// History scan watermark — tracks processed HistoryRecord dedupKeys
-private processedHistoryKeys: Map<string, true>;
+// Token scan watermark — tracks processed tx count per token
+private tokenScanState: Map<string, number>;
 
 // Secondary: token → invoice mapping (rebuilt on load, not persisted)
 private tokenInvoiceMap: Map<string, Set<string>>;
@@ -2102,7 +2227,7 @@ private balanceCache: Map<string, Map<string, { covered: bigint; returned: bigin
 - **Idempotent updates by (transferId, coinId):** The composite dedup key ensures that reprocessing the same transfer is a no-op. This is critical because `returnInvoicePayment()` synchronously updates the index after `send()` (§5.9), and the subsequent async event must not produce a duplicate.
 - **Terminal invoices included:** The index records ALL invoice-related transfers regardless of terminal state. Frozen balances are a separate point-in-time snapshot. The index powers `getRelatedTransfers()` (complete picture); frozen balances power `getInvoiceStatus()` for terminal invoices (snapshot at termination).
 - **Multi-asset correctness:** Each transfer is expanded into per-coin entries at processing time using the token's full `coinData` from `TxfToken.genesis.data.coinData`. Once captured, no token lookup is needed at query time.
-- **Incremental via watermark:** The `processedHistoryKeys` set tracks which `HistoryRecord.dedupKey` values have been processed. On restart, only unprocessed history entries are scanned. On a warm start with no new history, gap processing does zero work.
+- **Incremental via watermark:** The `tokenScanState` map tracks how many `TxfToken.transactions[]` entries have been processed per token. On restart, only the tail of each token's transaction array is scanned. On a warm start with no new transactions, gap processing does a single Map lookup per token.
 - **Retroactive on create/import:** On `createInvoice()` / `importInvoice()`, the full history is scanned for pre-existing payments referencing the new invoice. Each match goes through `processTransfer()` (§5.4.3), which respects the dedup key.
 
 #### Storage Efficiency Estimates
@@ -2110,7 +2235,7 @@ private balanceCache: Map<string, Map<string, { covered: bigint; returned: bigin
 | Component | Per-entry size | Typical scale | Total |
 |-----------|---------------|---------------|-------|
 | InvoiceTransferRef (JSON) | ~400–500 bytes | 1000 invoices × 20 entries | ~10 MB |
-| Processed history keys | ~60 bytes/key | 10,000 history entries | ~600 KB |
+| Token scan state | ~80 bytes/token | 5,000 tokens | ~400 KB |
 | Invoice ledger index | ~80 bytes/invoice | 1000 invoices | ~80 KB |
 
 Per-invoice partitioned storage means any single read/write operation touches at most one invoice's data. IndexedDB (browser) and file-based storage (Node.js) handle this scale without issue.
@@ -2119,14 +2244,14 @@ Per-invoice partitioned storage means any single read/write operation touches at
 
 **Storage write order** (on flush):
 1. Write `inv_ledger:{invoiceId}` for each dirty invoice
-2. Write `processed_history_keys`
+2. Write `token_scan_state`
 3. Write `inv_ledger_index`
 
-If the process crashes after step 1 but before step 2, the next cold start will reprocess some history entries. The dedup check on `${transferId}::${coinId}` inside `processTransfer()` catches duplicates — the ledger is the source of truth.
+If the process crashes after step 1 but before step 2, the next cold start will reprocess some token transactions from the tail. The dedup check on `${transferId}::${coinId}` inside `processTokenTransactions()` catches duplicates — the ledger is the source of truth.
 
 **Corruption recovery:**
-- If `inv_ledger:{invoiceId}` is corrupted: log warning, delete key, remove that invoice from `processedHistoryKeys` for entries referencing it, rescan history for that invoice only.
-- If `processed_history_keys` is corrupted: reset to empty, rescan full history. Dedup in `processTransfer()` prevents duplicate ledger entries. This is O(full history) but recovers correctly.
+- If `inv_ledger:{invoiceId}` is corrupted: log warning, delete key, reset tokenScanState entries for tokens referencing that invoice, rescan their transactions from index 0.
+- If `token_scan_state` is corrupted: reset to empty, rescan all tokens from transaction index 0. Dedup in `processTokenTransactions()` prevents duplicate ledger entries. This is O(all tokens × all transactions) but recovers correctly.
 - If `inv_ledger_index` is corrupted: rebuild from `inv_ledger:*` keys discovered via storage enumeration.
 
 ---

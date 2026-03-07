@@ -14,8 +14,8 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 |-----------|-----------|
 | **Invoice IS a token** | An invoice is a minted on-chain token — the invoice terms live in the token's genesis `tokenData` field. There are no external metadata fields outside the token itself. The token ID (guaranteed unique by the aggregator) is the invoice ID. |
 | **Local-first accounting** | Each party computes invoice status from its own token inventory — no shared on-chain state, no consensus needed. Status is **never** stored for non-terminal invoices; it is always derived on-demand. Terminal invoices have frozen balances persisted locally. |
-| **Memo-referenced balances** | Invoice balances are derived **exclusively** from transfers whose memo references the invoice, captured in a persistent invoice-transfer index. The index is built from `HistoryRecord` + token `coinData` at processing time and queried in-memory — no history rescan at query time. Physical token inventory is irrelevant to invoice accounting. |
-| **Read-only dependency on PaymentsModule** | AccountingModule reads from `PaymentsModule` (getHistory, getTokens, events) but never calls `send()` or modifies payment state directly. The one exception is auto-return, where the module invokes `send()` to return tokens for terminated invoices. |
+| **On-chain referenced balances** | Invoice balances are derived **exclusively** from token transfers whose on-chain `TransferTransactionData.message` field references the invoice. The reference is embedded in the cryptographic proof chain (aggregator SMT), not in the Nostr transport layer. A persistent invoice-transfer index captures expanded per-coin entries by scanning token transaction histories — queried in-memory, no rescan at query time. Physical token inventory is irrelevant to invoice accounting. |
+| **Read-only dependency on PaymentsModule** | AccountingModule reads from `PaymentsModule` (getTokens, events) and scans token transaction histories for on-chain invoice references. It never calls `send()` directly except for auto-return, where it invokes `send()` to return tokens for terminated invoices. |
 | **Outbound payment blocking for terminated invoices** | Outgoing forward payments (`INV:<id>:F`) referencing a locally terminated (CLOSED or CANCELLED) invoice are **blocked** — the transfer is prevented and an exception is thrown. This is enforced at the `payInvoice()` / memo-construction layer, not in `PaymentsModule.send()`. |
 | **Non-blocking inbound observer** | Accounting errors during inbound transfer processing MUST NEVER break the token transfer flow. Inbound transfers are atomic — they either happen fully or not at all. The accounting module is a side-effect observer that processes inbound transfers after the fact. |
 | **Idempotent event re-firing** | The same event (with the same or updated `confirmed` flag) may fire multiple times for the same underlying transfer. Event consumers MUST be idempotent — handling a re-fired event must produce the same result as handling it once. This is the fundamental contract. |
@@ -191,30 +191,43 @@ Key rules:
 
 7. **Frozen at terminal states.** Once an invoice reaches CLOSED or CANCELLED, its balances are frozen and persisted. Dynamic recomputation no longer occurs. The frozen snapshot is returned for all subsequent queries.
 
-### 3.7 Invoice-Transfer Index
+### 3.7 On-Chain Invoice References & Persistent Index
 
-Invoice balance computation does NOT scan `PaymentsModule.getHistory()` on every query. Instead, the module maintains a **persistent invoice-transfer index** that captures expanded per-coin transfer entries at processing time.
+#### 3.7.1 On-Chain References (Not Nostr)
 
-**Why not getHistory()?** `HistoryRecord` exposes a single `coinId` and `amount` per entry. For multi-asset tokens (`coinData = [["UCT", "500"], ["USDU", "1000"]]`), only the primary coin is visible in the history record — the full `coinData` is only available from the token itself (`Token.sdkData` → `TxfToken.genesis.data.coinData`). Rescanning O(H) history entries on every status query is also unacceptable at scale.
+Invoice references are recorded **on-chain** in the `TransferTransactionData.message` field of each token transfer's proof chain. This is embedded in the aggregator's Sparse Merkle Tree and is cryptographically verifiable. The Nostr transport memo (`INV:` format) is a secondary, display-only channel.
+
+The on-chain `message` carries a structured `TransferMessagePayload`:
+```
+{ inv: { id: "<64-hex invoiceId>", dir: "F"|"B"|"RC"|"RX" }, txt?: "..." }
+```
+
+**PaymentsModule.send() change required:** Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter. This must be changed to encode `TransferRequest.memo` as UTF-8 bytes into the on-chain message. This change affects all transfer paths (direct send, split-and-send, V5 instant split).
+
+#### 3.7.2 Persistent Invoice-Transfer Index
+
+The module scans **token transaction histories** (`TxfToken.transactions[]`) for on-chain invoice references and maintains a persistent index.
+
+**Why not getHistory()?** `HistoryRecord` exposes a single `coinId`/`amount` and the Nostr memo — it cannot provide multi-asset data or the on-chain message. The authoritative source is the token's proof chain.
 
 **Index architecture:**
 
-1. **Per-invoice transfer ledger** — partitioned storage, one key per invoice. Each entry is an `InvoiceTransferRef` with a composite dedup key `${transferId}::${coinId}`. A multi-asset transfer produces one entry per coin.
+1. **Per-invoice transfer ledger** — partitioned storage, one key per invoice. Each entry is an `InvoiceTransferRef` with composite dedup key `${transferId}::${coinId}`. Multi-asset transfers produce one entry per coin.
 
-2. **History scan watermark** — tracks which `HistoryRecord.dedupKey` values have been processed. On restart, only unprocessed entries are scanned.
+2. **Token scan watermark** — tracks how many `TxfToken.transactions[]` entries have been processed per token. On restart, only the unprocessed tail is scanned.
 
-3. **Core processing function** `processTransfer()` — takes a `HistoryRecord` + optional token `coinData`, parses the invoice memo, expands multi-asset coins into individual index entries, and applies idempotent dedup.
+3. **Core processing function** `processTokenTransactions()` — scans a token's transaction array, decodes `TransferMessagePayload` from each transaction's on-chain message, expands multi-asset coins into individual index entries, and applies idempotent dedup.
 
 4. **Population paths:**
-   - **Cold start:** Load persisted index, then process any new history entries since last session.
-   - **Incremental:** `transfer:incoming`, `history:updated`, and `transfer:confirmed` events call `processTransfer()`.
-   - **Retroactive:** On `createInvoice()` / `importInvoice()`, scan full history for pre-existing payments.
+   - **Cold start:** Load persisted index, then scan unprocessed transaction tails.
+   - **Incremental:** `transfer:incoming` and `transfer:confirmed` events call `processTokenTransactions()`.
+   - **Retroactive:** On `createInvoice()` / `importInvoice()`, scan all tokens for pre-existing payments.
 
-5. **Query:** `getInvoiceStatus()` reads directly from the in-memory index and a lazy `balanceCache` — no storage reads or history scans at query time.
+5. **Query:** `getInvoiceStatus()` reads directly from the in-memory index and a lazy `balanceCache` — no token scans at query time.
 
 **Dynamic computation applies only to non-terminal invoices.** For terminal invoices, the persisted frozen balances are returned directly. The index still records post-termination transfers for `getRelatedTransfers()`.
 
-See ACCOUNTING-SPEC.md §5.4 for the complete index specification.
+See ACCOUNTING-SPEC.md §4.1 for the on-chain format and §5.4 for the complete index specification.
 
 ## 4. Invoice Lifecycle & State Machine
 
@@ -588,7 +601,7 @@ Additional per-address storage keys:
 | `sphere_{addressId}_auto_return_ledger` | Per-address | Auto-return deduplication ledger: tracks which transfers have been returned (JSON) |
 | `sphere_{addressId}_inv_ledger_index` | Per-address | Invoice ledger directory: `Record<invoiceId, { terminated, frozenAt? }>` |
 | `sphere_{addressId}_inv_ledger:{invoiceId}` | Per-address, per-invoice | Partitioned invoice-transfer index: `InvoiceTransferRef[]` for one invoice |
-| `sphere_{addressId}_processed_history_keys` | Per-address | History scan watermark: processed `HistoryRecord.dedupKey` values (JSON array) |
+| `sphere_{addressId}_token_scan_state` | Per-address | Token transaction scan watermark: `Record<tokenId, lastScannedIndex>` (JSON object) |
 
 Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`:
 
@@ -600,7 +613,7 @@ AUTO_RETURN: 'auto_return',
 AUTO_RETURN_LEDGER: 'auto_return_ledger',
 // INV_LEDGER prefix: 'inv_ledger:',  // per-invoice partitioned key
 INV_LEDGER_INDEX: 'inv_ledger_index',
-PROCESSED_HISTORY_KEYS: 'processed_history_keys',
+TOKEN_SCAN_STATE: 'token_scan_state',
 ```
 
 ### 7.5 New Events
