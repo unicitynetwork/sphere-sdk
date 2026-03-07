@@ -193,7 +193,7 @@ Key rules:
 
 7. **Frozen at terminal states.** Once an invoice reaches CLOSED or CANCELLED, its balances are frozen and persisted. The frozen snapshot determines the baseline for subsequent queries. Post-termination transfers (incoming forwards, manual returns, auto-returns) continue to be tracked per-sender on top of the frozen baseline.
 
-8. **CLOSED resets per-sender balances (payments accepted).** Closing an invoice means the target party accepts the payments received so far as final. At freeze time, all pre-closure per-sender balances are reset to zero — pre-closure payments are non-returnable. The surplus (if any) is assigned to the **latest sender** (by processing order — the sender whose payment was being processed inside the per-invoice gate when the close condition was met). Post-closure per-sender tracking starts from: surplus balance for the latest sender, zero for all others. Any new forward payments arriving after closure are tracked per-sender normally and are fully returnable.
+8. **CLOSED resets per-sender balances (payments accepted).** Closing an invoice means the target party accepts the payments received so far as final. At freeze time, all pre-closure per-sender balances are reset to zero — pre-closure payments are non-returnable. The surplus (if any) is assigned **per (target, coinId)** to the **latest sender** for that tuple (by processing order — the sender whose forward payment for that specific target:coinId was being processed inside the per-invoice gate when the close condition was met). In multi-target invoices, different targets may have different latest senders. Post-closure per-sender tracking starts from: surplus balance for the latest sender of each target:coinId, zero for all others. Any new forward payments arriving after closure are tracked per-sender normally and are fully returnable.
 
    **Race condition awareness:** Because payments are processed one-at-a-time through the per-invoice serialization gate, a payment from another sender may arrive while the triggering payment's close sequence is executing. That concurrent payment is a *post-closure* payment — its per-sender balance must NOT be reset to zero and must NOT be assigned surplus. Only the sender whose payment is inside the gate when the close triggers is the "latest sender."
 
@@ -223,7 +223,7 @@ The on-chain `message` carries a structured `TransferMessagePayload`:
 { inv: { id: "<64-hex invoiceId>", dir: "F"|"B"|"RC"|"RX" }, txt?: "..." }
 ```
 
-**PaymentsModule.send() change required:** Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter. This must be changed to encode `TransferRequest.memo` as UTF-8 bytes into the on-chain message. This change affects all transfer paths (direct send, split-and-send, V5 instant split).
+**PaymentsModule.send() change required:** Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter. This must be changed to encode the memo into the on-chain message field. For invoice-related memos (`INV:` prefix), the on-chain message carries the structured `TransferMessagePayload` JSON (not the raw memo text). For non-invoice memos, the raw memo is encoded as UTF-8 bytes. See ACCOUNTING-SPEC.md §4.7 for the `parseInvoiceMemoForOnChain()` helper. This change affects all transfer paths (direct send, split-and-send, V5 instant split).
 
 #### 3.7.2 Persistent Invoice-Transfer Index
 
@@ -267,32 +267,34 @@ See ACCOUNTING-SPEC.md §4.1 for the on-chain format and §5.4 for the complete 
 
 ```
                      +----------+
-                     |   OPEN   |
-                     +----+-----+
-                          | payment matched
-                          v
-                     +----------+
-              +------|  PARTIAL |------+
-              |      +----+-----+     |
-              |           | all       | cancel()
-              |           | covered   |
-              |           v           v
-              |      +----------+ +----------+
-              |      | COVERED  | |CANCELLED |
-              |      +----+-----+ +----------+
-              |           | all confirmed
-              |           | OR explicit close()
-              |           v
-              |      +----------+
-              +----->|  CLOSED  |<---+
-              |      +----------+    |
-              |           ^          |
-              |           |          |
-              |     close()          |
-              |     (explicit)       |
-              |                      |
-              |      +----------+    |
-              |      | EXPIRED  |----+
+                     |   OPEN   |---cancel()--+
+                     +----+-----+             |
+                          | payment matched   |
+                          v                   |
+                     +----------+             |
+              +------|  PARTIAL |---cancel()--+
+              |      +----+-----+             |
+              |           | all               |
+              |           | covered           |
+              |           v                   v
+              |      +----------+        +----------+
+              |      | COVERED  |-cancel->|CANCELLED |
+              |      +----+-----+        +----------+
+              |           | all confirmed     ^
+              |           | OR explicit close()  |
+              |           v                   |
+              |      +----------+             |
+              +----->|  CLOSED  |<---+        |
+              |      +----------+    |        |
+              |           ^          |        |
+              |           |          |        |
+              |     close()          |        |
+              |     (explicit,       |        |
+              |      from any        |        |
+              |      non-terminal)   |        |
+              |                      |        |
+              |      +----------+    |        |
+              |      | EXPIRED  |----+ cancel()
               |      +----+-----+  all covered
               |           ^        + confirmed
               |           |
@@ -350,7 +352,7 @@ Auto-return is a mechanism where the accounting module automatically returns tok
 - **Precedence rule:** Per-invoice settings take priority over global. Effective auto-return for an invoice is `perInvoice[id] ?? global`. Setting `setAutoReturn(invoiceId, false)` disables auto-return for that specific invoice even when global is enabled.
 
 **Immediate trigger on enable:** When auto-return is enabled for an already-terminated invoice, the auto-return operation is triggered **immediately** for that invoice (not just for future incoming payments):
-- **CLOSED invoice:** Auto-return the **surplus only** to the **latest sender** (by processing order — the sender whose payment triggered closure; see §3.6 rule 8). Since closure resets all per-sender balances to zero except the surplus assigned to the latest sender, the auto-return is a single transfer: return `surplusAmount` to that sender. If there is no surplus, nothing is returned.
+- **CLOSED invoice:** Auto-return the **surplus only** to the **latest sender per (target, coinId)** (by processing order — the sender whose forward payment for that target:coinId triggered closure; see §3.6 rule 8). Since closure resets all per-sender balances to zero except the surplus assigned to the latest sender of each target:coinId, the auto-return is one transfer per target:coinId with surplus. If there is no surplus for a given target:coinId, nothing is returned for that pair.
 - **CANCELLED invoice:** Auto-return **each sender's full net balance**. For each target:coinId, iterate all senders and return `senderNetBalance` to each.
 
 Similarly, when enabling auto-return globally (`'*'`), the operation is triggered immediately for all currently terminated invoices.
@@ -393,6 +395,7 @@ On crash recovery (during `load()`), scan the ledger for `pending` entries. For 
 - When a sender receives an auto-return transfer with `:RC`, their accounting module MAY auto-close the invoice locally — even if the invoice was not fully covered from the sender's perspective (the target decided to close).
 - When a sender receives an auto-return transfer with `:RX`, their accounting module MAY auto-cancel the invoice locally.
 - This is **opt-in** — controlled by `autoTerminateOnReturn` config (default: `false`). It provides implicit cross-party termination signaling without requiring an explicit broadcast mechanism.
+- **Implementation note:** Auto-termination uses an internal `_terminateInvoice()` method that performs the freeze-and-persist directly, bypassing the public `closeInvoice()`/`cancelInvoice()` gate acquisition. This prevents deadlock when the event handler is already inside the per-invoice gate. See SPEC §6.2 step 3d.
 - **Over-refund warning:** If the total amount returned to a sender exceeds the total amount that sender has forwarded (for a given coinId), the module fires `invoice:over_refund_warning`. This can happen if a target manually returns more than the sender paid. The warning is informational — the transfer is not blocked.
 - **Trust note:** A target can send `:RC`/`:RX` even if the invoice is not actually terminated on their side. The payer's `autoTerminateOnReturn` trusts the direction code at face value. This is acceptable because the target already holds the tokens and could simply not return them — spoofing a direction code gains nothing.
 

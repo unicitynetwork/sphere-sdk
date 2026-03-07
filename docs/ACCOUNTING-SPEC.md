@@ -433,7 +433,10 @@ interface AccountingModuleDependencies {
   oracle: OracleProvider;
   /** Current wallet identity */
   identity: FullIdentity;
-  /** All tracked wallet addresses — used for target check in close/cancel (checks all HD addresses, not just current) */
+  /** All tracked wallet addresses — used for target check in close/cancel/return.
+   *  Target validation compares TrackedAddress.directAddress against
+   *  InvoiceTarget.address (both are DIRECT:// format). Checks all HD addresses,
+   *  not just the current one. */
   getActiveAddresses: () => TrackedAddress[];
   /** Event emitter (from Sphere) */
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
@@ -655,10 +658,11 @@ class AccountingModule {
    *
    * 1. **Immediate trigger:** If the invoice (or any terminated invoice for '*')
    *    is already terminated, auto-return is executed immediately:
-   *    - CLOSED invoice: return the SURPLUS ONLY to the latest sender (by processing
-   *      order — the sender whose payment triggered closure; see §5.2).
-   *      Pre-closure payments are accepted as final (non-returnable).
-   *      If no surplus exists, nothing is returned.
+   *    - CLOSED invoice: return the SURPLUS ONLY to the latest sender per
+   *      (target, coinId) — the sender whose forward payment for that tuple
+   *      triggered closure (see §5.2). Pre-closure payments are accepted as
+   *      final (non-returnable). If no surplus exists for a given target:coinId,
+   *      nothing is returned for that pair.
    *    - CANCELLED invoice: return EVERYTHING — each sender gets back their full
    *      per-sender net balance.
    *
@@ -1101,15 +1105,41 @@ const commitment = await TransferCommitment.create(
 );
 
 // AFTER (required change — encode memo into on-chain message):
-const messageBytes = request.memo
-  ? new TextEncoder().encode(request.memo)  // UTF-8 encode the memo string
-  : null;
+// For invoice-related transfers, the memo contains the INV: text format.
+// The on-chain message carries a structured JSON TransferMessagePayload.
+// PaymentsModule.send() must detect invoice memos and encode accordingly:
+const payload = parseInvoiceMemoForOnChain(request.memo);
+// parseInvoiceMemoForOnChain returns:
+//   - TransferMessagePayload JSON bytes if memo is INV: format
+//   - raw UTF-8 bytes of memo string otherwise (for non-invoice transfers)
+//   - null if no memo
+const messageBytes = payload;
 const commitment = await TransferCommitment.create(
   sdkToken, recipientAddress, salt,
   null,  // recipientDataHash
   messageBytes,  // ← now carries the memo on-chain
   signingService
 );
+```
+
+**`parseInvoiceMemoForOnChain()` helper (in PaymentsModule):**
+
+```typescript
+function parseInvoiceMemoForOnChain(memo: string | undefined): Uint8Array | null {
+  if (!memo) return null;
+  const ref = parseInvoiceMemo(memo);
+  if (ref) {
+    // Invoice-related: encode as structured TransferMessagePayload
+    const dirMap = { forward: 'F', back: 'B', return_closed: 'RC', return_cancelled: 'RX' } as const;
+    const payload: TransferMessagePayload = {
+      inv: { id: ref.invoiceId, dir: dirMap[ref.direction] },
+      ...(ref.freeText ? { txt: ref.freeText } : {}),
+    };
+    return new TextEncoder().encode(JSON.stringify(payload));
+  }
+  // Non-invoice memo: encode as raw UTF-8
+  return new TextEncoder().encode(memo);
+}
 ```
 
 **This change applies to ALL transfer paths in PaymentsModule:**
@@ -1227,10 +1257,12 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
            freeze recomputed balances with `explicitClose: false`,
            persist to FROZEN_BALANCES, add to closedSet,
            fire 'invoice:closed' { explicit: false }
-        -> **Latest sender for surplus:** The sender of the payment currently being
-           processed (the payment that triggered the implicit close) is the "latest
-           sender." This is determined by processing order — the payment inside the
-           gate when the close condition is met — not by timestamp.
+        -> **Latest sender for surplus (per target:coinId):** For each target:coinId
+           with surplus, the "latest sender" is the sender whose forward payment for
+           THAT specific target:coinId was being processed inside the gate when the
+           close condition was met. In a multi-target invoice, different targets may
+           have different latest senders. This is determined by processing order —
+           the payment inside the gate — not by timestamp.
         -> **Race condition:** A payment from another sender may arrive while this
            close sequence executes inside the gate. That payment queues behind the
            gate and will be processed as a post-closure payment. Its per-sender
@@ -1238,7 +1270,7 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
         -> **Event ordering:** 'invoice:closed' fires BEFORE any 'invoice:auto_returned'
            events, for both explicit and implicit close paths.
         -> after freeze: if auto-return is enabled (perInvoice[id] ?? global)
-           AND wallet is a target AND invoice is not anonymous,
+           AND wallet is a target,
            trigger surplus auto-return (same as explicit close with autoReturn).
            Surplus is calculated from the recomputed-and-frozen balances
            (the balances just frozen inside this gate, not the pre-gate snapshot).
@@ -1329,7 +1361,7 @@ senderNetBalance = max(0, senderForwarded - senderReturned)
 - **Only target parties may return.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`).
 - **Per-sender return cap (INVARIANT).** Returns to a specific sender are **strictly prevented** from exceeding that sender's effective balance — regardless of invoice state. `returnInvoicePayment()` throws `INVOICE_RETURN_EXCEEDS_BALANCE` before the transfer happens. This guarantees that `returnedAmount` never exceeds `coveredAmount` at the per-sender level — the `max(0, ...)` floor in the formula is a defensive safeguard, not a normal code path. This applies to both manual `returnInvoicePayment()` and auto-return. What differs between terminal and non-terminal invoices is the *baseline*: closure resets per-sender balances to zero and assigns surplus (see CLOSED/CANCELLED rules below), but the cap still applies against the effective post-reset balance.
 - **Terminal state freeze.** Once CLOSED or CANCELLED, balances are frozen and persisted. Post-termination transfers continue to be tracked per-sender on top of the frozen baseline.
-- **CLOSED resets per-sender balances (payments accepted).** Closing means the target party accepts the payments as final. At freeze time, all pre-closure per-sender balances are reset to zero — **pre-closure payments are non-returnable.** The surplus (if any) is assigned to the **latest sender** (by processing order — the sender whose payment was being processed inside the per-invoice serialization gate when all targets became covered+confirmed, i.e., the payment that triggered the close). Post-closure per-sender tracking starts from: surplus for the latest sender, zero for all others. New forward payments after closure are tracked per-sender normally and are fully returnable.
+- **CLOSED resets per-sender balances (payments accepted).** Closing means the target party accepts the payments as final. At freeze time, all pre-closure per-sender balances are reset to zero — **pre-closure payments are non-returnable.** The surplus (if any) is assigned **per (target, coinId)** to the **latest sender** for that tuple (by processing order — the sender whose forward payment for that specific target:coinId was being processed inside the per-invoice serialization gate when the close condition was met). In multi-target invoices, different targets may have different latest senders. Post-closure per-sender tracking starts from: surplus for the latest sender of each target:coinId, zero for all others. New forward payments after closure are tracked per-sender normally and are fully returnable.
   **Race condition awareness:** A payment from another sender may arrive while the triggering payment's close sequence is executing inside the gate. That concurrent payment queues behind the gate and is processed as a *post-closure* payment — its per-sender balance must NOT be reset to zero and must NOT receive surplus. The per-invoice gate serialization ensures exactly one payment is "inside" at the close moment.
 - **CANCELLED preserves per-sender balances (deal abandoned).** Cancellation preserves all per-sender balances as-is — everything is returnable to each sender. Post-cancellation forwards are tracked per-sender normally (added on top).
 - **Multi-asset tokens.** A single token may carry multiple coin entries (e.g., `coinData = [["UCT", "500"], ["USDU", "1000"]]`). When such a token is transferred with an invoice memo, each coin entry is matched independently against the invoice targets. One transfer of a multi-asset token may cover multiple requested assets for the same target simultaneously.
@@ -1438,19 +1470,40 @@ processTokenTransactions(token: Token, startIndex: number):
        continue
 
     4. Derive transferId from tx:
-       transferId = tx.inclusionProof?.transactionHash
-                 ?? sha256(tx.previousStateHash + ':' + (tx.newStateHash ?? ''))
-       // The transactionHash from the inclusion proof is the canonical ID.
-       // Fallback hash for uncommitted transactions (inclusionProof === null).
+       // ALWAYS use the deterministic fallback hash as the canonical transferId.
+       // This ensures the ID is STABLE across sessions — if a token is first
+       // seen unconfirmed (inclusionProof === null) and later confirmed
+       // (inclusionProof added), the transferId does not change.
+       // Using transactionHash would cause the dedup key to change on
+       // confirmation, producing duplicate index entries.
+       transferId = sha256(tx.previousStateHash + ':' + (tx.newStateHash ?? ''))
+       // The inclusionProof.transactionHash is NOT used for transferId because
+       // it is unavailable for unconfirmed transactions and would create an
+       // unstable key. The previousStateHash + newStateHash pair is unique per
+       // state transition and available immediately.
 
-    5. Resolve sender/recipient from tx.data:
+    5. Resolve sender/recipient from tx and token state:
        recipientAddress = (tx.data as any)?.recipient   // TransferTransactionData.recipient
-       senderAddress = derived from tx.predicate via UnmaskedPredicate.fromCBOR()
-       // The predicate encodes the owner's public key. Deserialize with
-       // UnmaskedPredicate.fromCBOR(hexToBytes(tx.predicate)) to extract
-       // the public key, then derive the DIRECT:// address from it.
-       // For the first transaction, the genesis recipient serves as a
-       // fallback if predicate decoding fails.
+       // IMPORTANT: tx.predicate at index N is the NEW owner's predicate
+       // (the recipient of transaction N), NOT the sender's. The SENDER is
+       // the PREVIOUS state's owner — identified by the predicate at the
+       // previous transaction, or the genesis recipient for the first tx.
+       //
+       // Sender derivation:
+       //   - For transaction at index 0: sender = genesis.data.recipient
+       //     (the original minter/owner)
+       //   - For transaction at index N > 0: sender = derived from
+       //     txf.transactions[N-1].predicate via UnmaskedPredicate.fromCBOR()
+       //     (the predicate set by transaction N-1 identifies the owner
+       //     before transaction N transferred the token)
+       //
+       // Extract the public key from the predicate, then derive the
+       // DIRECT:// address from it.
+       senderAddress = (i === 0)
+         ? txf.genesis.data.recipient
+         : deriveDIRECTAddress(UnmaskedPredicate.fromCBOR(
+             hexToBytes(txf.transactions[startIndex + i - 1].predicate)
+           ).publicKey)
 
     6. For each [coinId, amount] in coinData:
        a. Skip if amount === "0"
@@ -1488,11 +1541,20 @@ Phase 1 — Load persisted index:
   4. Rebuild tokenInvoiceMap from loaded entries
 
 Phase 2 — Scan token transaction tails:
-  5. allTokens = PaymentsModule.getTokens()
-     // This includes active tokens. Archived tokens are no longer available
-     // via getTokens(), but their data was already captured in the index
-     // during the session when they were active. The tokenScanState entry
-     // (with txCount = final transactions.length) prevents re-scanning.
+  5. allTokens = PaymentsModule.getTokens() + PaymentsModule.getArchivedTokens()
+     // BOTH active and archived tokens must be scanned. Archived tokens may
+     // have unprocessed transaction tails if the process crashed between
+     // archiving the token and updating tokenScanState. The tokenScanState
+     // watermark provides the fast-path skip for fully-processed tokens.
+     // Note: getArchivedTokens() may not exist in current PaymentsModule API.
+     // If unavailable, scan archived token files directly from TokenStorage:
+     //   archivedTokens = tokenStorage.getArchivedTokens()
+     // Alternatively, if neither API is available, rely on the tokenScanState
+     // entries: any tokenId in tokenScanState that is NOT in allTokens was
+     // likely archived. Its index entries are already captured. The only risk
+     // is a crash between the token's last transaction and archival — this is
+     // a narrow window. For v1, document this as a known limitation and
+     // recommend the getArchivedTokens() API be added to PaymentsModule.
   6. For each token T in allTokens:
      a. txf = JSON.parse(T.sdkData) as TxfToken
      b. startIndex = tokenScanState.get(T.id) ?? 0
@@ -1848,6 +1910,17 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
           perspective — the target decided to close, and the sender accepts
           this via the implicit termination signal.
         - :RX -> auto-cancel invoice locally (if not already terminated)
+        **Implementation note:** Auto-termination MUST NOT call the public
+        `closeInvoice()`/`cancelInvoice()` methods, which would attempt to
+        acquire the per-invoice gate and deadlock (the event handler may
+        already be inside the gate). Instead, use an internal
+        `_terminateInvoice(invoiceId, state)` method that performs the
+        freeze-and-persist directly without gate acquisition. This is safe
+        because: (a) the caller is already inside the gate (serialized), and
+        (b) the frozen balance computation uses the current index state which
+        is consistent within the gate. The internal method performs the same
+        steps as closeInvoice()/cancelInvoice() (compute balances, freeze,
+        persist to terminal set) but skips the gate acquisition.
         **Trust note:** A legitimate target CAN send :RC/:RX even if the
         invoice is not actually closed/cancelled on their side. The payer's
         `autoTerminateOnReturn` trusts the target's direction code at face
@@ -2035,14 +2108,21 @@ interface FrozenCoinAssetBalances {
    *
    * For CLOSED: all entries are zero EXCEPT the latest sender gets the surplus.
    *   Pre-closure payments are accepted as final (non-returnable).
-   *   latestSender = sender of the payment that triggered the close (the payment
-   *   being processed inside the per-invoice gate when the close condition was met).
+   *   latestSender = sender whose forward payment for THIS target:coinId was
+   *   being processed inside the per-invoice gate when the close condition was met.
+   *   Different target:coinId pairs may have different latest senders.
    * For CANCELLED: each sender's full pre-cancellation senderNetBalance is preserved.
    *   Everything is returnable.
    *
    * Post-termination forwards and returns are tracked on top of these baselines.
    */
   readonly frozenSenderBalances: FrozenSenderBalance[];
+  /**
+   * The latest sender for this target:coinId at freeze time (CLOSED only).
+   * Persisted to enable crash recovery (inverse reconciliation in §7.6 step 4c).
+   * For CANCELLED invoices, this field is undefined (all balances preserved).
+   */
+  readonly latestSenderAddress?: string;
 }
 
 interface FrozenSenderBalance {
@@ -2183,12 +2263,15 @@ closeInvoice():
   1. Compute current balances one final time
   2. Reset per-sender balances for frozen snapshot:
      a. Set all pre-closure per-sender netBalance to '0' (payments accepted as final)
-     b. If surplusAmount > 0 for any target:coinId:
-        - Identify the latest sender: the sender of the payment that triggered
-          the close (for implicit close: the payment being processed inside the
-          per-invoice gate when the close condition was met; for explicit close:
-          the sender of the most recent forward transfer by processing order)
+     b. For EACH target:coinId with surplusAmount > 0:
+        - Identify the latest sender FOR THIS target:coinId: the sender whose
+          forward payment for this specific target:coinId was being processed
+          inside the per-invoice gate when the close condition was met
+          (for implicit close) or the sender of the most recent forward
+          transfer for this target:coinId by processing order (for explicit close).
+          Different target:coinId pairs may have different latest senders.
         - Assign surplusAmount as that sender's frozenSenderBalance.netBalance
+        - Store latestSenderAddress in FrozenCoinAssetBalances (for crash recovery)
      c. Store frozenSenderBalances[] in FrozenCoinAssetBalances
   3. Persist frozen balances to FROZEN_BALANCES storage with `explicitClose: true`
      (MUST complete before step 4)
@@ -2284,6 +2367,13 @@ load():
       is not guaranteed by the storage provider). For each orphan:
       - Recompute balances from history (same formula as non-terminal status
         computation — the balance formula is state-agnostic)
+      - For CLOSED invoices: the per-sender reset and latest-sender assignment
+        cannot be fully reconstructed from history alone (processing order is
+        lost). Use a conservative fallback: assign surplus to the sender with
+        the highest forwarded amount for each target:coinId (deterministic,
+        though may differ from original processing order). Persist the
+        `latestSenderAddress` field in `FrozenCoinAssetBalances` with the
+        fallback value, and log a warning noting the approximation.
       - Persist as FrozenInvoiceBalances with `state` set based on which
         terminal set the invoice belongs to (CLOSED or CANCELLED)
       - The `state` field (not the balance values) drives auto-return
@@ -2425,7 +2515,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Rule | Error |
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
-| Caller must be a target: the `chainPubkey` of ANY tracked address from `getActiveAddresses()` must match one of the `targets[].address` entries in the invoice terms. | `INVOICE_NOT_TARGET` |
+| Caller must be a target: the `directAddress` of ANY tracked address from `getActiveAddresses()` must match one of the `targets[].address` entries in the invoice terms. Note: `targets[].address` is a `DIRECT://` address — compare against `TrackedAddress.directAddress`, NOT `chainPubkey`. | `INVOICE_NOT_TARGET` |
 | Invoice must not already be CLOSED | `INVOICE_ALREADY_CLOSED` |
 | Invoice must not already be CANCELLED | `INVOICE_ALREADY_CANCELLED` |
 
@@ -2434,7 +2524,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Rule | Error |
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
-| Caller must be a target: the `chainPubkey` of ANY tracked address from `getActiveAddresses()` must match one of the `targets[].address` entries in the invoice terms. | `INVOICE_NOT_TARGET` |
+| Caller must be a target: the `directAddress` of ANY tracked address from `getActiveAddresses()` must match one of the `targets[].address` entries in the invoice terms. Note: `targets[].address` is a `DIRECT://` address — compare against `TrackedAddress.directAddress`, NOT `chainPubkey`. | `INVOICE_NOT_TARGET` |
 | Invoice must not already be CLOSED (computed) | `INVOICE_ALREADY_CLOSED` |
 | Invoice must not already be cancelled | `INVOICE_ALREADY_CANCELLED` |
 
@@ -2837,8 +2927,8 @@ Invoice abc requests 1000 UCT from DIRECT://alice.
 S1 sends 700 UCT (INV:abc:F) to alice.
 S2 sends 500 UCT (INV:abc:F) to alice.
 Total covered = 1200 UCT, surplus = 200 UCT.
-S2 is the latest sender (by processing order — S2's payment was being
-processed when the total crossed the 1000 UCT threshold).
+S2 is the latest sender for (alice, UCT) — by processing order, S2's payment
+was being processed when the total crossed the 1000 UCT threshold.
 
 Alice closes invoice (satisfied with payments):
   -> closeInvoice('abc', { autoReturn: true })
