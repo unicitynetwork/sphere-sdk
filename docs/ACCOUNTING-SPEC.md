@@ -186,7 +186,7 @@ interface InvoiceSenderBalance {
  *   coveredAmount = sum of all forward payment amounts referencing this invoice for this target:coinId
  *   returnedAmount = sum of all back/return payment amounts referencing this invoice for this target:coinId
  *                    (includes :B, :RC, and :RX directions)
- *   netCoveredAmount = max(0, coveredAmount - returnedAmount)   // floored at zero
+ *   netCoveredAmount = max(0, coveredAmount - returnedAmount)   // defensive floor; validation prevents negative
  *
  * Note: These balances reflect memo-referenced transfers only.
  * Whether the underlying tokens are still in the wallet is irrelevant.
@@ -198,7 +198,7 @@ interface InvoiceCoinAssetStatus {
   readonly coveredAmount: string;
   /** Total back/return payments for this asset (smallest units, includes :B, :RC, :RX) */
   readonly returnedAmount: string;
-  /** Net covered = max(0, coveredAmount - returnedAmount), floored at zero */
+  /** Net covered = coveredAmount - returnedAmount (validation ensures non-negative; max(0,...) as defensive floor) */
   readonly netCoveredAmount: string;
   /** Whether requested amount is fully met (netCovered >= requested) */
   readonly isCovered: boolean;
@@ -1279,7 +1279,12 @@ returnedAmount = SUM(amount) for all InvoiceTransferRef entries WHERE:
                    InvoiceTransferRef fields, not from history record field names.
                  - coinId matches asset.coin[0]
 
-netCoveredAmount = max(0, coveredAmount - returnedAmount)   // floored at zero
+netCoveredAmount = coveredAmount - returnedAmount
+// INVARIANT: returnedAmount <= coveredAmount is enforced by returnInvoicePayment()
+// validation (throws INVOICE_RETURN_EXCEEDS_BALANCE). The net can never go negative
+// for non-terminal invoices. The max(0, ...) defensive floor below is for display
+// safety only — it should never activate if validation is correct.
+netCoveredAmount = max(0, netCoveredAmount)
 isCovered        = netCoveredAmount >= asset.coin[1] (requested amount)
 surplusAmount    = max(0, netCoveredAmount - asset.coin[1])
 ```
@@ -1312,7 +1317,7 @@ senderNetBalance = max(0, senderForwarded - senderReturned)
 - **Spending tokens is independent.** If Alice receives 500 UCT with memo `INV:abc:F`, then spends that 500 UCT on something else (no `INV:abc` memo), the invoice `abc` still shows 500 UCT covered. The spent token's outbound transfer has no invoice memo, so it doesn't affect the invoice.
 - **Self-payments are excluded.** If a target address owner sends tokens to themselves with memo `INV:abc:F` (sender address == destination address == target address), the forward payment is NOT counted toward `coveredAmount`. It is classified as `invoice:irrelevant` with reason `'self_payment'`. This prevents a target from fabricating coverage without external payments. **Limitation:** Self-payment detection compares addresses per-transfer — it does not detect cross-HD-address self-payments within the same wallet (e.g., address 0 paying address 1 where both belong to the same mnemonic). Each HD address is treated as an independent party, consistent with the SDK's address-level isolation model.
 - **Only target parties may return.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`).
-- **Per-sender return cap.** Returns to a specific sender are capped at what that sender has forwarded (net of previous returns to them). A target cannot return more to sender S than S has sent. This applies to both manual `returnInvoicePayment()` and auto-return.
+- **Per-sender return cap (INVARIANT).** For non-terminal invoices, returns to a specific sender are **strictly prevented** from exceeding what that sender has forwarded (net of previous returns to them). `returnInvoicePayment()` throws `INVOICE_RETURN_EXCEEDS_BALANCE` before the transfer happens. This guarantees that `returnedAmount` never exceeds `coveredAmount` at the per-sender level — the `max(0, ...)` floor in the formula is a defensive safeguard, not a normal code path. This applies to both manual `returnInvoicePayment()` and auto-return.
 - **Terminal state freeze.** Once CLOSED or CANCELLED, balances are frozen and persisted. `getInvoiceStatus()` returns the persisted snapshot. No recomputation occurs. New transfers referencing the invoice are still visible via `getRelatedTransfers()`.
 - **Multi-asset tokens.** A single token may carry multiple coin entries (e.g., `coinData = [["UCT", "500"], ["USDU", "1000"]]`). When such a token is transferred with an invoice memo, each coin entry is matched independently against the invoice targets. One transfer of a multi-asset token may cover multiple requested assets for the same target simultaneously.
 
@@ -2616,7 +2621,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_INVALID_TARGET` | Invalid target index | Out-of-bounds targetIndex in payInvoice |
 | `INVOICE_INVALID_ASSET_INDEX` | Invalid asset index | Out-of-bounds assetIndex in payInvoice |
 | `INVOICE_NOT_TARGET` | Only invoice target parties can send return payments | Return from non-target wallet address |
-| `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds net covered balance for this target:coinId | Excessive return |
+| `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds the per-sender net balance for (target, sender, coinId). Returns MUST NOT cause returnedAmount to exceed coveredAmount. | Excessive return to a specific sender |
 
 | `INVOICE_INVALID_DELIVERY_METHOD` | Delivery method must use https:// or wss:// scheme, max 2048 chars, max 10 entries | Invalid deliveryMethods entry |
 | `INVOICE_INVALID_ID` | Invoice ID must be a 64-char hex string | Invalid invoiceId passed to buildInvoiceMemo |

@@ -174,7 +174,7 @@ For a given invoice target and asset (e.g., target `DIRECT://alice`, asset `UCT`
 ```
 coveredAmount    = sum(forward payments referencing this invoice for this target:asset)
 returnedAmount   = sum(back/return payments referencing this invoice for this target:asset)
-netCoveredAmount = max(0, coveredAmount - returnedAmount)   // floored at zero
+netCoveredAmount = max(0, coveredAmount - returnedAmount)   // validation ensures non-negative; max(0,...) is defensive only
 ```
 
 Key rules:
@@ -189,7 +189,7 @@ Key rules:
 
 5. **Only target parties may send return payments.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`). This is enforced by `returnInvoicePayment()` and the auto-return system.
 
-6. **Net covered amount is floored at zero.** `netCoveredAmount = max(0, coveredAmount - returnedAmount)`. The net balance can never go negative. `returnInvoicePayment()` validates that the return amount does not exceed the per-sender net balance for the specified (target, sender, coinId) tuple. A target cannot return to sender S more than S has sent.
+6. **Returns MUST NOT exceed covered amount.** For non-terminal invoices, `returnInvoicePayment()` enforces that the return amount does not exceed the per-sender net balance for the specified (target, sender, coinId) tuple — throws `INVOICE_RETURN_EXCEEDS_BALANCE` before the transfer happens. A target cannot return to sender S more than S has sent. The `max(0, ...)` floor in the `netCoveredAmount` formula is a defensive display safeguard only — the validation guarantees `returnedAmount` never actually exceeds `coveredAmount` at the per-sender level.
 
 7. **Frozen at terminal states.** Once an invoice reaches CLOSED or CANCELLED, its balances are frozen and persisted. Dynamic recomputation no longer occurs. The frozen snapshot is returned for all subsequent queries.
 
