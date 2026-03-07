@@ -550,7 +550,6 @@ class AccountingModule {
    * @param invoiceId - The invoice token ID
    * @param options - Optional: { autoReturn?: boolean } — enable auto-return on close
    * @throws SphereError with INVOICE_NOT_CREATOR if not the creator (non-anonymous)
-   * @throws SphereError with INVOICE_ANON_AUTO_RETURN if autoReturn is true and invoice is anonymous
    * @throws SphereError if not found, already closed, or already cancelled
    */
   async closeInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
@@ -576,7 +575,6 @@ class AccountingModule {
    *
    * @param invoiceId - The invoice token ID
    * @param options - Optional: { autoReturn?: boolean } — enable auto-return on cancel
-   * @throws SphereError with INVOICE_ANON_AUTO_RETURN if autoReturn is true and invoice is anonymous
    * @throws SphereError if not creator (non-anonymous), not found, or already closed/cancelled
    */
   async cancelInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
@@ -644,17 +642,6 @@ class AccountingModule {
    *
    * RESTRICTION: Auto-return only executes if the local wallet's address
    * matches one of the invoice targets. Non-target parties cannot return tokens.
-   *
-   * RESTRICTION: Auto-return is disabled for anonymous invoices (terms.creator
-   * undefined). This prevents a malicious holder from cancelling an anonymous
-   * invoice to trigger return of all accumulated payments. For anonymous invoices,
-   * targets may still manually return tokens via returnInvoicePayment().
-   *
-   * - For a specific invoiceId: throws INVOICE_ANON_AUTO_RETURN if the invoice
-   *   is anonymous.
-   * - For '*' (global): the global flag is set, but immediate trigger
-   *   silently skips anonymous invoices (no error thrown). Anonymous invoices
-   *   are also skipped during ongoing auto-return processing.
    *
    * Return payments (:B, :RC, :RX) are NEVER auto-returned (prevents loops).
    *
@@ -2309,7 +2296,6 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Caller must be the creator: `terms.creator` must match the `chainPubkey` of ANY tracked address from `getActiveAddresses()`, not just the current active identity. For anonymous invoices (`terms.creator` undefined), any party holding the invoice may close it. | `INVOICE_NOT_CREATOR` |
 | Invoice must not already be CLOSED | `INVOICE_ALREADY_CLOSED` |
 | Invoice must not already be CANCELLED | `INVOICE_ALREADY_CANCELLED` |
-| If `options.autoReturn` is `true` and invoice is anonymous (`terms.creator` undefined): reject. Auto-return is not allowed for anonymous invoices (abuse vector — any holder could cancel and trigger return of all payments). | `INVOICE_ANON_AUTO_RETURN` |
 
 ### 8.4 Cancel Validation
 
@@ -2319,7 +2305,6 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | If non-anonymous: `terms.creator` must match the `chainPubkey` of ANY tracked address from `getActiveAddresses()`, not just the current active identity. For anonymous invoices (`terms.creator` undefined), any party holding the invoice may cancel it. | `INVOICE_NOT_CREATOR` |
 | Invoice must not already be CLOSED (computed) | `INVOICE_ALREADY_CLOSED` |
 | Invoice must not already be cancelled | `INVOICE_ALREADY_CANCELLED` |
-| If `options.autoReturn` is `true` and invoice is anonymous (`terms.creator` undefined): reject. Auto-return is not allowed for anonymous invoices. | `INVOICE_ANON_AUTO_RETURN` |
 
 ### 8.5 Pay Invoice Validation
 
@@ -2345,7 +2330,6 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Rule | Error |
 |------|-------|
 | For specific invoiceId (not `'*'`): invoice token must exist locally | `INVOICE_NOT_FOUND` |
-| For specific invoiceId: if invoice is anonymous (`terms.creator` undefined), reject | `INVOICE_ANON_AUTO_RETURN` |
 
 ### 8.8 getInvoiceStatus / getRelatedTransfers Validation
 
@@ -2564,7 +2548,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_INVALID_ASSET_INDEX` | Invalid asset index | Out-of-bounds assetIndex in payInvoice |
 | `INVOICE_NOT_TARGET` | Only invoice target parties can send return payments | Return from non-target wallet address |
 | `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds net covered balance for this target:coinId | Excessive return |
-| `INVOICE_ANON_AUTO_RETURN` | Auto-return is not allowed for anonymous invoices | `autoReturn: true` on anonymous invoice close/cancel |
+
 | `INVOICE_INVALID_DELIVERY_METHOD` | Delivery method must use https:// or wss:// scheme, max 2048 chars, max 10 entries | Invalid deliveryMethods entry |
 | `INVOICE_INVALID_ID` | Invoice ID must be a 64-char hex string | Invalid invoiceId passed to buildInvoiceMemo |
 | `INVOICE_TOO_MANY_TARGETS` | Invoice exceeds maximum of 100 targets | Too many targets in CreateInvoiceRequest |
