@@ -701,16 +701,8 @@ class AccountingModule {
    * Contact info is embedded in the on-chain TransferMessagePayload (`inv.ct` field).
    * If `params.contact` is provided, it is used directly. If `params.contact` is
    * NOT provided, it is auto-populated from `this.identity.directAddress` as
-   * `{ address: this.identity.directAddress }`. To suppress auto-populate entirely,
-   * pass `contact: null`. This ensures every outbound invoice payment carries
-   * contact info for the recipient to reach the payer by default.
-   *
-   * WARNING (masked predicate privacy): Auto-populate uses `identity.directAddress`,
-   * which is the wallet's real DIRECT address. If the sender uses a masked predicate
-   * to hide their on-chain identity, the auto-populated contact exposes their real
-   * address in the on-chain `inv.ct.a` field, defeating the masked predicate's
-   * privacy. Callers using masked predicates MUST explicitly pass a pseudonymous
-   * contact address or `contact: null` to preserve privacy.
+   * `{ address: this.identity.directAddress }`. This ensures every outbound invoice
+   * payment carries contact info for the recipient to reach the payer.
    * The `contact.address` must be a valid DIRECT:// address. If `contact.url` is
    * provided, it must use https:// or wss:// scheme and not exceed 2048 characters.
    * Throws `INVOICE_INVALID_CONTACT` on validation failure.
@@ -918,17 +910,13 @@ interface PayInvoiceParams {
    * Contact is purely informational — it does not affect auto-return routing,
    * balance computation, or per-sender keying.
    *
-   * When not provided (undefined), auto-populated from `identity.directAddress`
-   * at runtime (see §4.7). Pass `null` to explicitly suppress auto-populate.
-   *
-   * WARNING (masked predicate privacy): Auto-populate uses `identity.directAddress`.
-   * If using a masked predicate to hide identity, pass a pseudonymous contact
-   * or `null` — otherwise the real address is exposed on-chain via `inv.ct.a`.
+   * When not provided, auto-populated from `identity.directAddress` at runtime
+   * (see §4.7). This ensures every outbound invoice payment carries contact info.
    *
    * Contact resolution priority (application-level recommendation):
    * `contacts[0].address → refundAddress → senderAddress → null`
    */
-  readonly contact?: { address: string; url?: string } | null;
+  readonly contact?: { address: string; url?: string };
 }
 
 /**
@@ -1374,12 +1362,9 @@ const commitment = await TransferCommitment.create(
 // The on-chain message carries a structured JSON TransferMessagePayload.
 // PaymentsModule.send() must detect invoice memos and encode accordingly:
 // Auto-populate contact from identity when not explicitly provided.
-// Pass `contact: null` to suppress auto-populate (e.g., for masked-predicate privacy).
-// `undefined` triggers auto-populate; `null` suppresses it; object is used directly.
-const contact = request.contact === null
-  ? undefined                                      // explicit opt-out — no contact on-chain
-  : request.contact ?? { address: this.identity.directAddress };  // auto-populate if undefined
-// Validate contact if present (same rules as explicit contact — INVOICE_INVALID_CONTACT on failure)
+// This ensures every outbound invoice payment carries contact info.
+const contact = request.contact ?? { address: this.identity.directAddress };
+// Validate contact (same rules as explicit contact — INVOICE_INVALID_CONTACT on failure)
 const payload = parseInvoiceMemoForOnChain(request.memo, request.refundAddress, contact);
 // parseInvoiceMemoForOnChain returns:
 //   - TransferMessagePayload JSON bytes if memo is INV: format
@@ -1475,7 +1460,6 @@ When resolving invoice references for a transfer, the accounting module uses thi
 - **Self-payment exclusion:** Forward payments where sender == destination == target are excluded (see §5.2). **Limitation (Sybil):** Self-payment detection is per-address only — it does not prevent a target from creating a second wallet (different HD address or different mnemonic) and fabricating forward payments from that wallet. Cross-wallet self-payment detection is impossible in a privacy-preserving system. Applications requiring verified external payments should use out-of-band identity verification or trusted intermediaries.
 - **Untrusted string sanitization:** `txt` field in `TransferMessagePayload`, `InvoiceTerms.memo`, `deliveryMethods` URLs, and `senderNametag`/`recipientNametag` in `InvoiceTransferRef` contain untrusted user input. Applications MUST sanitize before HTML/DOM rendering. React (JSX) provides automatic escaping; other contexts must apply their own.
 - **Contact address is self-asserted (phishing risk).** The `contact.address` field in `InvoiceTransferRef` and `InvoiceSenderBalance.contacts` is set by the payer — the SDK does NOT verify that the contact address belongs to the actual sender. A malicious payer can set any DIRECT:// address as their contact, potentially impersonating another party. Applications MUST NOT treat `contact.address` as verified identity. For identity-sensitive operations (e.g., displaying "Payment from X"), applications SHOULD cross-reference `contact.address` against independently verified identity sources (e.g., nametag registry, trusted contact list). The `refundAddress` field has the same trust model — it is self-asserted and unverified.
-- **Contact auto-populate and masked predicate privacy.** `payInvoice()` auto-populates `contact` from `identity.directAddress` when `params.contact` is `undefined`. If the sender uses a masked predicate to hide their on-chain identity, the auto-populated contact exposes their real DIRECT address in the permanent on-chain `inv.ct.a` field, defeating the masked predicate's purpose. Callers using masked predicates MUST pass `contact: null` (explicit opt-out) or a pseudonymous contact address to preserve privacy.
 - **Contact URL sanitization.** Inbound `ct.u` values are validated for scheme (`https://` or `wss://` only), length (≤ 2048 chars), and control characters (codepoints < 0x20 rejected to prevent newline/header injection). Applications MUST still sanitize `ct.u` before use in HTML attributes, HTTP headers, or WebSocket handshakes — the SDK strips known-bad patterns but does not guarantee full URL safety.
 - Applications MUST use the SDK's decoding functions — never parse on-chain messages or transport memos manually.
 
