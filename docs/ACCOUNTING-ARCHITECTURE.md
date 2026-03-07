@@ -193,7 +193,9 @@ Key rules:
 
 7. **Frozen at terminal states.** Once an invoice reaches CLOSED or CANCELLED, its balances are frozen and persisted. The frozen snapshot determines the baseline for subsequent queries. Post-termination transfers (incoming forwards, manual returns, auto-returns) continue to be tracked per-sender on top of the frozen baseline.
 
-8. **CLOSED resets per-sender balances (payments accepted).** Closing an invoice means the creator accepts the payments received so far as final. At freeze time, all pre-closure per-sender balances are reset to zero — pre-closure payments are non-returnable. The surplus (if any) is assigned to the **latest sender** (by local arrival timestamp). Post-closure per-sender tracking starts from: surplus balance for the latest sender, zero for all others. Any new forward payments arriving after closure are tracked per-sender normally and are fully returnable.
+8. **CLOSED resets per-sender balances (payments accepted).** Closing an invoice means the creator accepts the payments received so far as final. At freeze time, all pre-closure per-sender balances are reset to zero — pre-closure payments are non-returnable. The surplus (if any) is assigned to the **latest sender** (by processing order — the sender whose payment was being processed inside the per-invoice gate when the close condition was met). Post-closure per-sender tracking starts from: surplus balance for the latest sender, zero for all others. Any new forward payments arriving after closure are tracked per-sender normally and are fully returnable.
+
+   **Race condition awareness:** Because payments are processed one-at-a-time through the per-invoice serialization gate, a payment from another sender may arrive while the triggering payment's close sequence is executing. That concurrent payment is a *post-closure* payment — its per-sender balance must NOT be reset to zero and must NOT be assigned surplus. Only the sender whose payment is inside the gate when the close triggers is the "latest sender."
 
 9. **CANCELLED preserves per-sender balances (deal abandoned).** Cancelling preserves all per-sender balances as-is — everything is returnable. Post-cancellation forwards are tracked per-sender normally (added on top of existing balances).
 
@@ -315,7 +317,7 @@ Key transitions:
 **`cancelInvoice()`** — Cancellation. The invoice creator (or any holder, for anonymous invoices) abandons the **deal or session** associated with this invoice. The invoice is no longer relevant. Payments already made may need to be returned. Since cancellation is a local-only operation, any party holding the invoice can cancel it locally — but for non-anonymous invoices, only the creator is authorized (to prevent a payer from unilaterally cancelling an invoice they owe).
 
 Both are local-only operations. The distinction matters for:
-1. **Per-sender balance reset.** Closing resets all per-sender balances to zero (pre-closure payments are accepted as final, non-returnable) with only the surplus assigned to the latest sender. Cancellation preserves all per-sender balances as-is (everything returnable). See §3.6 rules 8–9.
+1. **Per-sender balance reset.** Closing resets all per-sender balances to zero (pre-closure payments are accepted as final, non-returnable) with only the surplus assigned to the latest sender (by processing order — the sender whose payment triggered closure). Cancellation preserves all per-sender balances as-is (everything returnable). See §3.6 rules 8–9.
 2. **Auto-return memo direction codes.** Tokens auto-returned for a closed invoice use `:RC` (return-for-closed); for a cancelled invoice, `:RX` (return-for-cancelled). This tells the original sender why their tokens were returned.
 3. **Recipient-side auto-termination.** When a sender receives an auto-return with `:RC` or `:RX`, the sender's accounting module may auto-terminate the invoice on their side with the same terminal state (close or cancel respectively).
 4. **Semantic intent.** Application UIs can display different messages: "Invoice closed — payment accepted" vs "Invoice cancelled — deal abandoned."
@@ -348,7 +350,7 @@ Auto-return is a mechanism where the accounting module automatically returns tok
 - **Precedence rule:** Per-invoice settings take priority over global. Effective auto-return for an invoice is `perInvoice[id] ?? global`. Setting `setAutoReturn(invoiceId, false)` disables auto-return for that specific invoice even when global is enabled.
 
 **Immediate trigger on enable:** When auto-return is enabled for an already-terminated invoice, the auto-return operation is triggered **immediately** for that invoice (not just for future incoming payments):
-- **CLOSED invoice:** Auto-return the **surplus only** to the **latest sender** (by local arrival timestamp). Since closure resets all per-sender balances to zero except the surplus assigned to the latest sender, the auto-return is a single transfer: return `surplusAmount` to that sender. If there is no surplus, nothing is returned.
+- **CLOSED invoice:** Auto-return the **surplus only** to the **latest sender** (by processing order — the sender whose payment triggered closure; see §3.6 rule 8). Since closure resets all per-sender balances to zero except the surplus assigned to the latest sender, the auto-return is a single transfer: return `surplusAmount` to that sender. If there is no surplus, nothing is returned.
 - **CANCELLED invoice:** Auto-return **each sender's full net balance**. For each target:coinId, iterate all senders and return `senderNetBalance` to each.
 
 Similarly, when enabling auto-return globally (`'*'`), the operation is triggered immediately for all currently terminated invoices.

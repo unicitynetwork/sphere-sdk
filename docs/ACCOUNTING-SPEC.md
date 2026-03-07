@@ -656,8 +656,9 @@ class AccountingModule {
    *
    * 1. **Immediate trigger:** If the invoice (or any terminated invoice for '*')
    *    is already terminated, auto-return is executed immediately:
-   *    - CLOSED invoice: return the SURPLUS ONLY to the latest sender (by local
-   *      arrival time). Pre-closure payments are accepted as final (non-returnable).
+   *    - CLOSED invoice: return the SURPLUS ONLY to the latest sender (by processing
+   *      order — the sender whose payment triggered closure; see §5.2).
+   *      Pre-closure payments are accepted as final (non-returnable).
    *      If no surplus exists, nothing is returned.
    *    - CANCELLED invoice: return EVERYTHING — each sender gets back their full
    *      per-sender net balance.
@@ -1227,6 +1228,14 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
            freeze recomputed balances with `explicitClose: false`,
            persist to FROZEN_BALANCES, add to closedSet,
            fire 'invoice:closed' { explicit: false }
+        -> **Latest sender for surplus:** The sender of the payment currently being
+           processed (the payment that triggered the implicit close) is the "latest
+           sender." This is determined by processing order — the payment inside the
+           gate when the close condition is met — not by timestamp.
+        -> **Race condition:** A payment from another sender may arrive while this
+           close sequence executes inside the gate. That payment queues behind the
+           gate and will be processed as a post-closure payment. Its per-sender
+           balance must NOT be reset to zero and must NOT receive surplus.
         -> **Event ordering:** 'invoice:closed' fires BEFORE any 'invoice:auto_returned'
            events, for both explicit and implicit close paths.
         -> after freeze: if auto-return is enabled (perInvoice[id] ?? global)
@@ -1321,7 +1330,8 @@ senderNetBalance = max(0, senderForwarded - senderReturned)
 - **Only target parties may return.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`).
 - **Per-sender return cap (INVARIANT).** For non-terminal invoices, returns to a specific sender are **strictly prevented** from exceeding what that sender has forwarded (net of previous returns to them). `returnInvoicePayment()` throws `INVOICE_RETURN_EXCEEDS_BALANCE` before the transfer happens. This guarantees that `returnedAmount` never exceeds `coveredAmount` at the per-sender level — the `max(0, ...)` floor in the formula is a defensive safeguard, not a normal code path. This applies to both manual `returnInvoicePayment()` and auto-return.
 - **Terminal state freeze.** Once CLOSED or CANCELLED, balances are frozen and persisted. Post-termination transfers continue to be tracked per-sender on top of the frozen baseline.
-- **CLOSED resets per-sender balances (payments accepted).** Closing means the creator accepts the payments as final. At freeze time, all pre-closure per-sender balances are reset to zero — **pre-closure payments are non-returnable.** The surplus (if any) is assigned to the **latest sender** (by local arrival timestamp — note: strict global ordering is impossible in an async system, so "latest" means the most recent transfer known to this wallet at freeze time). Post-closure per-sender tracking starts from: surplus for the latest sender, zero for all others. New forward payments after closure are tracked per-sender normally and are fully returnable.
+- **CLOSED resets per-sender balances (payments accepted).** Closing means the creator accepts the payments as final. At freeze time, all pre-closure per-sender balances are reset to zero — **pre-closure payments are non-returnable.** The surplus (if any) is assigned to the **latest sender** (by processing order — the sender whose payment was being processed inside the per-invoice serialization gate when all targets became covered+confirmed, i.e., the payment that triggered the close). Post-closure per-sender tracking starts from: surplus for the latest sender, zero for all others. New forward payments after closure are tracked per-sender normally and are fully returnable.
+  **Race condition awareness:** A payment from another sender may arrive while the triggering payment's close sequence is executing inside the gate. That concurrent payment queues behind the gate and is processed as a *post-closure* payment — its per-sender balance must NOT be reset to zero and must NOT receive surplus. The per-invoice gate serialization ensures exactly one payment is "inside" at the close moment.
 - **CANCELLED preserves per-sender balances (deal abandoned).** Cancellation preserves all per-sender balances as-is — everything is returnable to each sender. Post-cancellation forwards are tracked per-sender normally (added on top).
 - **Multi-asset tokens.** A single token may carry multiple coin entries (e.g., `coinData = [["UCT", "500"], ["USDU", "1000"]]`). When such a token is transferred with an invoice memo, each coin entry is matched independently against the invoice targets. One transfer of a multi-asset token may cover multiple requested assets for the same target simultaneously.
 
@@ -2009,7 +2019,8 @@ interface FrozenCoinAssetBalances {
    *
    * For CLOSED: all entries are zero EXCEPT the latest sender gets the surplus.
    *   Pre-closure payments are accepted as final (non-returnable).
-   *   latestSender = sender of the most recent forward transfer by local arrival time.
+   *   latestSender = sender of the payment that triggered the close (the payment
+   *   being processed inside the per-invoice gate when the close condition was met).
    * For CANCELLED: each sender's full pre-cancellation senderNetBalance is preserved.
    *   Everything is returnable.
    *
@@ -2157,8 +2168,10 @@ closeInvoice():
   2. Reset per-sender balances for frozen snapshot:
      a. Set all pre-closure per-sender netBalance to '0' (payments accepted as final)
      b. If surplusAmount > 0 for any target:coinId:
-        - Identify the latest sender: the sender of the most recent forward
-          transfer for that target:coinId, by local arrival timestamp
+        - Identify the latest sender: the sender of the payment that triggered
+          the close (for implicit close: the payment being processed inside the
+          per-invoice gate when the close condition was met; for explicit close:
+          the sender of the most recent forward transfer by processing order)
         - Assign surplusAmount as that sender's frozenSenderBalance.netBalance
      c. Store frozenSenderBalances[] in FrozenCoinAssetBalances
   3. Persist frozen balances to FROZEN_BALANCES storage with `explicitClose: true`
@@ -2807,7 +2820,8 @@ Invoice abc requests 1000 UCT from DIRECT://alice.
 S1 sends 700 UCT (INV:abc:F) to alice.
 S2 sends 500 UCT (INV:abc:F) to alice.
 Total covered = 1200 UCT, surplus = 200 UCT.
-S2 is the latest sender (by local arrival time).
+S2 is the latest sender (by processing order — S2's payment was being
+processed when the total crossed the 1000 UCT threshold).
 
 Alice closes invoice (satisfied with payments):
   -> closeInvoice('abc', { autoReturn: true })
@@ -2818,6 +2832,31 @@ Alice closes invoice (satisfied with payments):
   -> Fires invoice:closed { explicit: true }
   -> Fires invoice:auto_returned (200 UCT to S2)
   NOTE: S1's 700 is non-returnable (accepted). Only S2's surplus is returned.
+
+--- Implicit Close with Race Condition (processing order matters) ---
+
+Invoice xyz requests 1000 UCT from DIRECT://alice.
+S1 sends 700 UCT (INV:xyz:F) to alice.  -> processIncomingTransfer() runs, total=700 (PARTIAL)
+S2 sends 400 UCT (INV:xyz:F) to alice.  -> processIncomingTransfer() runs:
+  -> enters per-invoice gate for xyz
+  -> recomputes: total=1100, surplus=100, all confirmed
+  -> S2 is the "latest sender" (S2's payment is inside the gate when close triggers)
+  -> freeze: S1=0, S2=0 (reset), surplus 100 assigned to S2
+  -> frozenSenderBalances = [{ S1: netBalance="0" }, { S2: netBalance="100" }]
+  -> fires invoice:closed { explicit: false }
+
+Meanwhile, S3 sends 200 UCT (INV:xyz:F) WHILE S2's close sequence is inside the gate:
+  -> S3's processIncomingTransfer() queues behind the gate
+  -> gate releases after close completes
+  -> S3's payment is now processed as POST-CLOSURE
+  -> S3's per-sender balance = 200 (0 baseline + 200 new) — NOT reset to 0
+  -> if auto-return enabled: returns 200 UCT to S3 with INV:xyz:RC
+
+CRITICAL: S3 is NOT the "latest sender" even if S3's payment arrived before
+the close completed. Processing order is what matters — S2's payment was
+inside the gate when the close triggered; S3's payment queued behind it.
+
+--- Explicit Close with Auto-Return (continued) ---
 
 Later, S1 sends 500 UCT with memo INV:abc:F (unaware of closure):
   -> Token transfer succeeds (inbound transfers are NEVER blocked)
