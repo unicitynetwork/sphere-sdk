@@ -895,11 +895,32 @@ class AccountingModule {
    * - Caller must be a target party
    * - CommunicationsModule must be available (passed via dependencies)
    *
+   * DATA SOURCES:
+   * - Frozen balances (from FrozenInvoiceBalances, persisted at termination)
+   * - Invoice terms (from token genesis tokenData, for requestedAmount)
+   *
+   * ITERATION MODEL:
+   * For each target address that this wallet controls:
+   *   1. Collect unique senders across all coinAssets in this target's frozen balances.
+   *      Grouping key: `(targetAddress, senderAddress)` — i.e., one receipt per
+   *      unique sender per target, aggregating all coinId breakdowns into a single
+   *      `InvoiceReceiptContribution.assets[]` array.
+   *   2. For each unique sender:
+   *      a. If net balance across all coinIds is zero AND !options.includeZeroBalance: skip
+   *      b. Resolve DM recipient (see DELIVERY below)
+   *      c. Build InvoiceReceiptPayload with all coinId breakdowns for this (target, sender)
+   *      d. Send DM
+   *
    * DELIVERY:
    * - Recipient resolution per sender (first match wins):
    *   1. `contacts[0].address` — payer's explicitly-provided contact address
    *   2. `senderAddress` (if not a refund address, i.e., `isRefundAddress` is falsy)
    *   3. Skip — unresolvable sender goes to `failedReceipts`
+   *   NOTE: When `isRefundAddress` is true and `contacts` is empty, the sender is
+   *   unresolvable. The refund address is a token-return destination that may lack
+   *   a Nostr identity binding — using it for DM delivery could fail silently or
+   *   reach an unintended recipient. Applications that want to reach such payers
+   *   should use out-of-band communication.
    * - DM failures for one sender don't block others (best-effort)
    * - Receipt DMs do not affect invoice state or balances
    *
@@ -948,13 +969,15 @@ class AccountingModule {
    *
    * Sequence:
    * 1. Set internal `destroyed` flag (FIRST — prevents new operations immediately)
-   * 2. Unsubscribe from all PaymentsModule events (prevents new event-driven entries)
+   * 2. Unsubscribe from all PaymentsModule events AND CommunicationsModule DM
+   *    subscription if active (prevents new event-driven entries and receipt detection)
    * 3. Await the current promise-chain tail for ALL active gate entries
    *    (captures the map snapshot at flag-set time)
    *
    * The `destroyed` flag is checked in TWO places:
    * - At the TOP of every PUBLIC METHOD (getInvoiceStatus, payInvoice,
-   *   closeInvoice, cancelInvoice, returnInvoicePayment, setAutoReturn).
+   *   closeInvoice, cancelInvoice, returnInvoicePayment, setAutoReturn,
+   *   sendInvoiceReceipts).
    *   If set, the method throws immediately without entering the gate.
    * - At the TOP of every gate `fn` body. If set, the fn returns immediately
    *   without storage writes (catches operations queued before flag was set).
@@ -2404,6 +2427,15 @@ All state-mutating operations on a given invoice are serialized through a **per-
   `payInvoice()` programmatically MUST implement their own call serialization
   or accept that concurrent calls may overpay.
 - `parseInvoiceMemo()`
+- `sendInvoiceReceipts()` — read-only with respect to invoice state. Reads frozen
+  balances (immutable once written) and invoice terms (immutable genesis data). Does
+  not acquire the per-invoice gate. The only side effects are sending DMs via
+  `CommunicationsModule.sendDM()` and firing `invoice:receipt_sent`. Safe to call
+  concurrently with any other operation: frozen balances cannot be modified after
+  persistence, so there is no TOCTOU risk. Multiple concurrent calls produce
+  duplicate receipts (documented as idempotent in §2.1). Receipt payloads reflect
+  frozen-at-termination balances, NOT post-auto-return state — payers should
+  cross-reference against their own transaction history.
 
 ```typescript
 // Conceptual implementation
@@ -2495,6 +2527,8 @@ On CommunicationsModule 'message:dm' (subscribed during load()):
 
 **Implementation note:** The DM subscription is set up in `load()` and torn down in `destroy()`. The subscription uses the same lifecycle pattern as PaymentsModule event subscriptions. If `CommunicationsModule` is not in dependencies, receipt detection is simply not available — no error is thrown.
 
+**CommunicationsModule event contract assumption:** This section assumes `CommunicationsModule` emits a `'message:dm'` event (or equivalent `onDirectMessage()` callback) with a payload containing at minimum: `{ id: string, content: string, senderPubkey: string, senderNametag?: string, timestamp?: number }`. If the actual event signature differs, adapt the subscription accordingly.
+
 **No separate receipt storage.** Receipt DMs are stored by `CommunicationsModule` as regular DMs. The `invoice:receipt_received` event allows UI layers to detect and render receipts with structured formatting. The AccountingModule does not persist receipt state separately.
 
 ---
@@ -2530,7 +2564,7 @@ updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` a
 | 'invoice:auto_return_failed'
 | 'invoice:return_received'
 | 'invoice:over_refund_warning'
-| 'invoice:receipts_sent'
+| 'invoice:receipt_sent'
 | 'invoice:receipt_received'
 
 // New SphereEventMap entries:
@@ -2626,7 +2660,7 @@ updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` a
   contactAddresses?: string[];            // if present, all contact addresses from the sender (for manual follow-up)
 };
 
-'invoice:receipts_sent': {
+'invoice:receipt_sent': {
   invoiceId: string;
   sent: number;                           // number of receipt DMs successfully sent
   failed: number;                         // number of receipt DMs that failed
@@ -2778,7 +2812,7 @@ On createInvoice() or importInvoice():
 
 On sendInvoiceReceipts():
   1. After all receipt DMs are sent (or failed):
-     -> fire 'invoice:receipts_sent' { invoiceId, sent: <count>, failed: <count> }
+     -> fire 'invoice:receipt_sent' { invoiceId, sent: <count>, failed: <count> }
 
 On CommunicationsModule 'message:dm' (payer-side receipt detection):
   1. If content starts with 'invoice_receipt:' AND parses successfully (see §5.11):
@@ -3690,7 +3724,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 'invoice:auto_return_failed' // Auto-return failed
 'invoice:return_received'  // When auto-return tokens are received
 'invoice:over_refund_warning' // Total returned exceeds total forwarded (informational)
-'invoice:receipts_sent'    // Receipt DMs sent after close/cancel
+'invoice:receipt_sent'    // Receipt DMs sent after close/cancel
 'invoice:receipt_received' // Receipt DM received from a target
 ```
 
@@ -3794,7 +3828,7 @@ Creator                    Aggregator              Payer
    | sendInvoiceReceipts(id, { memo })               |
    | --- receipt DM (NIP-17) ----------------------> |
    |                          |                      | invoice:receipt_received
-   | invoice:receipts_sent                           |
+   | invoice:receipt_sent                           |
 ```
 
 ## Appendix C: Exchange/Swap Scenario

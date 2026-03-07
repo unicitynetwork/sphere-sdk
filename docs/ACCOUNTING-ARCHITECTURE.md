@@ -58,7 +58,7 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 |                                 |                | inv_ledger_index|  |
 |                                 |                | token_scan_state|  |
 |                                 +----------------+-----------------+  |
-+----------------------------------------------------------------------+
++-----------------------------------------------------------------+
 ```
 
 ## 3. Invoice Data Model
@@ -695,7 +695,7 @@ Added to `SphereEventType` and `SphereEventMap`:
 | `invoice:auto_return_failed` | `{ invoiceId, transferId, reason, refundAddress?, contactAddresses? }` | Auto-return failed — `reason`: `'sender_unresolvable'` \| `'send_failed'` \| `'max_retries_exceeded'` |
 | `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Received auto-return — `returnReason`: `'closed'` (from `:RC`) \| `'cancelled'` (from `:RX`). May trigger sender-side implicit termination |
 | `invoice:over_refund_warning` | `{ invoiceId, senderAddress, coinId, forwardedAmount, returnedAmount }` | Total returned to sender exceeds total forwarded — informational warning, transfer not blocked |
-| `invoice:receipts_sent` | `{ invoiceId, sent, failed }` | Receipt DMs sent after `sendInvoiceReceipts()` completes |
+| `invoice:receipt_sent` | `{ invoiceId, sent, failed }` | Receipt DMs sent after `sendInvoiceReceipts()` completes |
 | `invoice:receipt_received` | `{ invoiceId, receipt: IncomingInvoiceReceipt }` | Receipt DM received from a target (payer-side, detected via `invoice_receipt:` prefix) |
 
 **Event ordering guarantee:** `invoice:closed` fires BEFORE any `invoice:auto_returned` events, for both explicit close (via `closeInvoice()`) and implicit close (all targets covered + all confirmed). This ensures listeners can react to the close before seeing the auto-return consequences.
@@ -872,7 +872,7 @@ Recipient (alice) sends receipts after closing:
      - Resolve DM recipient: contacts[0].address ?? senderAddress ?? skip
      - Build InvoiceReceiptPayload with per-asset breakdown
      - Send via CommunicationsModule.sendDM() (NIP-17 encrypted)
-  -> Fires invoice:receipts_sent { invoiceId: 'abc', sent: 2, failed: 0 }
+  -> Fires invoice:receipt_sent { invoiceId: 'abc', sent: 2, failed: 0 }
 
 Sender receives the receipt DM:
   -> CommunicationsModule delivers DM with 'invoice_receipt:' prefix
