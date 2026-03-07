@@ -163,6 +163,7 @@ The accounting module must handle this:
 1. **Single transfer, multiple asset updates.** When a transfer carries a token with `coinData = [["UCT", "500"], ["USDU", "1000"]]` and memo `INV:abc:F`, both the UCT and USDU balances for the matching target are updated.
 2. **Per-asset accounting.** Each coin entry in the token's `coinData` is matched independently against the invoice target's requested assets. One coin may match (relevant) while another may not (irrelevant for that target).
 3. **InvoiceTransferRef per coin.** A single transfer involving a multi-asset token produces one `InvoiceTransferRef` per coin entry in the token, each with its own `coinId` and `amount`.
+4. **Per-sender balances apply per coin.** Per-sender balances are maintained independently for each coin entry. A multi-asset token from sender S1 with `coinData = [["UCT", "500"], ["USDU", "1000"]]` contributes 500 to S1's UCT balance and 1000 to S1's USDU balance at the target address.
 
 ### 3.6 Balance Computation Model
 
@@ -184,13 +185,26 @@ Key rules:
 
 3. **Self-payments are excluded.** A forward payment where the sender address matches the target address (sender pays themselves) is **not counted** toward `coveredAmount`. Self-directed forward transfers with invoice memos are classified as `invoice:irrelevant` with reason `'self_payment'`. This prevents a target from fabricating coverage without receiving actual external payments.
 
-4. **Return payments decrease balance.** A return payment (`INV:<id>:B`) decreases the net covered amount for the matching target:asset. This handles overpayments, refunds, and corrections. Auto-return payments (`INV:<id>:RC` or `INV:<id>:RX`) also decrease the balance, just like manual `:B` returns. Note: return payments are matched by **sender** address (returns flow FROM target TO payer), unlike forward payments which are matched by destination address.
+4. **Return payments decrease balance.** A return payment (`INV:<id>:B`) decreases the net covered amount for the matching target:asset. This handles overpayments, refunds, and corrections. Auto-return payments (`INV:<id>:RC` or `INV:<id>:RX`) also decrease the balance, just like manual `:B` returns. Note: return payments are matched by **sender** address (returns flow FROM target TO payer), unlike forward payments which are matched by destination address. Each return is matched to a specific sender — the return amount cannot exceed what that sender has forwarded to the target for that coinId.
 
 5. **Only target parties may send return payments.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`). This is enforced by `returnInvoicePayment()` and the auto-return system.
 
-6. **Net covered amount is floored at zero.** `netCoveredAmount = max(0, coveredAmount - returnedAmount)`. The net balance can never go negative. `returnInvoicePayment()` validates that the return amount does not exceed the current `netCoveredAmount` for the specified target:asset.
+6. **Net covered amount is floored at zero.** `netCoveredAmount = max(0, coveredAmount - returnedAmount)`. The net balance can never go negative. `returnInvoicePayment()` validates that the return amount does not exceed the per-sender net balance for the specified (target, sender, coinId) tuple. A target cannot return to sender S more than S has sent.
 
 7. **Frozen at terminal states.** Once an invoice reaches CLOSED or CANCELLED, its balances are frozen and persisted. Dynamic recomputation no longer occurs. The frozen snapshot is returned for all subsequent queries.
+
+**Per-sender balance tracking (return cap and auto-return distribution):**
+
+For each target address, the module maintains a per-sender breakdown of forward balances. This enables:
+1. **Return cap enforcement:** `returnInvoicePayment()` to sender S is capped at what S has sent to the target (net of previous returns to S).
+2. **Auto-return distribution:** On close/cancel, auto-return iterates each sender individually, returning to each at most what they sent.
+
+For a given (target, sender, coinId) tuple:
+```
+senderNetBalance = max(0, sum(sender's forwards to target for coinId) - sum(returns to sender for coinId))
+```
+
+The **aggregate** `netCoveredAmount` (across all senders) is still used for coverage determination (`isCovered`). The **per-sender** `senderNetBalance` is used for return validation and auto-return distribution.
 
 ### 3.7 On-Chain Invoice References & Persistent Index
 
@@ -329,8 +343,8 @@ Auto-return is a mechanism where the accounting module automatically returns tok
 - **Precedence rule:** Per-invoice settings take priority over global. Effective auto-return for an invoice is `perInvoice[id] ?? global`. Setting `setAutoReturn(invoiceId, false)` disables auto-return for that specific invoice even when global is enabled.
 
 **Immediate trigger on enable:** When auto-return is enabled for an already-terminated invoice, the auto-return operation is triggered **immediately** for that invoice (not just for future incoming payments):
-- **CLOSED invoice:** Auto-return the **surplus only** — the amount exceeding the requested amount for each target:asset. If there is no surplus, nothing is returned.
-- **CANCELLED invoice:** Auto-return **everything** — all forward payments received for this invoice are returned.
+- **CLOSED invoice:** Auto-return the **surplus only**, distributed per-sender. For each target:coinId with surplus, iterate senders in FIFO order (earliest forward first). Return to each sender `min(senderNetBalance, remaining_surplus)` until the surplus is exhausted. If there is no surplus, nothing is returned.
+- **CANCELLED invoice:** Auto-return **each sender's full net balance**. For each target:coinId, iterate all senders and return `senderNetBalance` to each.
 
 Similarly, when enabling auto-return globally (`'*'`), the operation is triggered immediately for all currently terminated invoices.
 
@@ -338,9 +352,9 @@ Similarly, when enabling auto-return globally (`'*'`), the operation is triggere
 1. An incoming forward payment with memo `INV:<id>:F` arrives for a terminated invoice.
 2. If auto-return is enabled for this invoice (or globally), and the local wallet is an invoice target:
    - The incoming transfer is processed normally (recorded in history).
-   - The module invokes `PaymentsModule.send()` to return the tokens to the original sender.
-   - **CLOSED invoice:** The entire incoming amount is returned (the invoice is already satisfied — any new payment is surplus by definition).
-   - **CANCELLED invoice:** The entire incoming amount is returned (the deal is abandoned).
+   - The module invokes `PaymentsModule.send()` to return the tokens to **the sender of that specific transfer** (not aggregated across senders).
+   - **CLOSED invoice:** The entire incoming amount is returned to that sender (the invoice is already satisfied — any new payment is surplus by definition).
+   - **CANCELLED invoice:** The entire incoming amount is returned to that sender (the deal is abandoned).
    - The return memo uses `INV:<id>:RC` (if invoice is CLOSED) or `INV:<id>:RX` (if CANCELLED).
 3. The auto-return transfer is recorded in history like any other transfer.
 

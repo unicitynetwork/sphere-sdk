@@ -161,6 +161,25 @@ interface CreateInvoiceRequest {
 type InvoiceState = 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'EXPIRED';
 
 /**
+ * Balance breakdown for a single sender contributing to a target:coinId.
+ * Tracks how much this sender has forwarded and how much has been returned to them.
+ */
+interface InvoiceSenderBalance {
+  /** Sender's DIRECT:// address */
+  readonly senderAddress: string;
+  /** Sender's chain pubkey (if known) */
+  readonly senderPubkey?: string;
+  /** Sender's nametag (if known) */
+  readonly senderNametag?: string;
+  /** Total forwarded by this sender for this target:coinId */
+  readonly forwardedAmount: string;
+  /** Total returned to this sender for this target:coinId (includes :B, :RC, :RX) */
+  readonly returnedAmount: string;
+  /** Net balance: max(0, forwardedAmount - returnedAmount) — the max returnable to this sender */
+  readonly netBalance: string;
+}
+
+/**
  * Detailed status of a single coin asset within a target.
  *
  * Balance formula:
@@ -189,6 +208,8 @@ interface InvoiceCoinAssetStatus {
   readonly confirmed: boolean;
   /** Individual transfers contributing to this asset */
   readonly transfers: InvoiceTransferRef[];
+  /** Per-sender balance breakdown for this target:coinId */
+  readonly senderBalances: InvoiceSenderBalance[];
 }
 
 /**
@@ -254,6 +275,8 @@ interface InvoiceTransferRef {
   readonly timestamp: number;
   /** Whether the transfer's tokens are fully confirmed */
   readonly confirmed: boolean;
+  /** Sender's DIRECT:// address (derived from senderPubkey) */
+  readonly senderAddress: string;
   /** Sender chain pubkey */
   readonly senderPubkey?: string;
   /** Sender nametag */
@@ -611,10 +634,18 @@ class AccountingModule {
    * payments — they can only make forward payments. Throws INVOICE_NOT_TARGET
    * if the wallet is not an invoice target.
    *
+   * RETURN CAP: The return amount is capped at the per-sender net balance for
+   * the (target=caller's address, sender=params.recipient, coinId=params.coinId)
+   * tuple. This is the total amount params.recipient has forwarded to this
+   * target for this coinId, minus any amounts already returned to them.
+   * A target cannot return more to a sender than that sender originally sent.
+   * Throws INVOICE_RETURN_EXCEEDS_BALANCE if the amount exceeds this cap.
+   *
    * @param invoiceId - The invoice token ID
    * @param params - { recipient, amount, coinId, freeText? }
    * @returns TransferResult from PaymentsModule.send()
    * @throws SphereError with INVOICE_NOT_TARGET if wallet is not an invoice target
+   * @throws SphereError with INVOICE_RETURN_EXCEEDS_BALANCE if amount exceeds per-sender net balance
    */
   async returnInvoicePayment(invoiceId: string, params: ReturnPaymentParams): Promise<TransferResult>;
 
@@ -1253,12 +1284,35 @@ isCovered        = netCoveredAmount >= asset.coin[1] (requested amount)
 surplusAmount    = max(0, netCoveredAmount - asset.coin[1])
 ```
 
+**Per-sender balance (for return cap enforcement and auto-return distribution):**
+
+The aggregate formula above is used for coverage computation (`isCovered`, `surplusAmount`). In addition, balances are tracked per `(target, sender, coinId)` tuple for return cap enforcement and auto-return distribution:
+
+```
+senderForwarded = SUM(amount) for all InvoiceTransferRef entries WHERE:
+                  - ref.paymentDirection == 'forward'
+                  - ref.destinationAddress == target.address
+                  - ref.senderAddress == sender
+                  - ref.coinId == coinId
+
+senderReturned  = SUM(amount) for all InvoiceTransferRef entries WHERE:
+                  - ref.paymentDirection in ('back', 'return_closed', 'return_cancelled')
+                  - ref.senderAddress == target.address   (return flows FROM target)
+                  - ref.destinationAddress == sender       (return goes TO original sender)
+                  - ref.coinId == coinId
+
+senderNetBalance = max(0, senderForwarded - senderReturned)
+```
+
+**Return cap rule:** `returnInvoicePayment(invoiceId, { recipient: S, amount, coinId })` MUST validate that `amount <= senderNetBalance` for the `(target=caller's address, sender=S, coinId)` tuple. This replaces the old aggregate `netCoveredAmount` cap.
+
 **Key semantics:**
 
 - **Only memo-referenced transfers count.** A token received without an `INV:` memo does not affect any invoice balance, even if sent to a target address with a matching coin.
 - **Spending tokens is independent.** If Alice receives 500 UCT with memo `INV:abc:F`, then spends that 500 UCT on something else (no `INV:abc` memo), the invoice `abc` still shows 500 UCT covered. The spent token's outbound transfer has no invoice memo, so it doesn't affect the invoice.
 - **Self-payments are excluded.** If a target address owner sends tokens to themselves with memo `INV:abc:F` (sender address == destination address == target address), the forward payment is NOT counted toward `coveredAmount`. It is classified as `invoice:irrelevant` with reason `'self_payment'`. This prevents a target from fabricating coverage without external payments. **Limitation:** Self-payment detection compares addresses per-transfer — it does not detect cross-HD-address self-payments within the same wallet (e.g., address 0 paying address 1 where both belong to the same mnemonic). Each HD address is treated as an independent party, consistent with the SDK's address-level isolation model.
 - **Only target parties may return.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`).
+- **Per-sender return cap.** Returns to a specific sender are capped at what that sender has forwarded (net of previous returns to them). A target cannot return more to sender S than S has sent. This applies to both manual `returnInvoicePayment()` and auto-return.
 - **Terminal state freeze.** Once CLOSED or CANCELLED, balances are frozen and persisted. `getInvoiceStatus()` returns the persisted snapshot. No recomputation occurs. New transfers referencing the invoice are still visible via `getRelatedTransfers()`.
 - **Multi-asset tokens.** A single token may carry multiple coin entries (e.g., `coinData = [["UCT", "500"], ["USDU", "1000"]]`). When such a token is transferred with an invoice memo, each coin entry is matched independently against the invoice targets. One transfer of a multi-asset token may cover multiple requested assets for the same target simultaneously.
 
@@ -1324,8 +1378,17 @@ private tokenInvoiceMap: Map<string, Set<string>>; // tokenId → Set<invoiceId>
 **Balance cache (not persisted, computed lazily):**
 
 ```typescript
-// Per-invoice, per-coinId balance summary — invalidated on index mutation.
-private balanceCache: Map<string, Map<string, { covered: bigint; returned: bigint }>>;
+// Per-invoice balance cache — invalidated on index mutation.
+// Outer key: invoiceId
+// Inner structure: per-target, per-coinId, per-sender balance breakdown
+private balanceCache: Map<string, InvoiceBalanceSnapshot>;
+
+interface InvoiceBalanceSnapshot {
+  // Aggregate per (target, coinId) — for coverage computation
+  aggregate: Map<string, { covered: bigint; returned: bigint }>;  // key = `${targetAddress}::${coinId}`
+  // Per-sender per (target, sender, coinId) — for return cap and auto-return
+  perSender: Map<string, { forwarded: bigint; returned: bigint }>; // key = `${targetAddress}::${senderAddress}::${coinId}`
+}
 ```
 
 #### 5.4.3 Token Transaction Processing: `processTokenTransactions()`
@@ -1767,8 +1830,9 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
            - check dedup ledger for (invoiceId, transferId) — skip if status='completed' or 'failed'
              ('failed' entries are terminal until explicitly re-enabled via setAutoReturn())
            - write dedup ledger entry with status='pending' (intent log)
-           - invoke auto-return: send entire incoming amount back
-             (any new forward payment to a terminated invoice is surplus by definition)
+           - invoke auto-return: send the entire incoming amount back to the SENDER
+             of this specific transfer (any new forward payment to a terminated
+             invoice is surplus by definition; return is always to the specific sender)
            - use :RC for CLOSED, :RX for CANCELLED
            - update dedup ledger entry to status='completed'
            - fire 'invoice:auto_returned'
@@ -2066,10 +2130,13 @@ closeInvoice():
   3. Add invoiceId to CLOSED_INVOICES set in storage
   4. If options.autoReturn:
      -> enable auto-return for this invoice
-     -> immediately return SURPLUS ONLY: decompose into individual returns,
-        one per target:coinId pair with non-zero surplusAmount.
+     -> immediately return SURPLUS ONLY: decompose into individual returns
+        per sender. For each target:coinId with non-zero surplusAmount,
+        iterate senders in FIFO order (earliest forward payment first).
+        For each sender with senderNetBalance > 0, return
+        min(senderNetBalance, remaining_surplus) to that sender.
         Each individual return uses a synthetic dedup key:
-        `(invoiceId, "CLOSE_IMMEDIATE:<targetAddress>:<coinId>")`
+        `(invoiceId, "CLOSE_IMMEDIATE:<targetAddress>:<senderAddress>:<coinId>")`
         and follows the same intent-log pattern as ongoing auto-return (§7.5).
      -> use :RC memo direction
      -> Partial failure semantics: same as cancelInvoice() — completed returns
@@ -2085,10 +2152,11 @@ cancelInvoice():
   4. Add invoiceId to CANCELLED_INVOICES set in storage
   5. If options.autoReturn:
      -> enable auto-return for this invoice
-     -> immediately return EVERYTHING: decompose into individual returns,
-        one per target:coinId pair with non-zero netCoveredAmount.
+     -> immediately return EVERYTHING: decompose into individual returns
+        per sender. For each target:coinId, iterate all senders with
+        senderNetBalance > 0 and return each sender's full senderNetBalance.
         Each individual return uses a synthetic dedup key:
-        `(invoiceId, "CANCEL_IMMEDIATE:<targetAddress>:<coinId>")`
+        `(invoiceId, "CANCEL_IMMEDIATE:<targetAddress>:<senderAddress>:<coinId>")`
         and follows the same intent-log pattern as ongoing auto-return (§7.5).
      -> use :RX memo direction
      -> **Partial failure semantics:** If some returns succeed and others fail
@@ -2215,7 +2283,8 @@ private tokenScanState: Map<string, number>;
 private tokenInvoiceMap: Map<string, Set<string>>;
 
 // Computed balance cache (invalidated on mutation, not persisted)
-private balanceCache: Map<string, Map<string, { covered: bigint; returned: bigint }>>;
+// See InvoiceBalanceSnapshot: aggregate per (target, coinId) + perSender per (target, sender, coinId)
+private balanceCache: Map<string, InvoiceBalanceSnapshot>;
 ```
 
 **Key properties:**
@@ -2323,7 +2392,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
 | Caller's wallet address must match one of the invoice targets | `INVOICE_NOT_TARGET` |
-| Return amount must not exceed the effective returnable amount for the specified target:coinId. For non-terminal invoices: computed from current history (`netCoveredAmount`). For terminal invoices: `frozenNetCoveredAmount - sum(all post-freeze return transfers for this target:coinId)`, where post-freeze returns are discovered via `getRelatedTransfers()` filtered to `:B`/`:RC`/`:RX` transfers with local arrival timestamp > `frozenAt` (use the transfer's indexing time, not the sender-controlled timestamp, to prevent backdating attacks). This accounts for auto-returns and manual returns that occurred after the balance was frozen. **Note:** This balance check executes inside the per-invoice gate (§5.9), ensuring the in-memory index read by `getRelatedTransfers()` is consistent — no concurrent return can modify the index between this check and the subsequent `send()`. | `INVOICE_RETURN_EXCEEDS_BALANCE` |
+| Return amount must not exceed the per-sender net balance for the `(target=caller's address, sender=params.recipient, coinId=params.coinId)` tuple. For non-terminal invoices: `senderNetBalance` from the live balance index. For terminal invoices: frozen `senderNetBalance` minus any post-freeze returns to that specific sender (discovered via `getRelatedTransfers()` filtered to `:B`/`:RC`/`:RX` transfers from the caller's target address to `params.recipient`, with local arrival timestamp > `frozenAt`; use the transfer's indexing time, not the sender-controlled timestamp, to prevent backdating attacks). This accounts for auto-returns and manual returns to that sender that occurred after the balance was frozen. **Note:** This balance check executes inside the per-invoice gate (§5.9), ensuring the in-memory index is consistent — no concurrent return can modify it between this check and the subsequent `send()`. | `INVOICE_RETURN_EXCEEDS_BALANCE` |
 
 ### 8.7 setAutoReturn Validation
 
