@@ -395,7 +395,7 @@ On crash recovery (during `load()`), scan the ledger for `pending` entries. For 
 - When a sender receives an auto-return transfer with `:RC`, their accounting module MAY auto-close the invoice locally — even if the invoice was not fully covered from the sender's perspective (the target decided to close).
 - When a sender receives an auto-return transfer with `:RX`, their accounting module MAY auto-cancel the invoice locally.
 - This is **opt-in** — controlled by `autoTerminateOnReturn` config (default: `false`). It provides implicit cross-party termination signaling without requiring an explicit broadcast mechanism.
-- **Implementation note:** Auto-termination uses an internal `_terminateInvoice()` method that performs the freeze-and-persist directly, bypassing the public `closeInvoice()`/`cancelInvoice()` gate acquisition. This prevents deadlock when the event handler is already inside the per-invoice gate. **PREREQUISITE:** `_terminateInvoice()` MUST only be called from code paths that already hold the per-invoice gate. The §6.2 step 3 event handler acquires the gate at entry before any processing, satisfying this requirement. See SPEC §6.2 step 3.
+- **Implementation note:** Auto-termination uses an internal `_terminateInvoice()` method that performs the freeze-and-persist directly, bypassing the public `closeInvoice()`/`cancelInvoice()` gate acquisition. This prevents deadlock when the event handler is already inside the per-invoice gate. **PREREQUISITE:** `_terminateInvoice()` MUST only be called from code paths that already hold the per-invoice gate. The §6.2 step 3 event handler acquires the gate after indexing (processTokenTransactions) but before `_terminateInvoice()` invocation, satisfying this requirement. See SPEC §6.2 step 3.
 - **Over-refund warning:** If the total amount returned to a sender exceeds the total amount that sender has forwarded (for a given coinId), the module fires `invoice:over_refund_warning`. This can happen if a target manually returns more than the sender paid. The warning is informational — the transfer is not blocked.
 - **Trust note:** A target can send `:RC`/`:RX` even if the invoice is not actually terminated on their side. The payer's `autoTerminateOnReturn` trusts the direction code at face value. This is acceptable because the target already holds the tokens and could simply not return them — spoofing a direction code gains nothing.
 
@@ -561,7 +561,7 @@ INV:a1b2c3...ef00 Coffee beans (implied forward)
 
 The AccountingModule registers a memo parser that extracts:
 - `invoiceId` — the referenced invoice
-- `direction` — `'forward'` (F or default), `'back'` (B), `'return_closed'` (RC), or `'return_cancelled'` (RX)
+- `paymentDirection` — `'forward'` (F or default), `'back'` (B), `'return_closed'` (RC), or `'return_cancelled'` (RX)
 - `freeText` — remaining memo content
 
 No changes to `TransferRequest` or the transport layer are needed. However, `PaymentsModule.send()` **must be modified** to encode `TransferRequest.memo` into the on-chain `TransferTransactionData.message` field (see SPEC §4.7).

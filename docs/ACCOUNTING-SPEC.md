@@ -891,7 +891,7 @@ const INVOICE_TOKEN_TYPE_HEX =
 
 ### 3.4 Canonical Serialization
 
-**Security note on `creator` field:** The `creator` field in InvoiceTerms is **self-asserted** — the minter can set it to any pubkey. The aggregator does not verify that the `creator` matches the minting key. This means a malicious party could mint an invoice claiming to be someone else. Import validation (§8.2) does NOT verify creator identity against the minting key because the minting key is not exposed in the token's genesis data. Applications requiring verified creator identity should use out-of-band verification (e.g., the invoice token is received directly from the claimed creator via authenticated transport). The `creator` field is **informational only** — it identifies the invoice creator but does not gate any authorization. All explicit close/cancel authorization is target-based (see §4.4 `closeInvoice()` and `cancelInvoice()`).
+**Security note on `creator` field:** The `creator` field in InvoiceTerms is **self-asserted** — the minter can set it to any pubkey. The aggregator does not verify that the `creator` matches the minting key. This means a malicious party could mint an invoice claiming to be someone else. Import validation (§8.2) does NOT verify creator identity against the minting key because the minting key is not exposed in the token's genesis data. Applications requiring verified creator identity should use out-of-band verification (e.g., the invoice token is received directly from the claimed creator via authenticated transport). The `creator` field is **informational only** — it identifies the invoice creator but does not gate any authorization. All explicit close/cancel authorization is target-based (see §2.1 `closeInvoice()` and `cancelInvoice()`).
 
 InvoiceTerms must be serialized deterministically (same input -> same bytes) for consistent token ID derivation:
 
@@ -1508,7 +1508,8 @@ interface InvoiceBalanceSnapshot {
 This is the core function called by both cold-start and incremental updates. It scans a token's transaction history for invoice references in the on-chain `TransferTransactionData.message` field.
 
 ```
-processTokenTransactions(token: Token, startIndex: number):
+processTokenTransactions(token: Token, startIndex: number): InvoiceTransferRef[]
+  const newEntries: InvoiceTransferRef[] = []
   txf = JSON.parse(token.sdkData) as TxfToken
   coinData = txf.genesis.data.coinData   // multi-asset: [string, string][]
   // NOTE: coinData is read from GENESIS and is IMMUTABLE across the token's
@@ -1699,15 +1700,21 @@ processTokenTransactions(token: Token, startIndex: number):
           - confirmed: tx.inclusionProof !== null
           NOTE: If senderAddress is null (masked predicate), the entry is
           still indexed. Self-payment detection (§5.2) skips entries with
-          null senderAddress. Return matching uses senderAddress — returns
-          for transfers with null senderAddress cannot be matched to a
-          specific sender and are classified as irrelevant.
+          null senderAddress. For return transfers (:B/:RC/:RX) with null
+          senderAddress, the entry is indexed here with its declared
+          paymentDirection, but the §6.2 step 3a post-validation reclassifies
+          it as 'forward' (preventing returnedAmount inflation) and marks it
+          as 'unauthorized_return'. This two-phase approach ensures the
+          index always contains the entry (for getRelatedTransfers) while
+          preventing unverifiable senders from manipulating balance computation.
        f. invoiceMap.set(entryKey, entry)
-       g. Update tokenInvoiceMap(tokenId → invoiceId)
-       h. Invalidate balanceCache for ref.invoiceId
-       i. Mark invoice as dirty (needs storage flush)
+       g. newEntries.push(entry)
+       h. Update tokenInvoiceMap(tokenId → invoiceId)
+       i. Invalidate balanceCache for ref.invoiceId
+       j. Mark invoice as dirty (needs storage flush)
 
   Update tokenScanState: tokenScanState.set(tokenId, txf.transactions.length)
+  return newEntries
 ```
 
 **Idempotency guarantee:** The composite key `${transferId}::${coinId}` ensures that reprocessing the same transaction is a no-op. The `tokenScanState` watermark provides a fast-path skip: if `tokenScanState.get(tokenId) >= txf.transactions.length`, the token is fully processed.
@@ -2103,10 +2110,19 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
      -> **acquire per-invoice gate** (serializes all return processing for
         this invoice; released at end of step 3 or on early return)
      a. **Validate sender:** check that the transfer's sender address matches
-        one of the invoice's target addresses. If the sender is NOT an invoice
-        target, treat the transfer as `invoice:irrelevant` with reason
-        `'unauthorized_return'` and return (releasing gate). This prevents
-        spoofed :RC/:RX transfers from non-target parties triggering
+        one of the invoice's target addresses. If senderAddress is null (masked
+        predicate) OR the sender is NOT an invoice target:
+        - Remove the InvoiceTransferRef entries created by the pre-gate
+          processTokenTransactions() call from invoiceLedger (using the
+          entryKeys `${transferId}::${coinId}` from the returned entries).
+          Invalidate balanceCache for the invoiceId.
+        - Re-insert the entries with `paymentDirection: 'forward'` so the
+          transfer is still indexed (it carries real tokens) but does not
+          inflate returnedAmount.
+        - Treat the transfer as `invoice:irrelevant` with reason
+          `'unauthorized_return'` and return (releasing gate).
+        This prevents spoofed :RC/:RX transfers from non-target parties or
+        masked-predicate senders from inflating returnedAmount or triggering
         auto-termination.
      b. fire 'invoice:return_received' { invoiceId, transfer, returnReason }
      c. **Over-refund check:** Compare total returned to this sender vs total
@@ -2453,7 +2469,7 @@ interface AutoReturnLedger {
    * whose memo freeText contains the `originalTransferId`. The match tuple is
    * `(invoiceId, originalTransferId)` — derived by parsing the outbound memo
    * and extracting the freeText field which auto-return populates with the
-   * original transfer ID (see §4.5 buildInvoiceMemo). If a match is found,
+   * original transfer ID (see §4.6 buildInvoiceMemo). If a match is found,
    * skip the send and write the ledger entry as `completed` with the existing
    * return transfer ID. This prevents duplicate returns when ledger entries
    * have been pruned (e.g., Nostr re-delivery after 30+ days offline).
@@ -2504,8 +2520,14 @@ closeInvoice():
           inside the per-invoice gate when the close condition was met
           (for implicit close) or the sender of the most recent forward
           transfer for this target:coinId by timestamp, with ties broken by
-          transferId lexicographic order (for explicit close). This tie-breaking
-          is deterministic regardless of Map iteration order or restart state.
+          transferId lexicographic order (for explicit close).
+          NOTE: "timestamp" is the processing-time timestamp set by
+          `processTokenTransactions()` step 6e (`Date.now()` at indexing time),
+          NOT the transfer's creation time on the sender's clock. Out-of-order
+          Nostr delivery means "latest" is "most recently processed by the
+          local node" — this is consistent with implicit close (which uses
+          processing order inside the gate) and is deterministic regardless
+          of Map iteration order or restart state.
           Different target:coinId pairs may have different latest senders.
         - Assign surplusAmount as that sender's frozenSenderBalance.netBalance
         - Store latestSenderAddress in FrozenCoinAssetBalances (for crash recovery)
@@ -2774,6 +2796,8 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | `memo` (if provided) must be max 4096 characters | `INVOICE_MEMO_TOO_LONG` |
 | Serialized InvoiceTerms (`canonicalSerialize(terms)`) must not exceed 64 KB | `INVOICE_TERMS_TOO_LARGE` |
 
+**Note on inbound transfer amounts:** Coin entries with amount `"0"` in incoming token coinData are silently excluded from balance computation by the `processTokenTransactions()` regex validation (`/^[1-9][0-9]*$/` in §5.4.3 step 6a). This is correct — zero-value entries carry no economic value. No error is raised; the entry is simply skipped.
+
 ### 8.2 Import Validation
 
 | Rule | Error |
@@ -2896,9 +2920,14 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 // in-flight operations racing with teardown.
 //
 // LATENCY: When implicit close triggers auto-return for multiple target:coinId
-// pairs, each requires a PaymentsModule.send() network call. The query may block
-// for up to N * 60s (where N = number of surplus pairs, 60s = send timeout).
-// Connect hosts SHOULD set response timeouts accordingly (recommended: 120s).
+// pairs, each requires a PaymentsModule.send() network call. To bound query
+// latency, the implicit close path MUST process at most MAX_SYNC_RETURNS (10)
+// surplus pairs synchronously within the gate. Any remaining surplus pairs are
+// queued for async processing via setTimeout(0) (still serialized through the
+// per-invoice gate). This caps worst-case query latency to ~600s (10 * 60s send
+// timeout). Connect hosts SHOULD set response timeouts accordingly (recommended:
+// 120s — if more than 2 surplus pairs exist, the query returns after processing
+// the first batch and remaining auto-returns complete asynchronously).
 {
   method: 'sphere_getInvoiceStatus',
   params: { invoiceId: 'abc123...' }
