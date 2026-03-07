@@ -276,10 +276,14 @@ interface InvoiceTransferRef {
   readonly timestamp: number;
   /** Whether the transfer's tokens are fully confirmed */
   readonly confirmed: boolean;
-  /** Sender's DIRECT:// address (derived from senderPubkey) */
-  readonly senderAddress: string;
-  /** Sender chain pubkey */
-  readonly senderPubkey?: string;
+  /** Sender's DIRECT:// address (derived from senderPubkey).
+   *  Null if the sender's predicate is masked (owner hidden on-chain).
+   *  Transfers with null senderAddress cannot participate in self-payment
+   *  detection or return matching — they are indexed but treated as
+   *  having an unknown sender for balance purposes. */
+  readonly senderAddress: string | null;
+  /** Sender chain pubkey (null if predicate is masked) */
+  readonly senderPubkey?: string | null;
   /** Sender nametag */
   readonly senderNametag?: string;
   /** Recipient chain pubkey */
@@ -984,7 +988,14 @@ function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessageP
   if (!messageHex || typeof messageHex !== 'string') return null;
   try {
     const bytes = hexToBytes(messageHex);
-    return JSON.parse(new TextDecoder().decode(bytes));
+    const parsed = JSON.parse(new TextDecoder().decode(bytes));
+    // Truncate inbound txt to 1024 code points to bound index cache and
+    // event payload size. Outbound is capped at 256 by buildInvoiceMemo(),
+    // but inbound messages from untrusted senders may be arbitrarily long.
+    if (parsed.txt && typeof parsed.txt === 'string') {
+      parsed.txt = Array.from(parsed.txt).slice(0, 1024).join('');
+    }
+    return parsed;
   } catch {
     return null; // malformed or non-JSON message — treat as no invoice reference
   }
@@ -992,6 +1003,8 @@ function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessageP
 ```
 
 **Validation:** The `inv.id` field MUST be a 64-char lowercase hex string. The `inv.dir` field MUST be one of `'F'`, `'B'`, `'RC'`, `'RX'`. Payloads failing validation are treated as non-invoice transfers (no error thrown, silently ignored).
+
+**On-chain / transport disagreement:** When both the on-chain message and the transport memo contain invoice references, the on-chain reference is authoritative (§4.8). The transport memo is ignored for balance computation. If the two disagree (different invoiceId or direction), no error is raised — the on-chain reference wins silently. This can happen if a sender modifies the transport memo after constructing the on-chain commitment, or if a relay replays a stale transport message.
 
 ### 4.2 Direction Codes
 
@@ -1111,8 +1124,8 @@ const commitment = await TransferCommitment.create(
 const payload = parseInvoiceMemoForOnChain(request.memo);
 // parseInvoiceMemoForOnChain returns:
 //   - TransferMessagePayload JSON bytes if memo is INV: format
-//   - raw UTF-8 bytes of memo string otherwise (for non-invoice transfers)
-//   - null if no memo
+//   - null if no memo or if memo is non-invoice (non-invoice memos stay
+//     transport-only to preserve privacy)
 const messageBytes = payload;
 const commitment = await TransferCommitment.create(
   sdkToken, recipientAddress, salt,
@@ -1137,8 +1150,11 @@ function parseInvoiceMemoForOnChain(memo: string | undefined): Uint8Array | null
     };
     return new TextEncoder().encode(JSON.stringify(payload));
   }
-  // Non-invoice memo: encode as raw UTF-8
-  return new TextEncoder().encode(memo);
+  // Non-invoice memo: DO NOT encode on-chain.
+  // Only invoice-related memos are written to the on-chain message field.
+  // Non-invoice memos remain transport-only (Nostr) to avoid leaking
+  // private user text into the permanent on-chain record.
+  return null;
 }
 ```
 
@@ -1185,7 +1201,7 @@ When resolving invoice references for a transfer, the accounting module uses thi
 - **Invoice ID validation:** Only 64-char lowercase hex strings are accepted. Guaranteed by SHA-256 token ID derivation.
 - **Direction code enforcement:** Only `F`, `B`, `RC`, `RX` are recognized. Unrecognized values cause the reference to be ignored.
 - **Sender validation for returns:** Inbound `B`/`RC`/`RX` transfers are validated against invoice target addresses (see §6.2 step 3).
-- **Self-payment exclusion:** Forward payments where sender == destination == target are excluded (see §5.2).
+- **Self-payment exclusion:** Forward payments where sender == destination == target are excluded (see §5.2). **Limitation (Sybil):** Self-payment detection is per-address only — it does not prevent a target from creating a second wallet (different HD address or different mnemonic) and fabricating forward payments from that wallet. Cross-wallet self-payment detection is impossible in a privacy-preserving system. Applications requiring verified external payments should use out-of-band identity verification or trusted intermediaries.
 - **Untrusted string sanitization:** `txt` field in `TransferMessagePayload`, `InvoiceTerms.memo`, `deliveryMethods` URLs, and `senderNametag`/`recipientNametag` in `InvoiceTransferRef` contain untrusted user input. Applications MUST sanitize before HTML/DOM rendering. React (JSX) provides automatic escaping; other contexts must apply their own.
 - Applications MUST use the SDK's decoding functions — never parse on-chain messages or transport memos manually.
 
@@ -1279,6 +1295,16 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
         -> return CLOSED
         NOTE: the implicit close MUST go through the gate to prevent races
         with concurrent closeInvoice()/cancelInvoice() calls.
+        **Cross-invoice token race:** The per-invoice gate serializes operations
+        within a single invoice. However, two invoices auto-returning simultaneously
+        may compete for the same wallet tokens via `PaymentsModule.send()`. The
+        PaymentsModule handles token selection internally — if insufficient tokens
+        are available for one return, `send()` throws (insufficient balance), and
+        the auto-return is recorded as failed in the dedup ledger. Crash recovery
+        (§7.6 step 5) retries failed entries. There is no global cross-invoice mutex
+        — introducing one would serialize all invoice operations and defeat the
+        per-invoice gate design. Token contention between invoices is expected to be
+        rare and is handled by the existing retry mechanism.
      d. if all targets isCovered -> COVERED
      e. if terms.dueDate && now > terms.dueDate -> EXPIRED
         (reachable from OPEN or PARTIAL — any payment activity + past due)
@@ -1322,10 +1348,11 @@ returnedAmount = SUM(amount) for all InvoiceTransferRef entries WHERE:
                  - coinId matches asset.coin[0]
 
 netCoveredAmount = coveredAmount - returnedAmount
-// INVARIANT: returnedAmount <= coveredAmount is enforced by returnInvoicePayment()
-// validation (throws INVOICE_RETURN_EXCEEDS_BALANCE). The net can never go negative
-// regardless of invoice state. The max(0, ...) defensive floor below is for display
-// safety only — it should never activate if validation is correct.
+// returnedAmount <= coveredAmount is enforced by returnInvoicePayment() and the
+// auto-return system (throws INVOICE_RETURN_EXCEEDS_BALANCE). However, this is a
+// convenience-layer check — direct PaymentsModule.send() with an INV: memo can
+// bypass it. The max(0, ...) defensive floor below is therefore a necessary
+// safeguard, not dead code.
 netCoveredAmount = max(0, netCoveredAmount)
 isCovered        = netCoveredAmount >= asset.coin[1] (requested amount)
 surplusAmount    = max(0, netCoveredAmount - asset.coin[1])
@@ -1357,9 +1384,9 @@ senderNetBalance = max(0, senderForwarded - senderReturned)
 
 - **Only memo-referenced transfers count.** A token received without an `INV:` memo does not affect any invoice balance, even if sent to a target address with a matching coin.
 - **Spending tokens is independent.** If Alice receives 500 UCT with memo `INV:abc:F`, then spends that 500 UCT on something else (no `INV:abc` memo), the invoice `abc` still shows 500 UCT covered. The spent token's outbound transfer has no invoice memo, so it doesn't affect the invoice.
-- **Self-payments are excluded.** If a target address owner sends tokens to themselves with memo `INV:abc:F` (sender address == destination address == target address), the forward payment is NOT counted toward `coveredAmount`. It is classified as `invoice:irrelevant` with reason `'self_payment'`. This prevents a target from fabricating coverage without external payments. **Limitation:** Self-payment detection compares addresses per-transfer — it does not detect cross-HD-address self-payments within the same wallet (e.g., address 0 paying address 1 where both belong to the same mnemonic). Each HD address is treated as an independent party, consistent with the SDK's address-level isolation model.
+- **Self-payments are excluded.** If a target address owner sends tokens to themselves with memo `INV:abc:F` (sender address == destination address == target address), the forward payment is NOT counted toward `coveredAmount`. It is classified as `invoice:irrelevant` with reason `'self_payment'`. This prevents a target from fabricating coverage without external payments. **Address comparison:** All `DIRECT://` address comparisons (self-payment detection, target matching, return sender matching) are **case-sensitive exact string matches**. `DIRECT://` addresses are derived deterministically from public keys and always have consistent casing — no normalization is needed. **Limitation:** Self-payment detection compares addresses per-transfer — it does not detect cross-HD-address self-payments within the same wallet (e.g., address 0 paying address 1 where both belong to the same mnemonic). Each HD address is treated as an independent party, consistent with the SDK's address-level isolation model.
 - **Only target parties may return.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`).
-- **Per-sender return cap (INVARIANT).** Returns to a specific sender are **strictly prevented** from exceeding that sender's effective balance — regardless of invoice state. `returnInvoicePayment()` throws `INVOICE_RETURN_EXCEEDS_BALANCE` before the transfer happens. This guarantees that `returnedAmount` never exceeds `coveredAmount` at the per-sender level — the `max(0, ...)` floor in the formula is a defensive safeguard, not a normal code path. This applies to both manual `returnInvoicePayment()` and auto-return. What differs between terminal and non-terminal invoices is the *baseline*: closure resets per-sender balances to zero and assigns surplus (see CLOSED/CANCELLED rules below), but the cap still applies against the effective post-reset balance.
+- **Per-sender return cap (convenience-layer enforcement).** Returns to a specific sender are prevented from exceeding that sender's effective balance by the `returnInvoicePayment()` API and the auto-return system, which throw `INVOICE_RETURN_EXCEEDS_BALANCE` before the transfer happens. This is a **convenience-layer check**, NOT a protocol-level invariant — a user with direct access to `PaymentsModule.send()` can construct an `INV:<id>:B` memo and bypass the cap entirely. The `max(0, ...)` floor in the formula is therefore a necessary defensive safeguard, not dead code. Applications building on the SDK SHOULD use `returnInvoicePayment()` rather than raw `send()` for all return payments to benefit from cap enforcement. What differs between terminal and non-terminal invoices is the *baseline*: closure resets per-sender balances to zero and assigns surplus (see CLOSED/CANCELLED rules below), but the cap still applies against the effective post-reset balance.
 - **Terminal state freeze.** Once CLOSED or CANCELLED, balances are frozen and persisted. Post-termination transfers continue to be tracked per-sender on top of the frozen baseline.
 - **CLOSED resets per-sender balances (payments accepted).** Closing means the target party accepts the payments as final. At freeze time, all pre-closure per-sender balances are reset to zero — **pre-closure payments are non-returnable.** The surplus (if any) is assigned **per (target, coinId)** to the **latest sender** for that tuple (by processing order — the sender whose forward payment for that specific target:coinId was being processed inside the per-invoice serialization gate when the close condition was met). In multi-target invoices, different targets may have different latest senders. Post-closure per-sender tracking starts from: surplus for the latest sender of each target:coinId, zero for all others. New forward payments after closure are tracked per-sender normally and are fully returnable.
   **Race condition awareness:** A payment from another sender may arrive while the triggering payment's close sequence is executing inside the gate. That concurrent payment queues behind the gate and is processed as a *post-closure* payment — its per-sender balance must NOT be reset to zero and must NOT receive surplus. The per-invoice gate serialization ensures exactly one payment is "inside" at the close moment.
@@ -1478,12 +1505,24 @@ processTokenTransactions(token: Token, startIndex: number):
        // Reconstruct the TransferTransactionData object from tx.data, then call
        // calculateHash() which computes SHA256(TransferTransactionData.toCBOR()).
        //
-       // This hash is STABLE: it is computed from the transaction data itself
-       // (sourceState, recipient, salt, message, nametags), which is immutable
-       // once the transaction is created. It does NOT depend on the inclusion
-       // proof — the same hash is produced whether the transaction is confirmed
-       // or unconfirmed. It is the same value that appears in
-       // inclusionProof.transactionHash after confirmation.
+       // This hash is STABLE for a given SDK version: it is computed from the
+       // transaction data itself (sourceState, recipient, salt, message,
+       // nametags), which is immutable once the transaction is created. It does
+       // NOT depend on the inclusion proof — the same hash is produced whether
+       // the transaction is confirmed or unconfirmed. It is the same value
+       // that appears in inclusionProof.transactionHash after confirmation.
+       //
+       // CBOR STABILITY WARNING: calculateHash() computes SHA256(toCBOR()).
+       // If the SDK's CBOR encoder changes field ordering across versions,
+       // the hash changes for the same logical data. This is acceptable because:
+       // (1) the dedup key `${transferId}::${coinId}` is compared only within
+       //     a single wallet's persisted index — no cross-wallet hash comparison;
+       // (2) the index is rebuilt from token transaction data on cold start —
+       //     a new SDK version will produce consistent hashes for all entries;
+       // (3) the tokenScanState watermark prevents reprocessing unless the index
+       //     is reset, so stale hashes and new hashes never coexist.
+       // If a future SDK version changes CBOR encoding, a one-time index rebuild
+       // (reset tokenScanState) is sufficient to re-derive all transferIds.
        //
        // Reconstruction from tx.data:
        //   const txData = TransferTransactionData.fromJSON(tx.data);
@@ -1511,11 +1550,23 @@ processTokenTransactions(token: Token, startIndex: number):
        //
        // Extract the public key from the predicate, then derive the
        // DIRECT:// address from it.
+       // IMPORTANT: Predicate may be MASKED (owner hidden) or UNMASKED.
+       // UnmaskedPredicate.fromCBOR() will throw on a masked predicate.
+       // If the predicate is masked, the sender address is unresolvable —
+       // set senderAddress to null and classify the transfer as irrelevant
+       // (reason: 'sender_unresolvable') downstream if sender is required
+       // (e.g., for return matching or self-payment detection).
        senderAddress = (i === 0)
          ? txf.genesis.data.recipient
-         : deriveDIRECTAddress(UnmaskedPredicate.fromCBOR(
-             hexToBytes(txf.transactions[startIndex + i - 1].predicate)
-           ).publicKey)
+         : (() => {
+             try {
+               return deriveDIRECTAddress(UnmaskedPredicate.fromCBOR(
+                 hexToBytes(txf.transactions[startIndex + i - 1].predicate)
+               ).publicKey);
+             } catch {
+               return null;  // masked predicate — sender unknown
+             }
+           })()
 
     6. For each [coinId, amount] in coinData:
        a. Skip if amount === "0"
@@ -1526,9 +1577,15 @@ processTokenTransactions(token: Token, startIndex: number):
           - transferId, tokenId: txf.genesis.data.tokenId
           - direction: ref.direction
           - coinId, amount
-          - senderAddress, recipientAddress
+          - senderAddress (may be null if predicate was masked),
+            recipientAddress
           - timestamp: tx.inclusionProof?.authenticator timestamp or Date.now()
           - confirmed: tx.inclusionProof !== null
+          NOTE: If senderAddress is null (masked predicate), the entry is
+          still indexed. Self-payment detection (§5.2) skips entries with
+          null senderAddress. Return matching uses senderAddress — returns
+          for transfers with null senderAddress cannot be matched to a
+          specific sender and are classified as irrelevant.
        f. invoiceMap.set(entryKey, entry)
        g. Update tokenInvoiceMap(tokenId → invoiceId)
        h. Invalidate balanceCache for ref.invoiceId
@@ -1732,6 +1789,14 @@ All state-mutating operations on a given invoice are serialized through a **per-
   auto-return is enabled, the next inbound event or `setAutoReturn()` call will
   return the surplus. Applications concerned about this race SHOULD enable
   auto-return on close to ensure post-freeze payments are automatically handled.
+  **Rapid-call drain risk:** Because `payInvoice()` releases the gate before
+  `send()`, rapid successive calls can each pass the terminal-state check and
+  queue multiple sends before any completes. This is by design (non-blocking),
+  but callers SHOULD serialize their own `payInvoice()` calls (await each before
+  calling the next) to avoid unintended overpayment. Connect hosts enforce this
+  via intent confirmation modals (one at a time). SDK consumers calling
+  `payInvoice()` programmatically MUST implement their own call serialization
+  or accept that concurrent calls may overpay.
 - `parseInvoiceMemo()`
 
 ```typescript
@@ -1941,7 +2006,11 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
         simply not return them; (3) spoofing a direction code gains the
         target nothing — the tokens are being returned regardless.
      -> return
-  4. If invoice is in terminal state (CLOSED or CANCELLED):
+  4. Process transfer into index via processTokenTransactions() (§5.4.3)
+     This builds InvoiceTransferRef entries and updates invoiceLedger.
+     NOTE: This step runs for ALL invoices (terminal and non-terminal) so that
+     post-termination transfers are captured in the index for getRelatedTransfers().
+  5. If invoice is in terminal state (CLOSED or CANCELLED):
      -> fire 'invoice:payment' (transfer is still recorded)
      -> if direction is 'forward' AND auto-return enabled (perInvoice[id] ?? global)
         AND wallet is a target:
@@ -1958,14 +2027,12 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
            - fire 'invoice:auto_returned'
      -> do not fire balance-related events (frozen)
      -> return
-  5. Process transfer into index via processTransfer() (§5.4.3)
-     This builds InvoiceTransferRef entries and updates invoiceLedger.
-  6. Match transfer against invoice targets (using index entries):
+  6. (Non-terminal invoices only) Match transfer against invoice targets (using index entries):
      a. If matches target + asset:
         -> fire 'invoice:payment' { invoiceId, transfer, direction, confirmed }
      b. If doesn't match any target/asset:
         -> fire 'invoice:irrelevant' { invoiceId, transfer, reason, confirmed }
-  7. Recompute status:
+  7. (Non-terminal invoices only) Recompute status:
      a. If asset just became covered -> fire 'invoice:asset_covered'
      b. If target just became covered -> fire 'invoice:target_covered'
      c. If all targets covered:
@@ -2280,7 +2347,9 @@ closeInvoice():
           forward payment for this specific target:coinId was being processed
           inside the per-invoice gate when the close condition was met
           (for implicit close) or the sender of the most recent forward
-          transfer for this target:coinId by processing order (for explicit close).
+          transfer for this target:coinId by timestamp, with ties broken by
+          transferId lexicographic order (for explicit close). This tie-breaking
+          is deterministic regardless of Map iteration order or restart state.
           Different target:coinId pairs may have different latest senders.
         - Assign surplusAmount as that sender's frozenSenderBalance.netBalance
         - Store latestSenderAddress in FrozenCoinAssetBalances (for crash recovery)
@@ -2347,7 +2416,14 @@ setAutoReturn():
      - For specific invoiceId: if terminated AND wallet is a target:
        - CLOSED -> return surplus only (per target:asset)
        - CANCELLED -> return everything
-     - For '*': iterate all terminated invoices sequentially, each with its own gate:
+     - For '*': iterate all terminated invoices sequentially, each with its own gate.
+       **Bounded execution:** Process at most 100 invoices per `setAutoReturn('*')`
+       call. If more terminated invoices exist, the remainder are processed on
+       the next call or on future inbound events. This prevents unbounded
+       execution time when thousands of terminated invoices exist. Progress is
+       tracked via the dedup ledger (completed entries are skipped on retry).
+       The caller receives the count of invoices processed and remaining via
+       the returned promise (future: consider returning a progress object).
        - CLOSED -> return surplus only
        - CANCELLED -> return everything
   5. Fire 'invoice:auto_returned' for each return executed
@@ -2430,6 +2506,18 @@ load():
 complete before step 7 (event subscription). This prevents races between recovery
 retries and incoming event processing for the same transfer — both would enter the
 per-invoice gate, but recovery must finish first to populate the dedup ledger.
+
+**Load-subscribe gap:** Tokens may arrive between step 6 (scan) and step 7
+(subscription). After subscribing, perform a **one-time re-scan** of all tokens
+to catch any transfers that arrived during the gap:
+  7b. allTokens = PaymentsModule.getTokens()
+      For each token T:
+        startIndex = tokenScanState.get(T.id) ?? 0
+        If txf.transactions.length > startIndex:
+          → processTokenTransactions(T, startIndex)
+      Flush dirty entries and update tokenScanState.
+This re-scan is idempotent (dedup by transferId::coinId) and closes the window
+between the initial scan and the subscription becoming active.
 ```
 
 #### Invoice-Transfer Index (Primary Data Source)
@@ -2510,6 +2598,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Maximum 100 targets per invoice | `INVOICE_TOO_MANY_TARGETS` |
 | Maximum 50 assets per target | `INVOICE_TOO_MANY_ASSETS` |
 | `memo` (if provided) must be max 4096 characters | `INVOICE_MEMO_TOO_LONG` |
+| Serialized InvoiceTerms (`canonicalSerialize(terms)`) must not exceed 64 KB | `INVOICE_TERMS_TOO_LARGE` |
 
 ### 8.2 Import Validation
 
@@ -2616,10 +2705,16 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 // query blocks until the full close+auto-return sequence finishes. Wallet
 // hosts SHOULD rate-limit sphere_getInvoiceStatus calls from dApps (e.g.,
 // max 1 call/second per invoiceId, AND max 10 calls/second aggregate across
-// all invoiceIds per session) to prevent a malicious dApp from enumerating
-// invoices via sphere_getInvoices and triggering implicit close cascades. Wallet hosts
-// MUST stop accepting new Connect RPC calls before calling
-// accounting.destroy() to avoid in-flight operations racing with teardown.
+// all invoiceIds per session) to prevent a malicious dApp from:
+// (a) triggering implicit close cascades by rapidly querying all invoices,
+// (b) draining wallet funds via auto-return sends triggered by queries.
+// Note: getInvoiceStatus is classified as a QUERY (invoice:read permission),
+// but its implicit close side effect can trigger token sends (auto-return).
+// This is a known design trade-off — alternatives (separate explicit trigger,
+// background timer) add complexity without solving the fundamental issue that
+// close detection must happen somewhere. Wallet hosts MUST stop accepting
+// new Connect RPC calls before calling accounting.destroy() to avoid
+// in-flight operations racing with teardown.
 //
 // LATENCY: When implicit close triggers auto-return for multiple target:coinId
 // pairs, each requires a PaymentsModule.send() network call. The query may block
@@ -2783,12 +2878,12 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_INVALID_ASSET_INDEX` | Invalid asset index | Out-of-bounds assetIndex in payInvoice |
 | `INVOICE_NOT_TARGET` | Only invoice target parties can send return payments | Return from non-target wallet address |
 | `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds the per-sender net balance for (target, sender, coinId). Returns MUST NOT cause returnedAmount to exceed coveredAmount. | Excessive return to a specific sender |
-
 | `INVOICE_INVALID_DELIVERY_METHOD` | Delivery method must use https:// or wss:// scheme, max 2048 chars, max 10 entries | Invalid deliveryMethods entry |
 | `INVOICE_INVALID_ID` | Invoice ID must be a 64-char hex string | Invalid invoiceId passed to buildInvoiceMemo |
 | `INVOICE_TOO_MANY_TARGETS` | Invoice exceeds maximum of 100 targets | Too many targets in CreateInvoiceRequest |
 | `INVOICE_TOO_MANY_ASSETS` | Target exceeds maximum of 50 assets | Too many assets in a single target |
 | `INVOICE_MEMO_TOO_LONG` | Invoice memo exceeds maximum of 4096 characters | InvoiceTerms.memo too long |
+| `INVOICE_TERMS_TOO_LARGE` | Serialized invoice terms exceed 64 KB limit | Aggregate size of all targets, assets, memo, deliveryMethods too large |
 
 Note: `INVOICE_INVALID_ID` and `INVOICE_MINT_FAILED` are thrown from internal utilities (`buildInvoiceMemo` and the minting flow respectively), not from §8 validation tables. They are included here for completeness.
 

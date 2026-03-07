@@ -189,7 +189,7 @@ Key rules:
 
 5. **Only target parties may send return payments.** Back/return payments (`:B`, `:RC`, `:RX`) can only be sent by a party whose wallet address matches one of the invoice targets. Non-target parties can only make forward payments (`:F`). This is enforced by `returnInvoicePayment()` and the auto-return system.
 
-6. **Returns MUST NOT exceed covered amount.** `returnInvoicePayment()` enforces that the return amount does not exceed the per-sender net balance for the specified (target, sender, coinId) tuple — throws `INVOICE_RETURN_EXCEEDS_BALANCE` before the transfer happens. A target cannot return to sender S more than S has effective balance. This invariant applies in all invoice states; what differs between terminal and non-terminal invoices is the *baseline* (closure resets per-sender balances and assigns surplus — see rules 8–9 — but the cap still applies against the effective post-reset balance). The `max(0, ...)` floor in the `netCoveredAmount` formula is a defensive display safeguard only — the validation guarantees `returnedAmount` never actually exceeds `coveredAmount` at the per-sender level.
+6. **Returns SHOULD NOT exceed covered amount.** `returnInvoicePayment()` enforces that the return amount does not exceed the per-sender net balance for the specified (target, sender, coinId) tuple — throws `INVOICE_RETURN_EXCEEDS_BALANCE` before the transfer happens. A target cannot return to sender S more than S has effective balance **via the convenience API**. This is a convenience-layer check, NOT a protocol-level invariant — direct use of `PaymentsModule.send()` with an `INV:<id>:B` memo can bypass it. The `max(0, ...)` floor in the `netCoveredAmount` formula is therefore a **necessary** defensive safeguard, not dead code. This applies in all invoice states; what differs between terminal and non-terminal invoices is the *baseline* (closure resets per-sender balances and assigns surplus — see rules 8–9 below — but the cap still applies against the effective post-reset balance).
 
 7. **Frozen at terminal states.** Once an invoice reaches CLOSED or CANCELLED, its balances are frozen and persisted. The frozen snapshot determines the baseline for subsequent queries. Post-termination transfers (incoming forwards, manual returns, auto-returns) continue to be tracked per-sender on top of the frozen baseline.
 
@@ -223,7 +223,7 @@ The on-chain `message` carries a structured `TransferMessagePayload`:
 { inv: { id: "<64-hex invoiceId>", dir: "F"|"B"|"RC"|"RX" }, txt?: "..." }
 ```
 
-**PaymentsModule.send() change required:** Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter. This must be changed to encode the memo into the on-chain message field. For invoice-related memos (`INV:` prefix), the on-chain message carries the structured `TransferMessagePayload` JSON (not the raw memo text). For non-invoice memos, the raw memo is encoded as UTF-8 bytes. See ACCOUNTING-SPEC.md §4.7 for the `parseInvoiceMemoForOnChain()` helper. This change affects all transfer paths (direct send, split-and-send, V5 instant split).
+**PaymentsModule.send() change required:** Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter. This must be changed to encode the memo into the on-chain message field **for invoice-related transfers only**. For invoice-related memos (`INV:` prefix), the on-chain message carries the structured `TransferMessagePayload` JSON (not the raw memo text). Non-invoice memos are NOT encoded on-chain — they remain transport-only (Nostr) to avoid permanently recording private user text on-chain. See ACCOUNTING-SPEC.md §4.7 for the `parseInvoiceMemoForOnChain()` helper. This change affects all transfer paths (direct send, split-and-send, V5 instant split).
 
 #### 3.7.2 Persistent Invoice-Transfer Index
 
@@ -438,7 +438,7 @@ The accounting module wraps all its inbound event processing in try/catch guards
 
 **Implementation:** A `Map<string, Promise<void>>` keyed by invoice ID. Each mutating operation chains onto the existing promise (or creates a new one). This is a lightweight cooperative lock — no OS-level primitives needed in single-threaded JavaScript. The gate ensures that if two events arrive in rapid succession for the same invoice, the second waits for the first to complete before executing. **Cleanup:** After each operation completes, if no further operations are queued, the gate entry is deleted from the map to prevent unbounded memory growth over thousands of invoices.
 
-**Global operations** (`setAutoReturn('*', true)`) acquire the gate for each affected invoice sequentially, not all at once. This prevents deadlocks and allows interleaving with per-invoice operations on other invoices.
+**Global operations** (`setAutoReturn('*', true)`) acquire the gate for each affected invoice sequentially, not all at once. This prevents deadlocks and allows interleaving with per-invoice operations on other invoices. To prevent unbounded execution time, at most 100 invoices are processed per call (see SPEC §7.6).
 
 ### 4.8 Status Computation
 
@@ -465,8 +465,10 @@ Each party independently derives invoice status from their own perspective — s
 2.  Build InvoiceTerms (add createdAt, optionally add creator pubkey)
 3.  Serialize InvoiceTerms canonically -> deterministic bytes (invoiceBytes)
 4.  Generate salt: SHA-256(signingKey || invoiceBytes)
-5.  Derive tokenId: SHA-256(invoiceBytes) -> new TokenId(hash.imprint)
-    (mirrors NametagMinter's TokenId.fromNameTag() pattern)
+5.  Derive tokenId: DataHasher(SHA-256).update(invoiceBytes).digest()
+    -> new TokenId(hash.imprint)
+    (mirrors NametagMinter's TokenId.fromNameTag() pattern;
+     see SPEC §3.1 for the DataHasher usage)
 6.  Create MintTransactionData with:
     - tokenId from step 5
     - tokenType: INVOICE_TOKEN_TYPE_HEX
@@ -626,7 +628,7 @@ Additional per-address storage keys (the `StorageProvider` handles key scoping �
 | Storage Key (logical) | Scope | Content |
 |------------|-------|---------|
 | `cancelled_invoices` | Per-address | Set of cancelled invoice IDs (JSON array) |
-| `closed_invoices` | Per-address | Set of explicitly closed invoice IDs (JSON array) |
+| `closed_invoices` | Per-address | Set of closed invoice IDs — both explicit `closeInvoice()` and implicit all-covered+confirmed (JSON array) |
 | `frozen_balances` | Per-address | Frozen balance snapshots for terminated invoices (JSON map) |
 | `auto_return` | Per-address | Auto-return settings: per-invoice flags and global flag (JSON) |
 | `auto_return_ledger` | Per-address | Auto-return deduplication ledger: tracks which transfers have been returned (JSON) |
