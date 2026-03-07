@@ -93,13 +93,13 @@ InvoiceTerms (serialized into genesis.data.tokenData)
         +-- nft?: NFTEntry              // NFT request (placeholder)
 ```
 
-**Anonymous invoices:** The `creator` field is optional. Anyone can create an invoice without identifying themselves. When `creator` is omitted, the invoice is anonymous — any party holding the invoice locally may cancel it (since there is no creator to verify against). For non-anonymous invoices, only the creator may cancel. Closing follows a different authorization model: only **target** parties may explicitly close an invoice (see §4.3).
+**Anonymous invoices:** The `creator` field is optional. Anyone can create an invoice without identifying themselves. When `creator` is omitted, the invoice is anonymous. The authorization model is the same for anonymous and non-anonymous invoices: only **target** parties may explicitly close or cancel. The `creator` field is informational — it does not gate any authorization.
 
-**Creator identity trust model:** The `creator` field is **self-asserted** — the minter can set it to any pubkey. The aggregator does not verify that `creator` matches the minting key. Applications requiring verified creator identity should use out-of-band verification (e.g., receiving the invoice token directly from the claimed creator via authenticated transport). The `creator` field's purpose is local authorization gating for cancel (and for anonymous invoice close/cancel fallback), not identity attestation.
+**Creator identity trust model:** The `creator` field is **self-asserted** — the minter can set it to any pubkey. The aggregator does not verify that `creator` matches the minting key. Applications requiring verified creator identity should use out-of-band verification (e.g., receiving the invoice token directly from the claimed creator via authenticated transport). The `creator` field is **informational only** — it identifies who created the invoice but does not gate any authorization. All explicit close/cancel authorization is target-based.
 
 **Privacy limitation of anonymous invoices:** Even when `creator` is omitted, the minting process embeds the minter's signing key in the salt derivation and sets the minter's DirectAddress as the `recipient` in genesis data. The minter's on-chain identity is therefore still discoverable. Additionally, the deterministic salt (`SHA-256(signingKey || invoiceBytes)`) enables cross-invoice linkability — an observer can determine if two invoices were created by the same wallet. "Anonymous" means the `creator` field is absent from InvoiceTerms (affecting close/cancel authorization), not that the minter's identity is hidden on-chain.
 
-**Anonymous invoices and auto-return:** Auto-return works the same for anonymous and non-anonymous invoices. Any party that can terminate an invoice (targets for close, creator for cancel, any holder for anonymous) can also enable auto-return for it. The authorization model is consistent: if you can terminate the invoice, you can configure its auto-return behavior.
+**Anonymous invoices and auto-return:** Auto-return works the same for anonymous and non-anonymous invoices. Only target parties can terminate an invoice (close or cancel), and only target parties can configure auto-return. The authorization model is consistent: if you can terminate the invoice, you can configure its auto-return behavior.
 
 **Delivery methods:** The `deliveryMethods` field is an optional ordered list of URLs specifying how payments should be delivered, in priority order (first URL = highest priority). This is a **placeholder** for future use — the current SDK uses the Nostr-based delivery network exclusively. When delivery method support is implemented, a payer should attempt delivery to the first URL, falling back to subsequent URLs on failure.
 
@@ -260,7 +260,7 @@ See ACCOUNTING-SPEC.md §4.1 for the on-chain format and §5.4 for the complete 
 | `PARTIAL` | At least one matching payment received, but not all targets fully covered |
 | `COVERED` | All targets fully covered (unconfirmed — at least one related token lacks full proof chain) |
 | `CLOSED` | All targets fully covered AND all related tokens fully confirmed. **Terminal.** Also triggered by explicit `closeInvoice()`. |
-| `CANCELLED` | Creator explicitly cancelled the invoice. **Terminal.** |
+| `CANCELLED` | Target party explicitly cancelled the invoice. **Terminal.** |
 | `EXPIRED` | `dueDate` passed without reaching CLOSED (if dueDate was set). **Not terminal** — can still transition to CLOSED. |
 
 ### 4.2 State Transitions
@@ -307,17 +307,17 @@ Key transitions:
 - **EXPIRED detection is passive.** The `invoice:expired` event fires when `getInvoiceStatus()` is called or when an inbound event triggers recomputation — there is no background timer. If no events arrive and no status queries are made after the due date, the `invoice:expired` event will not fire until the next interaction. Applications requiring prompt expiration notification should poll `getInvoiceStatus()` or set a `setTimeout` based on `dueDate - Date.now()`.
 - **Clock skew.** EXPIRED is a local-only state derived from `Date.now() > dueDate`. Different parties may have different system clocks, so they may disagree on whether an invoice is expired. Implementations SHOULD tolerate up to 60 seconds of clock skew in UI presentation (e.g., showing "expiring soon" rather than hard cutoff). The `dueDate` is a signal, not an enforcement mechanism — there is no on-chain expiration.
 - **CANCELLED is terminal (locally).** Once cancelled, the invoice remains cancelled on the local party's side regardless of subsequent payments. Balances are frozen and persisted. See Section 4.4 for cancellation semantics.
-- **CLOSED is terminal (locally).** Two paths to CLOSED: (1) implicit — all targets covered + all tokens confirmed; (2) explicit — a **target** party calls `closeInvoice()` at any time (satisfied with current payments). Balances are frozen and persisted. Only target parties may explicitly close — the creator cannot close unless they are also a target. For anonymous invoices, any party holding the invoice may close it. After implicit close, if auto-return is enabled and the wallet is a target, surplus auto-return is triggered immediately.
+- **CLOSED is terminal (locally).** Two paths to CLOSED: (1) implicit — all targets covered + all tokens confirmed; (2) explicit — a **target** party calls `closeInvoice()` at any time (satisfied with current payments). Balances are frozen and persisted. Only target parties may explicitly close. A third path exists on the sender side: implicit close via `autoTerminateOnReturn` when receiving an `:RC` auto-return (see §4.5). After implicit close, if auto-return is enabled and the wallet is a target, surplus auto-return is triggered immediately.
 - **Frozen terminal states.** Once CLOSED or CANCELLED, the frozen balance snapshot is persisted. Dynamic recomputation stops. New transfers referencing the invoice may trigger auto-return but do not change the status.
 
 ### 4.3 Close vs Cancel Semantics
 
-**`closeInvoice()`** — Explicit close. A **target** party signals they are **satisfied** with what has been paid so far. No more payments needed. The invoice may be partially covered — the target accepts the current state as final. Only target parties may close an invoice — the creator cannot close unless they are also a target (since closing affects the target's receivable balances, it is a target-side decision). For anonymous invoices (no `creator` field), any party holding the invoice locally may close it.
+**`closeInvoice()`** — Explicit close. A **target** party signals they are **satisfied** with what has been paid so far. No more payments needed. The invoice may be partially covered — the target accepts the current state as final. Only target parties may close an invoice — closing affects the target's receivable balances, making it a target-side decision.
 
-**`cancelInvoice()`** — Cancellation. The invoice creator (or any holder, for anonymous invoices) abandons the **deal or session** associated with this invoice. The invoice is no longer relevant. Payments already made may need to be returned. Since cancellation is a local-only operation, any party holding the invoice can cancel it locally — but for non-anonymous invoices, only the creator is authorized (to prevent a payer from unilaterally cancelling an invoice they owe).
+**`cancelInvoice()`** — Cancellation. A **target** party abandons the **deal or session** associated with this invoice. The invoice is no longer relevant. Payments already made may need to be returned. Only target parties may cancel — this prevents a payer from unilaterally cancelling an invoice they owe.
 
 Both are local-only operations. The distinction matters for:
-1. **Per-sender balance reset.** Closing resets all per-sender balances to zero (pre-closure payments are accepted as final, non-returnable) with only the surplus assigned to the latest sender (by processing order — the sender whose payment triggered closure). Cancellation preserves all per-sender balances as-is (everything returnable). See §3.6 rules 8–9.
+1. **Per-sender balance reset.** Closing resets all per-sender balances to zero (pre-closure payments are accepted as final, non-returnable) with only the surplus assigned to the latest sender (by processing order — the sender whose payment triggered closure). Cancellation preserves all per-sender balances as-is (everything returnable). Both are target-only operations. See §3.6 rules 8–9.
 2. **Auto-return memo direction codes.** Tokens auto-returned for a closed invoice use `:RC` (return-for-closed); for a cancelled invoice, `:RX` (return-for-cancelled). This tells the original sender why their tokens were returned.
 3. **Recipient-side auto-termination.** When a sender receives an auto-return with `:RC` or `:RX`, the sender's accounting module may auto-terminate the invoice on their side with the same terminal state (close or cancel respectively).
 4. **Semantic intent.** Application UIs can display different messages: "Invoice closed — payment accepted" vs "Invoice cancelled — deal abandoned."
@@ -389,10 +389,12 @@ On crash recovery (during `load()`), scan the ledger for `pending` entries. For 
 - An invoice target can always explicitly return tokens received for any invoice, including non-terminated ones, using `INV:<id>:B`.
 - Manual return is independent of the auto-return setting.
 
-**Recipient-side auto-termination (opt-in):**
-- When a party receives an auto-return transfer with `:RC`, their accounting module MAY auto-close the invoice locally.
-- When a party receives an auto-return transfer with `:RX`, their accounting module MAY auto-cancel the invoice locally.
-- This is **opt-in** — controlled by `autoTerminateOnReturn` config (default: `false`). It provides implicit cross-party termination signaling without requiring an explicit broadcast mechanism. **Trust note:** A target can send `:RC`/`:RX` even if the invoice is not actually terminated on their side. The payer's `autoTerminateOnReturn` trusts the direction code at face value. This is acceptable because the target already holds the tokens and could simply not return them — spoofing a direction code gains nothing.
+**Sender-side implicit termination (opt-in):**
+- When a sender receives an auto-return transfer with `:RC`, their accounting module MAY auto-close the invoice locally — even if the invoice was not fully covered from the sender's perspective (the target decided to close).
+- When a sender receives an auto-return transfer with `:RX`, their accounting module MAY auto-cancel the invoice locally.
+- This is **opt-in** — controlled by `autoTerminateOnReturn` config (default: `false`). It provides implicit cross-party termination signaling without requiring an explicit broadcast mechanism.
+- **Over-refund warning:** If the total amount returned to a sender exceeds the total amount that sender has forwarded (for a given coinId), the module fires `invoice:over_refund_warning`. This can happen if a target manually returns more than the sender paid. The warning is informational — the transfer is not blocked.
+- **Trust note:** A target can send `:RC`/`:RX` even if the invoice is not actually terminated on their side. The payer's `autoTerminateOnReturn` trusts the direction code at face value. This is acceptable because the target already holds the tokens and could simply not return them — spoofing a direction code gains nothing.
 
 ### 4.6 Non-Blocking Inbound Guarantee
 
@@ -654,14 +656,15 @@ Added to `SphereEventType` and `SphereEventMap`:
 | `invoice:target_covered` | `{ invoiceId, address, confirmed }` | All assets for one target covered |
 | `invoice:covered` | `{ invoiceId, confirmed }` | All targets covered (may be unconfirmed) |
 | `invoice:closed` | `{ invoiceId, explicit }` | Invoice closed — `explicit: true` if via `closeInvoice()`, `false` if implicit (all confirmed) |
-| `invoice:cancelled` | `{ invoiceId }` | Creator cancelled the invoice |
+| `invoice:cancelled` | `{ invoiceId }` | Target party cancelled the invoice |
 | `invoice:expired` | `{ invoiceId }` | Due date passed (informational — invoice can still be closed) |
 | `invoice:unknown_reference` | `{ invoiceId, transfer }` | Transfer memo references an invoice not in local inventory |
 | `invoice:overpayment` | `{ invoiceId, address, coinId, surplus, confirmed }` | Payment exceeds requested amount |
 | `invoice:irrelevant` | `{ invoiceId, transfer, reason, confirmed }` | Transfer references this invoice but doesn't match any target address or requested asset |
 | `invoice:auto_returned` | `{ invoiceId, originalTransfer, returnTransfer }` | Tokens were auto-returned for a terminated invoice |
 | `invoice:auto_return_failed` | `{ invoiceId, transferId, reason }` | Auto-return failed — `reason`: `'sender_unresolvable'` \| `'send_failed'` \| `'max_retries_exceeded'` |
-| `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Received auto-return — `returnReason`: `'closed'` (from `:RC`) \| `'cancelled'` (from `:RX`). May trigger auto-termination |
+| `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Received auto-return — `returnReason`: `'closed'` (from `:RC`) \| `'cancelled'` (from `:RX`). May trigger sender-side implicit termination |
+| `invoice:over_refund_warning` | `{ invoiceId, senderAddress, coinId, forwardedAmount, returnedAmount }` | Total returned to sender exceeds total forwarded — informational warning, transfer not blocked |
 
 **Event ordering guarantee:** `invoice:closed` fires BEFORE any `invoice:auto_returned` events, for both explicit close (via `closeInvoice()`) and implicit close (all targets covered + all confirmed). This ensures listeners can react to the close before seeing the auto-return consequences.
 
@@ -840,8 +843,8 @@ Sender receives the auto-return (INV:abc:RX):
 | Malformed memo | Ignore — treat as a regular transfer with no invoice association |
 | Duplicate invoice | Aggregator rejects with `REQUEST_ID_EXISTS` — use deterministic salt for idempotent re-mint |
 | Token data parsing failure | Log warning, skip — corrupted tokenData does not crash the module |
-| Close by non-target | Reject — only target parties (or any holder for anonymous invoices) can close |
-| Cancel by non-creator | Reject — only the creator (or any holder for anonymous invoices) can cancel |
+| Close by non-target | Reject — only target parties can close |
+| Cancel by non-target | Reject — only target parties can cancel |
 | Forward payment to terminated invoice | **Throw `INVOICE_TERMINATED`** — the transfer is blocked before it happens |
 | Return payment from non-target party | **Throw `INVOICE_NOT_TARGET`** — only invoice target parties may send back/return payments |
 | Auto-return failure | Log error — the inbound transfer is already recorded, auto-return can be retried later |

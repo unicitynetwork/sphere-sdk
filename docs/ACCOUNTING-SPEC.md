@@ -89,8 +89,8 @@ interface InvoiceTerms {
   /**
    * Chain pubkey of the invoice creator.
    * OPTIONAL — when omitted, the invoice is anonymous.
-   * For anonymous invoices, any party holding the invoice may cancel it.
-   * Close authorization is target-based (see closeInvoice()), not creator-based.
+   * This field is informational only — it does not gate any authorization.
+   * All explicit close/cancel authorization is target-based.
    */
   readonly creator?: string;
   /**
@@ -138,7 +138,7 @@ interface CreateInvoiceRequest {
   /**
    * Whether to include the creator's chain pubkey in the invoice terms.
    * Default: true. Set to false to create an anonymous invoice.
-   * Anonymous invoices can be closed or cancelled by any holder.
+   * Anonymous invoices follow the same authorization: only targets can close or cancel.
    */
   readonly anonymous?: boolean;
 }
@@ -433,7 +433,7 @@ interface AccountingModuleDependencies {
   oracle: OracleProvider;
   /** Current wallet identity */
   identity: FullIdentity;
-  /** All tracked wallet addresses — used for target check in close and creator check in cancel (checks all HD addresses, not just current) */
+  /** All tracked wallet addresses — used for target check in close/cancel (checks all HD addresses, not just current) */
   getActiveAddresses: () => TrackedAddress[];
   /** Event emitter (from Sphere) */
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
@@ -556,8 +556,7 @@ class AccountingModule {
   /**
    * Explicitly close an invoice. Signals that a target party is satisfied
    * with the current payment state — no more payments needed.
-   * Only target parties may close (the creator cannot close unless also a target).
-   * For anonymous invoices, any holder may close.
+   * Only target parties may close.
    *
    * The difference from implicit close: implicit close happens automatically
    * when all targets are fully covered AND all tokens confirmed. Explicit close
@@ -580,7 +579,7 @@ class AccountingModule {
   async closeInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
 
   /**
-   * Cancel an invoice. Only the creator can cancel.
+   * Cancel an invoice. Only target parties can cancel.
    * Cancellation is local-only (not on-chain). Fires 'invoice:cancelled' event.
    *
    * Cancelling means abandoning the deal/session associated with this invoice.
@@ -595,12 +594,10 @@ class AccountingModule {
    *    - Uses :RX memo direction
    *    - Fires 'invoice:auto_returned' for each return executed
    *
-   * For anonymous invoices (terms.creator undefined), any party holding the invoice
-   * locally may cancel it — since there is no creator to verify against.
-   *
    * @param invoiceId - The invoice token ID
    * @param options - Optional: { autoReturn?: boolean } — enable auto-return on cancel
-   * @throws SphereError if not creator (non-anonymous), not found, or already closed/cancelled
+   * @throws SphereError with INVOICE_NOT_TARGET if caller is not a target party
+   * @throws SphereError if not found, already closed, or already cancelled
    */
   async cancelInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
 
@@ -870,7 +867,7 @@ Step  Action                                SDK Class
       retroactive payment/coverage events
 ```
 
-**Privacy note on anonymous invoices:** Even when `creator` is omitted, the minting process uses the minter's signing key for salt derivation (step 4) and sets the minter's DirectAddress as the `recipient` in the genesis data (step 5). This means the minter's identity is still embedded in the token's on-chain data. Additionally, since `salt = SHA-256(signingKey || invoiceBytes)` uses a constant signing key, any observer who can see multiple invoice tokens on-chain can determine whether two invoices were created by the same wallet by testing candidate keys against the salt — the salt is a cross-invoice linkability vector. However, this vector is **strictly dominated** by the `recipient` field exposure — the recipient DirectAddress directly identifies the minter without any brute-forcing. The salt linkability is therefore redundant with existing exposure. True anonymity would require changing BOTH the recipient strategy AND salt derivation (random nonce). For v1, "anonymous" means the `creator` field is absent from `InvoiceTerms` (affecting cancel authorization and allowing any holder to close), not that the minter's on-chain identity is hidden.
+**Privacy note on anonymous invoices:** Even when `creator` is omitted, the minting process uses the minter's signing key for salt derivation (step 4) and sets the minter's DirectAddress as the `recipient` in the genesis data (step 5). This means the minter's identity is still embedded in the token's on-chain data. Additionally, since `salt = SHA-256(signingKey || invoiceBytes)` uses a constant signing key, any observer who can see multiple invoice tokens on-chain can determine whether two invoices were created by the same wallet by testing candidate keys against the salt — the salt is a cross-invoice linkability vector. However, this vector is **strictly dominated** by the `recipient` field exposure — the recipient DirectAddress directly identifies the minter without any brute-forcing. The salt linkability is therefore redundant with existing exposure. True anonymity would require changing BOTH the recipient strategy AND salt derivation (random nonce). For v1, "anonymous" means the `creator` field is absent from `InvoiceTerms` (informational only), not that the minter's on-chain identity is hidden.
 
 ### 3.3 Invoice Token Type Constant
 
@@ -886,7 +883,7 @@ const INVOICE_TOKEN_TYPE_HEX =
 
 ### 3.4 Canonical Serialization
 
-**Security note on `creator` field:** The `creator` field in InvoiceTerms is **self-asserted** — the minter can set it to any pubkey. The aggregator does not verify that the `creator` matches the minting key. This means a malicious party could mint an invoice claiming to be someone else. Import validation (§8.2) does NOT verify creator identity against the minting key because the minting key is not exposed in the token's genesis data. Applications requiring verified creator identity should use out-of-band verification (e.g., the invoice token is received directly from the claimed creator via authenticated transport). The `creator` field's primary purpose is authorization gating for cancel operations (and anonymous invoice fallback), not identity attestation. Close authorization is target-based, not creator-based (see §4.4 `closeInvoice()`).
+**Security note on `creator` field:** The `creator` field in InvoiceTerms is **self-asserted** — the minter can set it to any pubkey. The aggregator does not verify that the `creator` matches the minting key. This means a malicious party could mint an invoice claiming to be someone else. Import validation (§8.2) does NOT verify creator identity against the minting key because the minting key is not exposed in the token's genesis data. Applications requiring verified creator identity should use out-of-band verification (e.g., the invoice token is received directly from the claimed creator via authenticated transport). The `creator` field is **informational only** — it identifies the invoice creator but does not gate any authorization. All explicit close/cancel authorization is target-based (see §4.4 `closeInvoice()` and `cancelInvoice()`).
 
 InvoiceTerms must be serialized deterministically (same input -> same bytes) for consistent token ID derivation:
 
@@ -1604,7 +1601,7 @@ This means: due date is a signal to participants, not an enforcement mechanism. 
 **Close and cancel are local operations with persisted frozen balances.**
 
 - **Explicit close (`closeInvoice()`).** A target party is satisfied with current payments. Balances are frozen at the moment of close. Subsequent forward payments may be auto-returned with `:RC`.
-- **Cancel (`cancelInvoice()`).** The creator abandons the deal. Balances are frozen at the moment of cancel. Subsequent forward payments may be auto-returned with `:RX`.
+- **Cancel (`cancelInvoice()`).** A target party abandons the deal. Balances are frozen at the moment of cancel. Subsequent forward payments may be auto-returned with `:RX`.
 - **Implicit close.** Happens automatically when all targets are fully covered AND all tokens confirmed. Balances are frozen. This is functionally identical to explicit close but with `explicitClose: false` in the status.
 - **Outbound blocking.** `payInvoice()` throws `INVOICE_TERMINATED` if the invoice is locally terminated (closed or cancelled). The transfer does NOT happen. This is the only case where the accounting module prevents a transfer.
 - **Perspective divergence.** Your CLOSED does not imply others' CLOSED. Different parties have different transaction histories.
@@ -1731,6 +1728,7 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
 | 'invoice:auto_returned'
 | 'invoice:auto_return_failed'
 | 'invoice:return_received'
+| 'invoice:over_refund_warning'
 
 // New SphereEventMap entries:
 'invoice:created': {
@@ -1809,6 +1807,14 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
   returnReason: 'closed' | 'cancelled';   // derived from :RC or :RX
 };
 
+'invoice:over_refund_warning': {
+  invoiceId: string;
+  senderAddress: string;                  // the sender's address (this wallet's address)
+  coinId: string;
+  forwardedAmount: string;                // total forwarded by this sender
+  returnedAmount: string;                 // total returned to this sender (exceeds forwarded)
+};
+
 'invoice:auto_return_failed': {
   invoiceId: string;
   transferId: string;                     // the inbound transfer that could not be returned
@@ -1831,8 +1837,16 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
         `'unauthorized_return'` and return. This prevents spoofed :RC/:RX
         transfers from non-target parties triggering auto-termination.
      b. fire 'invoice:return_received' { invoiceId, transfer, returnReason }
-     c. if autoTerminateOnReturn config is true:
-        - :RC -> auto-close invoice locally (if not already terminated)
+     c. **Over-refund check:** Compare total returned to this sender vs total
+        forwarded by this sender (for this coinId). If returned > forwarded,
+        fire 'invoice:over_refund_warning' { invoiceId, senderAddress, coinId,
+        forwardedAmount, returnedAmount }. The transfer is NOT blocked — this
+        is an informational warning only.
+     d. if autoTerminateOnReturn config is true:
+        - :RC -> auto-close invoice locally (if not already terminated).
+          NOTE: The invoice may not appear fully covered from the sender's
+          perspective — the target decided to close, and the sender accepts
+          this via the implicit termination signal.
         - :RX -> auto-cancel invoice locally (if not already terminated)
         **Trust note:** A legitimate target CAN send :RC/:RX even if the
         invoice is not actually closed/cancelled on their side. The payer's
@@ -2411,7 +2425,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Rule | Error |
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
-| Caller must be a target: the `chainPubkey` of ANY tracked address from `getActiveAddresses()` must match one of the `targets[].address` entries in the invoice terms. The creator cannot close unless they are also a target. For anonymous invoices (`terms.creator` undefined), any party holding the invoice may close it. | `INVOICE_NOT_TARGET` |
+| Caller must be a target: the `chainPubkey` of ANY tracked address from `getActiveAddresses()` must match one of the `targets[].address` entries in the invoice terms. | `INVOICE_NOT_TARGET` |
 | Invoice must not already be CLOSED | `INVOICE_ALREADY_CLOSED` |
 | Invoice must not already be CANCELLED | `INVOICE_ALREADY_CANCELLED` |
 
@@ -2420,7 +2434,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Rule | Error |
 |------|-------|
 | Invoice token must exist locally | `INVOICE_NOT_FOUND` |
-| If non-anonymous: `terms.creator` must match the `chainPubkey` of ANY tracked address from `getActiveAddresses()`, not just the current active identity. For anonymous invoices (`terms.creator` undefined), any party holding the invoice may cancel it. | `INVOICE_NOT_CREATOR` |
+| Caller must be a target: the `chainPubkey` of ANY tracked address from `getActiveAddresses()` must match one of the `targets[].address` entries in the invoice terms. | `INVOICE_NOT_TARGET` |
 | Invoice must not already be CLOSED (computed) | `INVOICE_ALREADY_CLOSED` |
 | Invoice must not already be cancelled | `INVOICE_ALREADY_CANCELLED` |
 
@@ -2630,6 +2644,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 'invoice:auto_returned'    // When tokens are auto-returned for a terminated invoice
 'invoice:auto_return_failed' // Auto-return failed
 'invoice:return_received'  // When auto-return tokens are received
+'invoice:over_refund_warning' // Total returned exceeds total forwarded (informational)
 ```
 
 ---
@@ -2657,8 +2672,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_INVALID_DATA` | Cannot parse invoice terms from token data | Corrupt tokenData |
 | `INVOICE_ALREADY_EXISTS` | Invoice token already exists locally | Duplicate import |
 | `INVOICE_NOT_FOUND` | Invoice token not found | Unknown invoiceId |
-| `INVOICE_NOT_CREATOR` | Only the creator can cancel this invoice | Cancel by non-creator (non-anonymous invoices). For anonymous invoices, any holder is allowed. |
-| `INVOICE_NOT_TARGET` | Only a target party can close this invoice | Close by non-target. For anonymous invoices, any holder is allowed. |
+| `INVOICE_NOT_TARGET` | Only a target party can close or cancel this invoice | Close or cancel by non-target party. |
 | `INVOICE_ALREADY_CLOSED` | Invoice is already closed | Close/cancel after CLOSED |
 | `INVOICE_ALREADY_CANCELLED` | Invoice is already cancelled | Close/cancel after CANCELLED |
 | `INVOICE_ORACLE_REQUIRED` | Oracle provider required for invoice minting | No oracle configured |
@@ -2875,6 +2889,17 @@ Sender receives the auto-return (INV:abc:RC):
   -> Fires invoice:return_received { returnReason: 'closed' }
   -> If autoTerminateOnReturn is true:
      -> Sender's module auto-closes invoice abc locally
+        (even though the invoice may not appear fully covered from the sender's view —
+         the target decided to close, and the sender accepts the implicit signal)
+
+--- Over-Refund Warning ---
+
+Invoice xyz: target alice manually returns 600 UCT to S1 with INV:xyz:B,
+but S1 only sent 400 UCT to alice.
+  -> S1's module detects: returned (600) > forwarded (400)
+  -> Fires invoice:over_refund_warning { senderAddress: S1, coinId: 'UCT',
+     forwardedAmount: '400', returnedAmount: '600' }
+  -> Transfer is NOT blocked — warning is informational only.
 
 --- Cancellation with Auto-Return (everything, per-sender) ---
 
