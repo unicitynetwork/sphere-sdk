@@ -518,13 +518,15 @@ interface AccountingModuleDependencies {
   /** General storage for cancelled/closed sets, frozen balances, auto-return settings */
   storage: StorageProvider;
   /**
-   * Optional CommunicationsModule instance for sending/receiving receipt DMs.
+   * Optional CommunicationsModule instance for sending/receiving receipt and
+   * cancellation notice DMs.
    * When provided:
-   * - `sendInvoiceReceipts()` sends receipt DMs via `sendDM()`
-   * - Incoming DMs are monitored for `invoice_receipt:` prefix (payer-side detection)
+   * - `sendInvoiceReceipts()` and `sendCancellationNotices()` send DMs via `sendDM()`
+   * - Incoming DMs are monitored for `invoice_receipt:` and `invoice_cancellation:`
+   *   prefixes (payer-side detection of receipts and cancellation notices)
    * When omitted:
-   * - `sendInvoiceReceipts()` throws `COMMUNICATIONS_UNAVAILABLE`
-   * - Payer-side receipt detection is disabled (no subscription)
+   * - Both methods throw `COMMUNICATIONS_UNAVAILABLE`
+   * - Payer-side receipt and cancellation notice detection is disabled (no subscription)
    */
   communications?: CommunicationsModule;
 }
@@ -608,6 +610,72 @@ interface IncomingInvoiceReceipt {
   readonly senderNametag?: string;
   /** Parsed receipt payload */
   readonly receipt: InvoiceReceiptPayload;
+  /** Timestamp when the DM was received */
+  readonly receivedAt: number;
+}
+```
+
+### 1.7 Cancellation Notice Types
+
+```typescript
+// =============================================================================
+// Cancellation Notice Types (Invoice Cancellation DMs)
+// =============================================================================
+
+/**
+ * Structured payload inside a cancellation notice DM content field.
+ * Sent by a target to each payer after invoice cancellation.
+ * Wire format: `invoice_cancellation:` prefix + JSON.stringify(InvoiceCancellationPayload).
+ *
+ * Unlike receipts (which apply to both CLOSED and CANCELLED invoices),
+ * cancellation notices are specific to CANCELLED invoices and carry
+ * cancellation-specific context (reason, deal description).
+ *
+ * No `terminalState` field — cancellation notices are only sent for CANCELLED
+ * invoices (enforced by §8.10 validation), so the terminal state is implicit.
+ */
+interface InvoiceCancellationPayload {
+  /** Discriminator — always 'invoice_cancellation' */
+  readonly type: 'invoice_cancellation';
+  /** Format version — always 1 for forward compatibility */
+  readonly version: 1;
+  /** Invoice token ID (64-char hex) */
+  readonly invoiceId: string;
+  /** DIRECT:// address of the target sending this notice */
+  readonly targetAddress: string;
+  /** Target's nametag (if known at send time) */
+  readonly targetNametag?: string;
+  /** This sender's contribution breakdown at time of cancellation */
+  readonly senderContribution: InvoiceReceiptContribution;
+  /** Cancellation reason — free-text explaining why the invoice was cancelled */
+  readonly reason?: string;
+  /**
+   * Optional deal/service/asset description — context about what was being
+   * bought, sold, exchanged, or provided. Helps the payer understand the
+   * commercial context of the cancelled transaction.
+   */
+  readonly dealDescription?: string;
+  /** Timestamp when notice was issued (ms) */
+  readonly issuedAt: number;
+}
+
+/**
+ * Parsed cancellation notice on the payer side — constructed from an incoming DM
+ * whose content starts with 'invoice_cancellation:'.
+ *
+ * NOTE: `sender*` fields refer to the DM sender, who is the invoice TARGET
+ * (not the invoice payer). The naming follows the DM layer convention where
+ * "sender" = the party who sent the DM.
+ */
+interface IncomingCancellationNotice {
+  /** DirectMessage.id from the DM that carried this notice */
+  readonly dmId: string;
+  /** Target's transport pubkey (DM sender = invoice target) */
+  readonly senderPubkey: string;
+  /** Target's nametag (from DM metadata or notice payload) */
+  readonly senderNametag?: string;
+  /** Parsed cancellation notice payload */
+  readonly notice: InvoiceCancellationPayload;
   /** Timestamp when the DM was received */
   readonly receivedAt: number;
 }
@@ -951,6 +1019,49 @@ class AccountingModule {
   ): Promise<SendReceiptsResult>;
 
   /**
+   * Send cancellation notice DMs to each payer of a cancelled invoice.
+   *
+   * For each target address controlled by this wallet, iterates over the
+   * frozen per-sender balances and sends a structured cancellation notice DM
+   * to each payer via `CommunicationsModule.sendDM()`.
+   *
+   * PREREQUISITES:
+   * - Invoice must be in CANCELLED state (not CLOSED — use sendInvoiceReceipts for CLOSED)
+   * - Caller must be a target party
+   * - CommunicationsModule must be available (passed via dependencies)
+   *
+   * DATA SOURCES:
+   * - Frozen balances (from FrozenInvoiceBalances, persisted at termination)
+   * - Invoice terms (from token genesis tokenData, for requestedAmount)
+   *
+   * ITERATION MODEL:
+   * Same as sendInvoiceReceipts() — one notice per unique (targetAddress, senderAddress)
+   * pair, aggregating all coinId breakdowns into a single senderContribution.assets[].
+   * Resolve targetNametag from `getActiveAddresses().find(a => a.directAddress === targetAddress)?.nametag`.
+   *
+   * DELIVERY:
+   * Same recipient resolution as sendInvoiceReceipts():
+   *   1. `contacts[0].address`
+   *   2. `senderAddress` (if `isRefundAddress` is falsy)
+   *   3. Skip — unresolvable sender goes to `failedNotices`
+   *
+   * IDEMPOTENCY: Multiple calls send duplicate notices. Applications needing
+   * at-most-once semantics should track this themselves.
+   *
+   * @param invoiceId - Invoice token ID (must be CANCELLED)
+   * @param options - Cancellation reason, deal description, filtering options
+   * @returns Result with sent/failed counts and per-sender details
+   * @throws INVOICE_NOT_FOUND if invoice doesn't exist
+   * @throws INVOICE_NOT_CANCELLED if invoice is not in CANCELLED state
+   * @throws INVOICE_NOT_TARGET if caller is not a target party
+   * @throws COMMUNICATIONS_UNAVAILABLE if CommunicationsModule is not available
+   */
+  async sendCancellationNotices(
+    invoiceId: string,
+    options?: SendCancellationNoticesOptions
+  ): Promise<SendNoticesResult>;
+
+  /**
    * Get all transfers related to a specific invoice.
    * Includes forward payments, back payments, return payments, and irrelevant transfers.
    * Scans full transaction history of active and sent tokens.
@@ -986,7 +1097,7 @@ class AccountingModule {
    * The `destroyed` flag is checked in TWO places:
    * - At the TOP of every PUBLIC METHOD (getInvoiceStatus, payInvoice,
    *   closeInvoice, cancelInvoice, returnInvoicePayment, setAutoReturn,
-   *   sendInvoiceReceipts).
+   *   sendInvoiceReceipts, sendCancellationNotices).
    *   If set, the method throws immediately without entering the gate.
    * - At the TOP of every gate `fn` body. If set, the fn returns immediately
    *   without storage writes (catches operations queued before flag was set).
@@ -1138,6 +1249,63 @@ interface FailedReceiptInfo {
   /** Effective sender address the receipt was attempted for */
   readonly senderAddress: string;
   /** Reason the receipt failed */
+  readonly reason: 'unresolvable' | 'dm_failed';
+  /** Error message (for 'dm_failed' reason) */
+  readonly error?: string;
+}
+
+/**
+ * Options for sendCancellationNotices().
+ */
+interface SendCancellationNoticesOptions {
+  /** Cancellation reason — free-text explaining why the invoice was cancelled. Max 4096 chars. */
+  readonly reason?: string;
+  /**
+   * Deal/service/asset description — context about what was being bought, sold,
+   * exchanged, or provided. Max 4096 chars.
+   */
+  readonly dealDescription?: string;
+  /** Whether to include senders with net balance of 0 (default: false) */
+  readonly includeZeroBalance?: boolean;
+}
+
+/**
+ * Result of sendCancellationNotices().
+ */
+interface SendNoticesResult {
+  /** Number of notices successfully sent */
+  readonly sent: number;
+  /** Number of notices that failed to send */
+  readonly failed: number;
+  /** Details of each successfully sent notice */
+  readonly sentNotices: SentNoticeInfo[];
+  /** Details of each failed notice */
+  readonly failedNotices: FailedNoticeInfo[];
+}
+
+/**
+ * Info about a successfully sent cancellation notice DM.
+ */
+interface SentNoticeInfo {
+  /** Target address this notice was sent for (DIRECT:// format) */
+  readonly targetAddress: string;
+  /** Effective sender address the notice was sent for */
+  readonly senderAddress: string;
+  /** Resolved DM recipient address */
+  readonly recipientAddress: string;
+  /** DM ID returned by CommunicationsModule.sendDM() */
+  readonly dmId: string;
+}
+
+/**
+ * Info about a failed cancellation notice DM.
+ */
+interface FailedNoticeInfo {
+  /** Target address this notice was attempted for (DIRECT:// format) */
+  readonly targetAddress: string;
+  /** Effective sender address the notice was attempted for */
+  readonly senderAddress: string;
+  /** Reason the notice failed */
   readonly reason: 'unresolvable' | 'dm_failed';
   /** Error message (for 'dm_failed' reason) */
   readonly error?: string;
@@ -1714,6 +1882,47 @@ invoice_receipt:{"type":"invoice_receipt","version":1,"invoiceId":"a1b2c3...64he
 - Receipt DMs are encrypted via NIP-17 (same as all DMs through `CommunicationsModule`).
 - The `memo` field in the receipt payload is untrusted user input — applications MUST sanitize before rendering in HTML/DOM contexts.
 - Receipt DMs are stored by `CommunicationsModule` as regular DMs. The `invoice_receipt:` prefix allows UI layers to render them with structured formatting. **UI dedup guidance:** Applications rendering both DM conversations and structured receipt cards SHOULD use the `invoice_receipt:` prefix to suppress raw text rendering of receipt DMs in conversation views, replacing them with a structured receipt component. The `IncomingInvoiceReceipt.dmId` field allows correlation between the structured `invoice:receipt_received` event and the stored DM.
+
+### 4.11 Cancellation Notice DM Format
+
+Cancellation notice DMs use the same prefix-based pattern as receipt DMs (§4.10).
+
+**Wire format:**
+
+```
+invoice_cancellation:<JSON payload>
+```
+
+Where `<JSON payload>` is `JSON.stringify(InvoiceCancellationPayload)` (no whitespace, no trailing newline).
+
+**Example:**
+
+```
+invoice_cancellation:{"type":"invoice_cancellation","version":1,"invoiceId":"a1b2c3...64hex...","targetAddress":"DIRECT://...","targetNametag":"alice","senderContribution":{"senderAddress":"DIRECT://...","assets":[{"coinId":"UCT","forwardedAmount":"400000","returnedAmount":"0","netAmount":"400000","requestedAmount":"1000000"}]},"reason":"Deal fell through — supplier unavailable","dealDescription":"500 units of Widget X at 2000 UCT each","issuedAt":1709856000000}
+```
+
+**Parsing rules (payer side):**
+
+1. Check if DM content starts with `invoice_cancellation:` — if not, continue to next prefix check or treat as regular DM.
+2. Extract the substring after the prefix: `content.slice('invoice_cancellation:'.length)`.
+3. Parse as JSON. On parse failure, treat as regular DM (do not throw).
+4. Validate required fields:
+   - `type` must equal `'invoice_cancellation'`
+   - `version` must be a number:
+     - If `version === 1`: proceed with current parsing
+     - If `version > 1`: silently ignore — return without firing events (forward compat)
+     - If `version < 1`, not a number, or not an integer: treat as validation failure (step 5 fallthrough)
+   - `invoiceId` must be a 64-char lowercase hex string (`/^[0-9a-f]{64}$/`)
+   - `senderContribution` must be an object with `senderAddress` (string) and `assets` (array)
+5. On validation failure, treat as regular DM (silent — do not throw or fire error events).
+6. On success, construct `IncomingCancellationNotice` and fire `invoice:cancellation_received` event.
+
+**Security considerations:**
+
+- Same trust model as receipt DMs (§4.10): content is self-asserted by the target. A malicious target can fabricate cancellation data. Applications SHOULD cross-reference against local invoice status.
+- The `reason` and `dealDescription` fields are untrusted user input — applications MUST sanitize before rendering in HTML/DOM contexts.
+- Cancellation notice DMs are encrypted via NIP-17 (same as all DMs).
+- **UI dedup guidance:** Same as receipt DMs — applications rendering both DM conversations and structured cancellation cards SHOULD use the `invoice_cancellation:` prefix to suppress raw text rendering, replacing with a structured component. The `IncomingCancellationNotice.dmId` field allows correlation.
 
 ---
 
@@ -2452,6 +2661,12 @@ All state-mutating operations on a given invoice are serialized through a **per-
   duplicate receipts (documented as idempotent in §2.1). Receipt payloads reflect
   frozen-at-termination balances, NOT post-auto-return state — payers should
   cross-reference against their own transaction history.
+- `sendCancellationNotices()` — same safety properties as `sendInvoiceReceipts()`.
+  Read-only with respect to invoice state. Reads frozen balances and invoice terms.
+  Does not acquire the per-invoice gate. The only side effects are sending DMs via
+  `CommunicationsModule.sendDM()` and firing `invoice:cancellation_sent`. Safe to
+  call concurrently with any other operation. Multiple concurrent calls produce
+  duplicate notices (documented as idempotent in §2.1).
 
 ```typescript
 // Conceptual implementation
@@ -2517,16 +2732,23 @@ On CommunicationsModule 'message:dm' (subscribed during load()):
 
   5. Validate parsed payload:
      a. type === 'invoice_receipt'
-     b. version must be a number:
+     b. version: must satisfy `Number.isInteger(version) && version >= 1`.
         - version === 1: proceed
         - version > 1: return (silently ignore, forward compat)
-        - version < 1 or non-number/non-integer: validation failure (step 5 fallthrough)
+        - Otherwise (non-integer, NaN, < 1, non-number): validation failure
      c. invoiceId is a 64-char lowercase hex string (/^[0-9a-f]{64}$/)
      d. terminalState is 'CLOSED' or 'CANCELLED'
      e. senderContribution is an object with:
         - senderAddress: non-empty string
-        - assets: array (may be empty)
+        - assets: array (length <= 100, reject if exceeded)
+     f. targetAddress: typeof === 'string' (required for nametag fallback)
+     g. memo (if present): typeof === 'string' (reject non-string)
      On any validation failure -> return (treat as regular DM, silent)
+
+  5b. Invoice existence check:
+      Look up payload.invoiceId in the local invoice store (getInvoice()).
+      If the invoice does not exist locally -> return (silently drop).
+      This prevents events from firing for fabricated invoice IDs.
 
   6. Construct IncomingInvoiceReceipt:
      {
@@ -2546,9 +2768,70 @@ On CommunicationsModule 'message:dm' (subscribed during load()):
 
 **Implementation note:** The DM subscription is set up in `load()` and torn down in `destroy()`. The subscription uses the same lifecycle pattern as PaymentsModule event subscriptions. If `CommunicationsModule` is not in dependencies, receipt detection is simply not available — no error is thrown.
 
+**Content size guard:** Before attempting `JSON.parse()` (step 4), implementations MUST check that the content substring length does not exceed 64 KB. If it does, skip parsing and treat as a regular DM. This prevents memory pressure from malicious oversized payloads sent by hostile peers. The 64 KB limit provides ample room for legitimate payloads (which are typically < 2 KB) while bounding resource consumption.
+
+**Sender authentication (best-effort):** The invoice existence check (step 5b) ensures events only fire for locally-known invoices. Full sender authentication (verifying the DM sender is a target of the invoice) requires resolving the sender's transport pubkey to a DIRECT:// address and comparing against `targets[].address`. This resolution may be unavailable (transport pubkey → chain address mapping is not always cached). Applications that require verified sender identity SHOULD cross-reference the `senderPubkey` from the event against known target transport pubkeys. The SDK fires the event for any DM that passes payload validation AND invoice existence check — UI layers MUST NOT assume the sender is a legitimate target without additional verification.
+
 **CommunicationsModule subscription mechanism:** AccountingModule subscribes via `dependencies.communications.onDirectMessage(handler)` (the direct CommunicationsModule callback API), NOT via the Sphere event bus (`sphere.on('message:dm', ...)`). This avoids requiring the AccountingModule to access the Sphere-level event emitter. The callback receives a `DirectMessage` object with at minimum: `{ id: string, content: string, senderPubkey: string, senderNametag?: string, timestamp?: number }`. If the CommunicationsModule API differs, adapt the subscription accordingly.
 
 **No separate receipt storage.** Receipt DMs are stored by `CommunicationsModule` as regular DMs. The `invoice:receipt_received` event allows UI layers to detect and render receipts with structured formatting. The AccountingModule does not persist receipt state separately.
+
+### 5.12 Cancellation Notice DM Processing (Payer Side)
+
+The same `onDirectMessage()` subscription used for receipt detection (§5.11) also handles cancellation notices. The prefix checks are ordered: `invoice_receipt:` first, then `invoice_cancellation:`. A DM matching neither prefix is treated as a regular DM.
+
+```
+On CommunicationsModule 'message:dm' (same subscription as §5.11, continued):
+
+  1. If CommunicationsModule is not available -> no subscription (same as §5.11)
+
+  2. (After receipt prefix check fails in §5.11 step 2)
+     Check if content starts with 'invoice_cancellation:' prefix.
+     If not -> return (regular DM, no action needed)
+
+  3. Extract JSON substring: content.slice('invoice_cancellation:'.length)
+
+  4. Try JSON.parse(). On failure -> return (treat as regular DM, silent)
+
+  5. Validate parsed payload:
+     a. type === 'invoice_cancellation'
+     b. version: must satisfy `Number.isInteger(version) && version >= 1`.
+        - version === 1: proceed
+        - version > 1: return (silently ignore, forward compat)
+        - Otherwise (non-integer, NaN, < 1, non-number): validation failure
+     c. invoiceId is a 64-char lowercase hex string (/^[0-9a-f]{64}$/)
+     d. senderContribution is an object with:
+        - senderAddress: non-empty string
+        - assets: array (length <= 100, reject if exceeded)
+     e. targetAddress: typeof === 'string' (required for nametag fallback)
+     f. reason (if present): typeof === 'string' (reject non-string)
+     g. dealDescription (if present): typeof === 'string' (reject non-string)
+     On any validation failure -> return (treat as regular DM, silent)
+
+  5b. Invoice existence check:
+      Look up payload.invoiceId in the local invoice store (getInvoice()).
+      If the invoice does not exist locally -> return (silently drop).
+      This prevents events from firing for fabricated invoice IDs.
+
+  6. Construct IncomingCancellationNotice:
+     {
+       dmId: dm.id,
+       senderPubkey: dm.senderPubkey,
+       senderNametag: dm.senderNametag ?? payload.targetNametag,
+       notice: payload,
+       receivedAt: dm.timestamp ?? Date.now()
+     }
+
+  7. Fire 'invoice:cancellation_received' event with:
+     {
+       invoiceId: payload.invoiceId,
+       notice: <constructed IncomingCancellationNotice>
+     }
+```
+
+**No separate notice storage.** Cancellation notice DMs are stored by `CommunicationsModule` as regular DMs. The `invoice:cancellation_received` event allows UI layers to detect and render notices with structured formatting (cancellation reason, deal description, contribution breakdown).
+
+**Receipt vs cancellation notice overlap:** A cancelled invoice may receive both receipt DMs (`sendInvoiceReceipts()`) and cancellation notice DMs (`sendCancellationNotices()`) — receipts apply to any terminal state (CLOSED or CANCELLED), while cancellation notices are CANCELLED-only. Applications SHOULD choose one or the other based on their use case. Sending both is valid but may confuse payers. If both are sent, the payer's UI should present them as complementary: the receipt provides a settlement summary while the cancellation notice carries the cancellation reason and deal context.
 
 ---
 
@@ -2564,7 +2847,7 @@ cannot extend it. The additions below MUST be made directly in `types/index.ts`.
 updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` and
 `sphere_getInvoiceStatus` to `METHOD_PERMISSIONS`, and add all six intent actions
 (`create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`, `return_invoice_payment`,
-`set_auto_return`, `send_invoice_receipts`) to `INTENT_PERMISSIONS`.
+`set_auto_return`, `send_invoice_receipts`, `send_cancellation_notices`) to `INTENT_PERMISSIONS`.
 
 ```typescript
 // New SphereEventType additions:
@@ -2585,6 +2868,8 @@ updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` a
 | 'invoice:over_refund_warning'
 | 'invoice:receipt_sent'
 | 'invoice:receipt_received'
+| 'invoice:cancellation_sent'
+| 'invoice:cancellation_received'
 
 // New SphereEventMap entries:
 'invoice:created': {
@@ -2688,6 +2973,17 @@ updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` a
 'invoice:receipt_received': {
   invoiceId: string;
   receipt: IncomingInvoiceReceipt;        // parsed receipt from incoming DM
+};
+
+'invoice:cancellation_sent': {
+  invoiceId: string;
+  sent: number;                           // number of cancellation notice DMs successfully sent
+  failed: number;                         // number of cancellation notice DMs that failed
+};
+
+'invoice:cancellation_received': {
+  invoiceId: string;
+  notice: IncomingCancellationNotice;     // parsed cancellation notice from incoming DM
 };
 ```
 
@@ -2836,6 +3132,15 @@ On sendInvoiceReceipts():
 On CommunicationsModule 'message:dm' (payer-side receipt detection):
   1. If content starts with 'invoice_receipt:' AND parses successfully (see §5.11):
      -> fire 'invoice:receipt_received' { invoiceId, receipt: <IncomingInvoiceReceipt> }
+  2. Parse/validation failures are silent — the DM is treated as a regular DM.
+
+On sendCancellationNotices():
+  1. After all cancellation notice DMs are sent (or failed):
+     -> fire 'invoice:cancellation_sent' { invoiceId, sent: <count>, failed: <count> }
+
+On CommunicationsModule 'message:dm' (payer-side cancellation notice detection):
+  1. If content starts with 'invoice_cancellation:' AND parses successfully (see §5.12):
+     -> fire 'invoice:cancellation_received' { invoiceId, notice: <IncomingCancellationNotice> }
   2. Parse/validation failures are silent — the DM is treated as a regular DM.
 ```
 
@@ -3537,6 +3842,19 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 
 **Note:** Per-sender DM delivery failures (unresolvable recipient, `sendDM()` error) are collected in `failedReceipts` and do NOT throw. Only the precondition checks above throw errors.
 
+### 8.10 sendCancellationNotices Validation
+
+| Rule | Error |
+|------|-------|
+| Invoice token must exist locally | `INVOICE_NOT_FOUND` |
+| Invoice must be in CANCELLED state (not CLOSED) | `INVOICE_NOT_CANCELLED` |
+| Caller must be a target: the `directAddress` of ANY tracked address from `getActiveAddresses()` must match one of the `targets[].address` entries in the invoice terms | `INVOICE_NOT_TARGET` |
+| CommunicationsModule must be available (passed via dependencies) | `COMMUNICATIONS_UNAVAILABLE` |
+| `options.reason` (if provided) must be max 4096 characters | `INVOICE_MEMO_TOO_LONG` |
+| `options.dealDescription` (if provided) must be max 4096 characters | `INVOICE_MEMO_TOO_LONG` |
+
+**Note:** Per-sender DM delivery failures (unresolvable recipient, `sendDM()` error) are collected in `failedNotices` and do NOT throw. Only the precondition checks above throw errors.
+
 ---
 
 ## 9. Connect Protocol Extensions
@@ -3707,6 +4025,18 @@ If the process crashes after step 1 but before step 2, the next cold start will 
   }
 }
 // Returns: SendReceiptsResult
+
+// send_cancellation_notices -- prompts user to confirm sending cancellation notice DMs
+{
+  action: 'send_cancellation_notices',
+  params: {
+    invoiceId: 'abc123...',
+    reason: 'Deal fell through',         // optional
+    dealDescription: 'Widget purchase',   // optional
+    includeZeroBalance: false,            // optional (default: false)
+  }
+}
+// Returns: SendNoticesResult
 ```
 
 ### 9.3 New Permission Scopes
@@ -3721,6 +4051,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 'intent:return_invoice_payment'   // Return invoice payment intent
 'intent:set_auto_return'          // Set auto-return intent
 'intent:send_invoice_receipts'    // Send invoice receipts intent
+'intent:send_cancellation_notices' // Send cancellation notices intent
 ```
 
 ### 9.4 New Events (Connect push)
@@ -3745,6 +4076,8 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 'invoice:over_refund_warning' // Total returned exceeds total forwarded (informational)
 'invoice:receipt_sent'    // Receipt DMs sent after close/cancel
 'invoice:receipt_received' // Receipt DM received from a target
+'invoice:cancellation_sent' // Cancellation notice DMs sent after cancel
+'invoice:cancellation_received' // Cancellation notice DM received from a target
 ```
 
 ---
@@ -3786,11 +4119,12 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_INVALID_ID` | Invoice ID must be a 64-char hex string | Invalid invoiceId passed to buildInvoiceMemo |
 | `INVOICE_TOO_MANY_TARGETS` | Invoice exceeds maximum of 100 targets | Too many targets in CreateInvoiceRequest |
 | `INVOICE_TOO_MANY_ASSETS` | Target exceeds maximum of 50 assets | Too many assets in a single target |
-| `INVOICE_MEMO_TOO_LONG` | Memo exceeds maximum of 4096 characters | InvoiceTerms.memo or receipt options.memo too long |
+| `INVOICE_MEMO_TOO_LONG` | Memo exceeds maximum of 4096 characters | InvoiceTerms.memo, receipt options.memo, or cancellation options.reason/dealDescription too long |
 | `INVOICE_TERMS_TOO_LARGE` | Serialized invoice terms exceed 64 KB limit | Aggregate size of all targets, assets, memo, deliveryMethods too large |
 | `RATE_LIMITED` | Operation rate-limited, try again later | `setAutoReturn('*')` called within 5-second cooldown |
 | `INVOICE_NOT_TERMINATED` | Invoice must be closed or cancelled before sending receipts | `sendInvoiceReceipts()` on non-terminal invoice |
-| `COMMUNICATIONS_UNAVAILABLE` | CommunicationsModule is required for sending receipt DMs | `sendInvoiceReceipts()` without CommunicationsModule |
+| `INVOICE_NOT_CANCELLED` | Invoice must be cancelled before sending cancellation notices | `sendCancellationNotices()` on non-CANCELLED invoice |
+| `COMMUNICATIONS_UNAVAILABLE` | CommunicationsModule is required for sending DMs | `sendInvoiceReceipts()` or `sendCancellationNotices()` without CommunicationsModule |
 | `MODULE_DESTROYED` | AccountingModule is destroyed | Any public method called after `destroy()` completes |
 
 Note: `INVOICE_INVALID_ID` and `INVOICE_MINT_FAILED` are thrown from internal utilities (`buildInvoiceMemo` and the minting flow respectively), not from §8 validation tables. They are included here for completeness.
@@ -3808,6 +4142,7 @@ modules/accounting/
 +-- StatusComputer.ts      # Invoice status computation logic
 +-- AutoReturnManager.ts   # Auto-return logic for terminated invoices
 +-- ReceiptSender.ts       # Receipt DM composition and delivery
++-- CancellationNotifier.ts # Cancellation notice DM composition and delivery
 +-- memo.ts                # Memo parsing/building utilities
 +-- types.ts               # All type definitions (InvoiceTerms, CoinEntry, NFTEntry, etc.)
 +-- index.ts               # Barrel exports
@@ -3848,6 +4183,15 @@ Creator                    Aggregator              Payer
    | --- receipt DM (NIP-17) ----------------------> |
    | invoice:receipt_sent                            |
    |                          |                      | invoice:receipt_received
+   |                          |                      |
+   | --- OR if cancelled: ---                        |
+   |                          |                      |
+   | cancelInvoice(id)                               |
+   | invoice:cancelled                               |
+   | sendCancellationNotices(id, { reason, ... })    |
+   | --- cancellation DM (NIP-17) ----------------> |
+   | invoice:cancellation_sent                       |
+   |                          |                      | invoice:cancellation_received
 ```
 
 ## Appendix C: Exchange/Swap Scenario

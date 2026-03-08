@@ -20,6 +20,7 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 | **Non-blocking inbound observer** | Accounting errors during inbound transfer processing MUST NEVER break the token transfer flow. Inbound transfers are atomic — they either happen fully or not at all. The accounting module is a side-effect observer that processes inbound transfers after the fact. |
 | **Idempotent event re-firing** | The same event (with the same or updated `confirmed` flag) may fire multiple times for the same underlying transfer. Event consumers MUST be idempotent — handling a re-fired event must produce the same result as handling it once. This is the fundamental contract. |
 | **Receipt DMs are opt-in and best-effort** | Receipt DMs are sent explicitly by the target via `sendInvoiceReceipts()`, never automatically on close/cancel. Delivery is best-effort — failures for individual senders are collected but do not block others or affect invoice state. Receipts use `CommunicationsModule.sendDM()` (NIP-17 encrypted DMs) with an `invoice_receipt:` prefix for content sniffing. |
+| **Cancellation notice DMs are opt-in and best-effort** | Cancellation notices are sent explicitly by the target via `sendCancellationNotices()` after cancelling an invoice. Same delivery model as receipts — best-effort, failures collected in `failedNotices`. Uses `invoice_cancellation:` prefix for content sniffing. Only applicable to CANCELLED invoices (not CLOSED). |
 
 ## 2. Architecture Diagram
 
@@ -42,13 +43,14 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 |  |  Oracle         |            |  - setAutoReturn()              |  |
 |  |  (Aggregator)   |<-----------|  - getAutoReturnSettings()      |  |
 |  |                 |  mint      |  - sendInvoiceReceipts()        |  |
-|  |                 |            |  - getRelatedTransfers()        |  |
-|  +-----------------+            |  - parseInvoiceMemo()            |  |
+|  |                 |            |  - sendCancellationNotices()    |  |
+|  +-----------------+            |  - getRelatedTransfers()        |  |
+|                                 |  - parseInvoiceMemo()            |  |
 |                                 |  - load() / destroy()           |  |
 |  +------------------+  sendDM  |                                 |  |
-|  | Communications   |<---------|  (receipt DMs, optional)         |  |
+|  | Communications   |<---------|  (receipt/cancellation DMs)      |  |
 |  | Module           |  onDM    |                                 |  |
-|  | (optional)       |--------->|  (payer-side receipt detection)  |  |
+|  | (optional)       |--------->|  (payer-side DM detection)       |  |
 |  +------------------+          +-------+-------+-------+---------+  |
 |                                 |  TokenStorage  | StorageProvider |  |
 |                                 |  (per-address) | (per-address)   |  |
@@ -697,6 +699,8 @@ Added to `SphereEventType` and `SphereEventMap`:
 | `invoice:over_refund_warning` | `{ invoiceId, senderAddress, coinId, forwardedAmount, returnedAmount }` | Total returned to sender exceeds total forwarded — informational warning, transfer not blocked |
 | `invoice:receipt_sent` | `{ invoiceId, sent, failed }` | Receipt DMs sent after `sendInvoiceReceipts()` completes |
 | `invoice:receipt_received` | `{ invoiceId, receipt: IncomingInvoiceReceipt }` | Receipt DM received from a target (payer-side, detected via `invoice_receipt:` prefix) |
+| `invoice:cancellation_sent` | `{ invoiceId, sent, failed }` | Cancellation notice DMs sent after `sendCancellationNotices()` completes |
+| `invoice:cancellation_received` | `{ invoiceId, notice: IncomingCancellationNotice }` | Cancellation notice DM received from a target (payer-side, detected via `invoice_cancellation:` prefix) |
 
 **Event ordering guarantee:** `invoice:closed` fires BEFORE any `invoice:auto_returned` events, for both explicit close (via `closeInvoice()`) and implicit close (all targets covered + all confirmed). This ensures listeners can react to the close before seeing the auto-return consequences.
 
@@ -731,6 +735,7 @@ All events with a `confirmed` field follow this contract:
 | `return_invoice_payment` | Return modal | Return tokens for an invoice |
 | `set_auto_return` | Confirmation modal | Enable/disable auto-return |
 | `send_invoice_receipts` | Confirmation modal | Send receipt DMs to payers of a terminated invoice |
+| `send_cancellation_notices` | Confirmation modal | Send cancellation notice DMs to payers of a cancelled invoice |
 
 ### 8.3 New Permission Scopes
 
@@ -744,6 +749,7 @@ All events with a `confirmed` field follow this contract:
 | `intent:return_invoice_payment` | Return invoice payment intent |
 | `intent:set_auto_return` | Set auto-return intent |
 | `intent:send_invoice_receipts` | Send invoice receipts intent |
+| `intent:send_cancellation_notices` | Send cancellation notices intent |
 
 ## 9. Multi-Party Perspective
 
@@ -869,7 +875,7 @@ Sender receives the auto-return (INV:abc:RX):
 Recipient (alice) sends receipts after closing:
   -> sendInvoiceReceipts('abc', { memo: 'Thank you for your payment' })
   -> For each sender with non-zero frozen balance:
-     - Resolve DM recipient: contacts[0].address ?? senderAddress ?? skip
+     - Resolve DM recipient: contacts[0].address ?? senderAddress (only if not refund address) ?? skip
      - Build InvoiceReceiptPayload with per-asset breakdown
      - Send via CommunicationsModule.sendDM() (NIP-17 encrypted)
   -> Fires invoice:receipt_sent { invoiceId: 'abc', sent: 2, failed: 0 }
@@ -879,6 +885,25 @@ Sender receives the receipt DM:
   -> AccountingModule detects prefix, parses payload, validates
   -> Fires invoice:receipt_received { invoiceId: 'abc', receipt: ... }
   -> UI renders structured receipt (amount breakdown, memo, terminal state)
+
+--- Optional: Send cancellation notices after cancel ---
+
+Recipient (alice) sends cancellation notices after cancelling:
+  -> sendCancellationNotices('abc', {
+       reason: 'Deal fell through',
+       dealDescription: 'Widget purchase order #1234'
+     })
+  -> For each sender with non-zero frozen balance:
+     - Resolve DM recipient: contacts[0].address ?? senderAddress (only if not refund address) ?? skip
+     - Build InvoiceCancellationPayload with per-asset breakdown
+     - Send via CommunicationsModule.sendDM() (NIP-17 encrypted)
+  -> Fires invoice:cancellation_sent { invoiceId: 'abc', sent: 2, failed: 0 }
+
+Sender receives the cancellation notice DM:
+  -> CommunicationsModule delivers DM with 'invoice_cancellation:' prefix
+  -> AccountingModule detects prefix, parses payload, validates
+  -> Fires invoice:cancellation_received { invoiceId: 'abc', notice: ... }
+  -> UI renders structured notice (reason, deal description, contribution breakdown)
 ```
 
 ## 10. Error Handling
@@ -906,6 +931,11 @@ Sender receives the receipt DM:
 | Receipt send without CommunicationsModule | **Throw `COMMUNICATIONS_UNAVAILABLE`** — CommunicationsModule is required |
 | Receipt DM delivery failure (per-sender) | Collect in `failedReceipts` — does not throw, does not block other receipts |
 | Incoming receipt DM parse failure | Ignore silently — treat as regular DM, no error event |
+| Cancellation notice send to non-CANCELLED invoice | **Throw `INVOICE_NOT_CANCELLED`** — cancellation notices require CANCELLED state only |
+| Cancellation notice send without CommunicationsModule | **Throw `COMMUNICATIONS_UNAVAILABLE`** — CommunicationsModule is required |
+| Cancellation notice reason or deal description too long | **Throw `INVOICE_MEMO_TOO_LONG`** — max 4096 characters per field |
+| Cancellation notice DM delivery failure (per-sender) | Collect in `failedNotices` — does not throw, does not block other notices |
+| Incoming cancellation notice DM parse failure | Ignore silently — treat as regular DM, no error event |
 
 ## 11. Future Extensions
 
@@ -918,4 +948,4 @@ These are **not** in scope for v1 but inform the architecture:
 - **L1 payment matching**: Match L1 (ALPHA) transfers to invoice targets via L1 history
 - **Cross-chain invoices**: Targets on different chains/networks
 - **Invoice negotiation**: Counter-offers modifying invoice terms via transport messages
-- **Cancellation notices and payment reminders**: Use the `contacts` array (from `InvoiceSenderBalance`, accumulated from `inv.ct` on-chain payloads) to send structured messages to payers on cancellation (notice) or when payment is overdue (reminder). Contact resolution priority: `contacts[0].address → refundAddress → senderAddress → null`. The `contact.url` field enables delivery via non-Nostr transports (HTTPS webhooks, WebSocket endpoints). (Note: **Receipts** are now fully specified — see `sendInvoiceReceipts()` in ACCOUNTING-SPEC.md §2.1 and §4.10.)
+- **Payment reminders**: Use the `contacts` array (from `InvoiceSenderBalance`, accumulated from `inv.ct` on-chain payloads) to send structured reminder messages to payers when payment is overdue. Contact resolution priority: `contacts[0].address → senderAddress → null`. The `contact.url` field enables delivery via non-Nostr transports (HTTPS webhooks, WebSocket endpoints). (Note: **Receipts** and **cancellation notices** are now fully specified — see `sendInvoiceReceipts()` and `sendCancellationNotices()` in ACCOUNTING-SPEC.md §2.1, §4.10, and §4.11.)
