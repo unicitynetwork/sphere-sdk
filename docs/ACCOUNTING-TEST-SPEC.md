@@ -86,37 +86,45 @@ Each mock implements the full interface of its target to avoid partial stub issu
 #### MockStorageProvider
 
 ```typescript
-// Returns a mock with:
+// Returns a mock with (matches StorageProvider interface):
+// - setIdentity(identity): void
 // - get(key): Promise<string | null>
 // - set(key, value): Promise<void>
 // - remove(key): Promise<void>
 // - has(key): Promise<boolean>
-// - clear(): Promise<void>
+// - keys(prefix?): Promise<string[]>
+// - clear(prefix?): Promise<void>
+// - saveTrackedAddresses(entries): Promise<void>
+// - loadTrackedAddresses(): Promise<TrackedAddressEntry[]>
 // (all operations backed by Map<string, string> for deterministic tests)
 ```
 
 #### MockTokenStorageProvider
 
 ```typescript
-// Returns a mock with:
-// - loadTokens(): Promise<Token[]>
-// - saveToken(token): Promise<void>
-// - addToken(token): Promise<void>
-// - removeToken(tokenId): Promise<void>
-// - archiveToken(tokenId): Promise<void>
-// - clear(): Promise<void>
+// Returns a mock with (matches TokenStorageProvider interface):
+// - setIdentity(identity): void
+// - initialize(): Promise<boolean>
+// - shutdown(): Promise<void>
+// - save(data): Promise<SaveResult>
+// - load(identifier?): Promise<LoadResult>
+// - sync(localData): Promise<SyncResult>
+// - addHistoryEntry?(entry): Promise<void>
+// - getHistoryEntries?(): Promise<HistoryRecord[]>
+// (AccountingModule uses save/load for token persistence, addHistoryEntry for history)
 ```
 
 #### MockCommunicationsModule
 
 ```typescript
 // Returns a mock with:
-// - sendDM(recipient, content): Promise<{ eventId: string }>
+// - sendDM(recipient, content): Promise<DirectMessage>
 // - getConversation(peer): DirectMessage[]
 // - on(event, handler): () => void (supports 'message:dm' event emission)
+// - onDirectMessage(handler): () => void (unsubscribe)
 // - emit(event, data): void (for test DM injection)
-// NOTE: emit() must invoke all handlers registered via on('message:dm', handler).
-// Use an internal EventEmitter to connect emit() → on() subscriptions.
+// NOTE: emit() must invoke all handlers registered via on('message:dm', handler)
+// and onDirectMessage(handler). Use an internal EventEmitter to connect them.
 ```
 
 ### 2.2 Test Fixtures
@@ -1064,8 +1072,8 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-AUTORET-009: getAutoReturnSettings() initial state before any setAutoReturn()
 - **Preconditions:** Module loaded; no setAutoReturn() calls made
 - **Action:** `getAutoReturnSettings()`
-- **Expected:** Returns { global: undefined } (no global setting); per-invoice queries return undefined
-- **Spec ref:** §2.1 getAutoReturnSettings() "returns undefined for unset settings"
+- **Expected:** Returns { global: false, perInvoice: {} } (default disabled, no per-invoice overrides)
+- **Spec ref:** §1.4 AutoReturnSettings interface
 
 ---
 
@@ -1247,6 +1255,18 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Expected:** Event fired with reason 'no_coin_data'
 - **Spec ref:** §5.3 empty coinData handling
 
+#### UT-EVENTS-016b: invoice:irrelevant with reason 'unknown_asset'
+- **Preconditions:** Module with invoice targeting UCT; transfer to correct target address with unknown coinId 'XYZ'
+- **Action:** Receive transfer
+- **Expected:** Event fired with reason 'unknown_asset'
+- **Spec ref:** §6.2 step 6b irrelevant classification
+
+#### UT-EVENTS-016c: invoice:irrelevant with reason 'unknown_address_and_asset'
+- **Preconditions:** Module with invoice; transfer to unknown address with unknown coinId
+- **Action:** Receive transfer
+- **Expected:** Event fired with reason 'unknown_address_and_asset'
+- **Spec ref:** §6.2 step 6b irrelevant classification
+
 #### UT-EVENTS-017: invoice:auto_returned fires on successful auto-return
 - **Preconditions:** Module with invoice, terminal state, auto-return enabled, balance available
 - **Action:** Trigger implicit auto-return via terminal state trigger
@@ -1258,6 +1278,12 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Action:** Trigger inbound transfer causing auto-return attempt
 - **Expected:** Event fired with { invoiceId, transferId, reason: 'send_failed' } where transferId is the original inbound transfer's ID
 - **Spec ref:** §6.1 invoice:auto_return_failed payload
+
+#### UT-EVENTS-018b: invoice:auto_return_failed fires with reason 'max_retries_exceeded'
+- **Preconditions:** Module with invoice, auto-return enabled; PaymentsModule.send() fails repeatedly, exhausting retry limit (3 retries per §3.2 step 7)
+- **Action:** Trigger inbound transfer causing auto-return attempt; all retries fail
+- **Expected:** Event fired with { invoiceId, transferId, reason: 'max_retries_exceeded' }
+- **Spec ref:** §6.1 invoice:auto_return_failed reason values
 
 #### UT-EVENTS-019: Repeated transfer delivery does not double-count balance (events fire twice)
 - **Preconditions:** Module with invoice
@@ -1658,9 +1684,9 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 #### UT-STORAGE-007: Exact storage key strings verified
 - **Preconditions:** N/A
-- **Action:** Verify that all storage keys use exact format: `closed_invoices`, `cancelled_invoices`, `frozen_balances` (single global key holding Record<string, FrozenInvoiceBalances>), `inv_ledger:{id}`, `inv_ledger_index`, `token_scan_state`, `auto_return_settings`, `auto_return_dedup_ledger`, etc.
+- **Action:** Verify that all storage keys use exact format: `closed_invoices`, `cancelled_invoices`, `frozen_balances` (single global key holding Record<string, FrozenInvoiceBalances>), `inv_ledger:{id}`, `inv_ledger_index`, `token_scan_state`, `auto_return`, `auto_return_ledger`, etc.
 - **Expected:** Keys match specification exactly
-- **Spec ref:** §7.6
+- **Spec ref:** §7.2
 
 #### UT-STORAGE-008: inv_ledger_index corruption → rebuild from inv_ledger:* keys
 - **Preconditions:** Storage has inv_ledger:* keys but index is corrupted
@@ -2312,7 +2338,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 | returnInvoicePayment() | 7 | Balance validation + terminal state semantics |
 | setAutoReturn() / getAutoReturnSettings() | 9 | Global + per-invoice + cooldown + synchronous + initial state |
 | Memo Encoding/Decoding | 11 | All direction codes + parse/build + normalization + legacy fallback |
-| Events (Idempotency & Firing) | 26 | All 19 event types (including unknown_reference + over_refund_warning + back direction) |
+| Events (Idempotency & Firing) | 29 | All 19 event types + all irrelevant reasons + all auto_return_failed reasons |
 | On-Chain Message Decoding | 11 | Type guards + control character stripping + truncation |
 | Token Minting Internals | 10 | Determinism + serialization + REQUEST_ID_EXISTS |
 | Invoice-Transfer Index | 11 | Cold-start + watermark + dedup + caps + error isolation |
@@ -2324,7 +2350,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 | sendCancellationNotices() | 14 | Happy path + error paths + reason/deal validation + NOT_CANCELLED for all non-cancelled states |
 | getRelatedTransfers() | 6 | Query + irrelevant + empty + multi-coin + post-termination |
 | CLI Integration | 33 | All 14 CLI commands (30 tests) + 3 security tests |
-| **Unit Tests Total** | **~308** | All 17 public methods + all error paths |
+| **Unit Tests Total** | **311** | All 17 public methods + all error paths |
 | **E2E Integration Tests** | **1 specified + planned** | Full workflow IT-LIFECYCLE-001; §4.2–4.10 planned |
 | **E2E CLI Tests** | **Planned** | Pending expansion |
 | **Concurrency Tests** | **8** | Gate serialization + race conditions + timeout |

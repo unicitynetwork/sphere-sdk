@@ -1709,7 +1709,7 @@ function buildInvoiceMemo(
 ): string {
   // MUST validate invoiceId format to prevent memo injection
   if (!INVOICE_ID_REGEX.test(invoiceId)) {
-    throw new SphereError('INVOICE_INVALID_ID', 'Invoice ID must be a 64-char hex string');
+    throw new SphereError('Invoice ID must be a 64-char hex string', 'INVOICE_INVALID_ID');
   }
   const dirMap = {
     forward: ':F',
@@ -1807,7 +1807,7 @@ function parseInvoiceMemoForOnChain(
 ```
 
 **This change applies to ALL transfer paths in PaymentsModule:**
-- `PaymentsModule.createTransferCommitment()` (direct send)
+- `PaymentsModule.createSdkCommitment()` (direct send)
 - `TokenSplitExecutor.execute()` (split-and-send)
 - `InstantSplitExecutor.createTransferCommitmentFromMintData()` (V5 instant split)
 
@@ -2366,7 +2366,7 @@ async processTokenTransactions(token: Token, startIndex: number): Promise<Invoic
        // aggregate coverage computation.
        // ADDRESS DERIVATION: Same logic as PaymentsModule's private
        // createDirectAddressFromPubkey() — calls
-       // UnmaskedPredicateReference.create(tokenType, 'secp256k1', pubkeyBytes).toString().
+       // UnmaskedPredicateReference.create(tokenType, algorithm, pubkeyBytes, HashAlgorithm.SHA256).toString().
        // AccountingModule inlines this derivation (3 lines) rather than depending on
        // PaymentsModule internals. Produces the same DIRECT:// format as
        // genesis.data.recipient for the same public key. No normalization needed.
@@ -2691,7 +2691,7 @@ All state-mutating operations on a given invoice are serialized through a **per-
 private readonly invoiceGates = new Map<string, Promise<void>>();
 
 private async withInvoiceGate(invoiceId: string, fn: () => Promise<void>): Promise<void> {
-  if (this.destroyed) throw new SphereError('MODULE_DESTROYED', 'AccountingModule is destroyed');
+  if (this.destroyed) throw new SphereError('AccountingModule is destroyed', 'MODULE_DESTROYED');
   const prev = this.invoiceGates.get(invoiceId) ?? Promise.resolve();
   // Chain fn after previous operation completes. Use .then(run, run) to ensure
   // fn executes even if the prior operation rejected — each gate entry runs
@@ -2962,8 +2962,8 @@ updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` a
 
 'invoice:return_received': {
   invoiceId: string;
-  transfer: InvoiceTransferRef;           // the received :RC or :RX transfer
-  returnReason: 'closed' | 'cancelled';   // derived from :RC or :RX
+  transfer: InvoiceTransferRef;           // the received :B, :RC, or :RX transfer
+  returnReason: 'manual' | 'closed' | 'cancelled';  // :B → 'manual', :RC → 'closed', :RX → 'cancelled'
 };
 
 'invoice:over_refund_warning': {
@@ -3887,6 +3887,11 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 // Returns: InvoiceRef[] (without computed status)
 // Params: GetInvoicesOptions (optional)
 // Requires: invoice:read permission scope
+//
+// NOTE: When state filters are provided, this query internally calls
+// getInvoiceStatus() for each invoice to evaluate filter predicates.
+// This triggers the same implicit close side effect as sphere_getInvoiceStatus.
+// The same rate-limiting guidance applies (see sphere_getInvoiceStatus below).
 {
   method: 'sphere_getInvoices',
   params: { state: 'OPEN', createdByMe: true, limit: 10 }
@@ -4103,7 +4108,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 
 ## 10. Error Codes
 
-All errors use `SphereError` with the following codes:
+All errors use `SphereError` with the following codes. **Implementation note:** All codes listed below must be added to the `SphereErrorCode` union type in `core/errors.ts` before use — TypeScript will reject unknown string literals.
 
 | Code | Message | When |
 |------|---------|------|
