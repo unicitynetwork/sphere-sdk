@@ -64,6 +64,7 @@ import {
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // Instant split imports
 import { InstantSplitExecutor } from './InstantSplitExecutor';
@@ -1005,6 +1006,9 @@ export class PaymentsModule {
 
       const transferMode = request.transferMode ?? 'instant';
 
+      // Encode invoice memo into on-chain message bytes (null for non-invoice memos)
+      const onChainMessage = parseInvoiceMemoForOnChain(request.memo);
+
       if (transferMode === 'conservative') {
         // =================================================================
         // CONSERVATIVE MODE: each token sent individually with full proofs
@@ -1025,6 +1029,7 @@ export class PaymentsModule {
             splitPlan.remainderAmount!,
             splitPlan.coinId,
             recipientAddress,
+            onChainMessage,
           );
 
           // Save change token
@@ -1070,7 +1075,7 @@ export class PaymentsModule {
         // Transfer direct tokens
         for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
           const token = tokenWithAmount.uiToken;
-          const commitment = await this.createSdkCommitment(token, recipientAddress, signingService);
+          const commitment = await this.createSdkCommitment(token, recipientAddress, signingService, onChainMessage);
 
           logger.debug('Payments', `CONSERVATIVE: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
 
@@ -1133,6 +1138,7 @@ export class PaymentsModule {
             recipientAddress,
             {
               memo: request.memo,
+              message: onChainMessage,
               onChangeTokenCreated: async (changeToken) => {
                 const changeTokenData = changeToken.toJSON();
                 // Remove placeholder — it was a temporary UI stand-in
@@ -1167,7 +1173,7 @@ export class PaymentsModule {
         // 2. Prepare direct token entries in parallel — does NOT send
         const directCommitments = await Promise.all(
           splitPlan.tokensToTransferDirectly.map(tw =>
-            this.createSdkCommitment(tw.uiToken, recipientAddress, signingService)
+            this.createSdkCommitment(tw.uiToken, recipientAddress, signingService, onChainMessage)
           )
         );
 
@@ -1432,6 +1438,9 @@ export class PaymentsModule {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const devMode = options?.devMode ?? (this.deps!.oracle as any).isDevMode?.() ?? false;
 
+      // Encode invoice memo into on-chain message bytes (null for non-invoice memos)
+      const onChainMessage = parseInvoiceMemoForOnChain(request.memo);
+
       // Create instant split executor
       const executor = new InstantSplitExecutor({
         stateTransitionClient: stClient,
@@ -1452,6 +1461,7 @@ export class PaymentsModule {
         {
           ...options,
           memo: request.memo,
+          message: onChainMessage,
           onChangeTokenCreated: async (changeToken) => {
             // Save change token when background completes
             const changeTokenData = changeToken.toJSON();
@@ -4475,7 +4485,8 @@ export class PaymentsModule {
   private async createSdkCommitment(
     token: Token,
     recipientAddress: IAddress,
-    signingService: SigningService
+    signingService: SigningService,
+    message?: Uint8Array | null
   ): Promise<TransferCommitment> {
     // Parse SDK token from stored data
     const tokenData = token.sdkData
@@ -4492,8 +4503,8 @@ export class PaymentsModule {
       sdkToken,
       recipientAddress,
       salt,
-      null, // recipientData
       null, // recipientDataHash
+      message ?? null, // on-chain message (invoice memo bytes, or null)
       signingService
     );
 

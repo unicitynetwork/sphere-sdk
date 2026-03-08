@@ -189,6 +189,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     nametag: options?.nametag,
     market: true,
     groupChat: true,
+    accounting: true,
   });
 
   sphereInstance = result.sphere;
@@ -345,6 +346,44 @@ MARKET (Intent Bulletin Board):
   market-feed                         Watch the live listing feed (WebSocket)
                                       --rest              Use REST fallback instead of WebSocket
 
+INVOICES (Accounting):
+  invoice-create [options]            Create a new invoice
+                                      --target <address>  Target address
+                                      --coin <id>         Coin ID (e.g., UCT)
+                                      --amount <value>    Requested amount
+                                      --nft <id>          NFT token ID
+                                      --due <ISO-date>    Due date
+                                      --memo <text>       Invoice memo
+                                      --delivery <method> Delivery method
+                                      --terms <json-file> Load full terms from JSON file
+  invoice-import <token-file>         Import an invoice from a token file
+  invoice-list [options]              List invoices
+                                      --state <states>    Filter by state (OPEN,PARTIAL,etc.)
+                                      --limit <n>         Max results
+                                      --json              Output as JSON array
+  invoice-status <id-or-prefix>       Show invoice status and balances
+                                      --json              Output as JSON
+  invoice-close <id-or-prefix>        Close an invoice
+                                      --auto-return       Trigger auto-return on close
+  invoice-cancel <id-or-prefix>       Cancel an invoice (as target)
+  invoice-pay <id-or-prefix> [amount] Pay an invoice
+                                      --amount <value>    Amount to pay (default: remaining)
+                                      --target-index <n>  Target index for multi-target
+  invoice-return <id-or-prefix>       Return payment to sender
+                                      --recipient <addr>  Recipient address (required)
+                                      --amount <value>    Amount to return (required)
+                                      --coin <id>         Coin ID (required)
+  invoice-receipts <id-or-prefix>     Send receipts for a terminated invoice
+  invoice-notices <id-or-prefix>      Send cancellation notices
+  invoice-auto-return [options]       Show/set auto-return settings
+                                      --enable            Enable auto-return
+                                      --disable           Disable auto-return
+                                      --invoice <id>      Target specific invoice
+  invoice-transfers <id-or-prefix>    List invoice transfers chronologically
+                                      --json              Output as JSON array
+  invoice-export <id-or-prefix>       Export invoice to JSON file
+  invoice-parse-memo <memo-string>    Parse an invoice memo string
+
 EVENT DAEMON:
   daemon start [options]              Start persistent event listener
                                       --config <path>    Config file (default: .sphere-cli/daemon.json)
@@ -427,6 +466,15 @@ Market Examples:
   npm run cli -- market-close <id>                                   Close an intent
   npm run cli -- market-feed                                         Watch live feed
   npm run cli -- market-feed --rest                                  Fetch recent (REST fallback)
+
+Invoice Examples:
+  npm run cli -- invoice-create --target @alice --coin UCT --amount 10.00
+  npm run cli -- invoice-create --terms invoice-terms.json
+  npm run cli -- invoice-list --state OPEN,PARTIAL --limit 5
+  npm run cli -- invoice-status a1b2c3d4
+  npm run cli -- invoice-pay a1b2c3d4 --amount 5.00
+  npm run cli -- invoice-close a1b2c3d4 --auto-return
+  npm run cli -- invoice-parse-memo "INV:a1b2c3d4...:F"
 
 Daemon Examples:
   npm run cli -- daemon start --event transfer:incoming --action auto-receive
@@ -2368,6 +2416,551 @@ async function main() {
           // Prevent the process from exiting
           await new Promise(() => {});
         }
+        break;
+      }
+
+      // =================================================================
+      // INVOICE MANAGEMENT (AccountingModule)
+      // =================================================================
+
+      case 'invoice-create': {
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled. Initialize with accounting support.');
+          process.exit(1);
+        }
+
+        // Parse options
+        const targetIdx = args.indexOf('--target');
+        const coinIdx = args.indexOf('--coin');
+        const amountIdx = args.indexOf('--amount');
+        const nftIdx = args.indexOf('--nft');
+        const dueIdx = args.indexOf('--due');
+        const memoIdx = args.indexOf('--memo');
+        const deliveryIdx = args.indexOf('--delivery');
+        const termsIdx = args.indexOf('--terms');
+
+        if (termsIdx !== -1 && args[termsIdx + 1]) {
+          // Load terms from JSON file
+          const termsFile = args[termsIdx + 1];
+          let termsJson: unknown;
+          try {
+            const resolvedPath = path.resolve(termsFile);
+            const raw = fs.readFileSync(resolvedPath, 'utf8');
+            termsJson = JSON.parse(raw);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            // Sanitize: only show whether it was a file read or JSON parse error
+            if (msg.includes('ENOENT')) {
+              console.error(`File not found: "${termsFile}"`);
+            } else if (msg.includes('EACCES') || msg.includes('EPERM')) {
+              console.error(`Access denied: "${termsFile}"`);
+            } else if (msg.includes('Unexpected token') || msg.includes('JSON')) {
+              console.error(`Invalid JSON in terms file "${termsFile}"`);
+            } else {
+              console.error(`Failed to read terms file "${termsFile}"`);
+            }
+            process.exit(1);
+          }
+          const result = await sphere.accounting.createInvoice(termsJson as import('../modules/accounting/types').CreateInvoiceRequest);
+          console.log('Invoice created:');
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          // Build from individual options
+          if (targetIdx === -1 || !args[targetIdx + 1]) {
+            console.error('Usage: invoice-create --target <address> --coin <id> --amount <value> [--nft <id>] [--due <ISO-date>] [--memo <text>] [--delivery <method>] [--terms <json-file>]');
+            process.exit(1);
+          }
+          const targetAddress = args[targetIdx + 1];
+          const coinId = coinIdx !== -1 ? args[coinIdx + 1] : undefined;
+          const amount = amountIdx !== -1 ? args[amountIdx + 1] : undefined;
+          const nftId = nftIdx !== -1 ? args[nftIdx + 1] : undefined;
+          const dueDate = dueIdx !== -1 ? new Date(args[dueIdx + 1]).getTime() : undefined;
+          const memo = memoIdx !== -1 ? args[memoIdx + 1] : undefined;
+          const delivery = deliveryIdx !== -1 ? args[deliveryIdx + 1] : undefined;
+
+          const assets: import('../modules/accounting/types').InvoiceRequestedAsset[] = [];
+          if (coinId && amount) {
+            assets.push({ coin: [coinId, amount] });
+          } else if (nftId) {
+            assets.push({ nft: { tokenId: nftId } });
+          }
+
+          const request: import('../modules/accounting/types').CreateInvoiceRequest = {
+            targets: [{ address: targetAddress, assets }],
+            dueDate,
+            memo,
+            deliveryMethods: delivery ? [delivery] : undefined,
+          };
+          const result = await sphere.accounting.createInvoice(request);
+          console.log('Invoice created:');
+          console.log(JSON.stringify(result, null, 2));
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-import': {
+        const tokenFile = args[1];
+        if (!tokenFile) {
+          console.error('Usage: invoice-import <token-file>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        let tokenJson: unknown;
+        try {
+          tokenJson = JSON.parse(fs.readFileSync(path.resolve(tokenFile), 'utf8'));
+        } catch (err) {
+          console.error(`Failed to read token file "${tokenFile}": ${err instanceof Error ? err.message : err}`);
+          process.exit(1);
+        }
+
+        const terms = await sphere.accounting.importInvoice(tokenJson as import('../types/txf').TxfToken);
+        console.log('Invoice imported:');
+        console.log(JSON.stringify(terms, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-list': {
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const stateIdx = args.indexOf('--state');
+        const createdByMe = args.includes('--role') && args[args.indexOf('--role') + 1] === 'creator';
+        const targetingMe = args.includes('--role') && args[args.indexOf('--role') + 1] === 'payer';
+        const stateFilter = stateIdx !== -1 ? args[stateIdx + 1] : undefined;
+
+        const options: import('../modules/accounting/types').GetInvoicesOptions = {};
+        if (createdByMe) options.createdByMe = true;
+        if (targetingMe) options.targetingMe = true;
+        if (stateFilter) options.state = stateFilter as import('../modules/accounting/types').InvoiceState;
+
+        const invoices = await sphere.accounting.getInvoices(options);
+
+        if (invoices.length === 0) {
+          console.log('No invoices found.');
+        } else {
+          console.log(`Invoices (${invoices.length}):`);
+          console.log('─'.repeat(60));
+          for (const inv of invoices) {
+            console.log(`ID:        ${inv.invoiceId}`);
+            console.log(`Creator:   ${inv.isCreator ? 'yes' : 'no'}`);
+            console.log(`Cancelled: ${inv.cancelled}`);
+            console.log(`Closed:    ${inv.closed}`);
+            if (inv.terms.dueDate) console.log(`Due:       ${new Date(inv.terms.dueDate).toISOString()}`);
+            if (inv.terms.memo) console.log(`Memo:      ${inv.terms.memo}`);
+            console.log('─'.repeat(60));
+          }
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-status': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-status <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        // Resolve ID from prefix
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices. Use more characters.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const status = await sphere.accounting.getInvoiceStatus(invoiceId);
+        console.log('Invoice Status:');
+        console.log(JSON.stringify(status, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-close': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-close <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        await sphere.accounting.closeInvoice(invoiceId);
+        console.log(`Invoice ${invoiceId} closed.`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-cancel': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-cancel <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        await sphere.accounting.cancelInvoice(invoiceId);
+        console.log(`Invoice ${invoiceId} cancelled.`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-pay': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-pay <id-or-prefix> [--amount <value>] [--target-index <n>]');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const amountIdx2 = args.indexOf('--amount');
+        const targetIndexIdx = args.indexOf('--target-index');
+
+        const payParams: import('../modules/accounting/types').PayInvoiceParams = {
+          targetIndex: targetIndexIdx !== -1 ? parseInt(args[targetIndexIdx + 1]) : 0,
+        };
+        if (amountIdx2 !== -1 && args[amountIdx2 + 1]) payParams.amount = args[amountIdx2 + 1];
+
+        const result = await sphere.accounting.payInvoice(invoiceId, payParams);
+        console.log('Payment result:');
+        console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-return': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-return <id-or-prefix> --recipient <address> --amount <value> --coin <id>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const recipientIdx = args.indexOf('--recipient');
+        const amountIdx3 = args.indexOf('--amount');
+        const coinIdx3 = args.indexOf('--coin');
+
+        if (recipientIdx === -1 || !args[recipientIdx + 1]) {
+          console.error('--recipient <address> is required for invoice-return');
+          process.exit(1);
+        }
+        if (amountIdx3 === -1 || !args[amountIdx3 + 1]) {
+          console.error('--amount <value> is required for invoice-return');
+          process.exit(1);
+        }
+        if (coinIdx3 === -1 || !args[coinIdx3 + 1]) {
+          console.error('--coin <id> is required for invoice-return');
+          process.exit(1);
+        }
+
+        const returnParams: import('../modules/accounting/types').ReturnPaymentParams = {
+          recipient: args[recipientIdx + 1],
+          amount: args[amountIdx3 + 1],
+          coinId: args[coinIdx3 + 1],
+        };
+
+        const result = await sphere.accounting.returnInvoicePayment(invoiceId, returnParams);
+        console.log('Return payment result:');
+        console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-receipts': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-receipts <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const result = await sphere.accounting.sendInvoiceReceipts(invoiceId);
+        console.log('Receipts result:');
+        console.log(JSON.stringify(result, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-notices': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-notices <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const result = await sphere.accounting.sendCancellationNotices(invoiceId);
+        console.log('Cancellation notices result:');
+        console.log(JSON.stringify(result, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-auto-return': {
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const enableFlag = args.includes('--enable');
+        const disableFlag = args.includes('--disable');
+        const invoiceIdx = args.indexOf('--invoice');
+        const specificInvoice = invoiceIdx !== -1 ? args[invoiceIdx + 1] : undefined;
+
+        if (!enableFlag && !disableFlag) {
+          // Show current settings
+          const settings = sphere.accounting.getAutoReturnSettings();
+          console.log('Auto-return settings:');
+          console.log(JSON.stringify(settings, null, 2));
+        } else if (enableFlag && disableFlag) {
+          console.error('Cannot use both --enable and --disable');
+          process.exit(1);
+        } else {
+          const enabled = enableFlag;
+          const invoiceId = specificInvoice ?? '*';
+          await sphere.accounting.setAutoReturn(invoiceId, enabled);
+          const scope = invoiceId === '*' ? 'globally' : `for invoice ${invoiceId}`;
+          console.log(`Auto-return ${enabled ? 'enabled' : 'disabled'} ${scope}.`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-transfers': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-transfers <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const transfers = sphere.accounting.getRelatedTransfers(invoiceId);
+        if (transfers.length === 0) {
+          console.log('No related transfers found.');
+        } else {
+          console.log(`Related transfers (${transfers.length}):`);
+          console.log(JSON.stringify(transfers, null, 2));
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-export': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-export <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        // Get the invoice ref via getInvoice
+        const invoiceRef = sphere.accounting.getInvoice(invoiceId);
+        if (!invoiceRef) {
+          console.error(`Invoice ${invoiceId} not found in memory.`);
+          process.exit(1);
+        }
+
+        const outFile = `invoice-${invoiceId.slice(0, 8)}.json`;
+        fs.writeFileSync(outFile, JSON.stringify(invoiceRef, null, 2));
+        console.log(`Invoice exported to: ${outFile}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-parse-memo': {
+        const memoStr = args[1];
+        if (!memoStr) {
+          console.error('Usage: invoice-parse-memo <memo-string>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const parsed = sphere.accounting.parseInvoiceMemo(memoStr);
+        if (!parsed) {
+          console.log('Not a valid invoice memo.');
+        } else {
+          console.log('Parsed invoice memo:');
+          console.log(JSON.stringify(parsed, null, 2));
+        }
+
+        await closeSphere();
         break;
       }
 

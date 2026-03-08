@@ -66,6 +66,8 @@ import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
 import type { GroupChatModuleConfig } from '../modules/groupchat';
 import { MarketModule, createMarketModule } from '../modules/market';
 import type { MarketModuleConfig } from '../modules/market';
+import { AccountingModule, createAccountingModule } from '../modules/accounting';
+import type { AccountingModuleConfig } from '../modules/accounting';
 import {
   STORAGE_KEYS_GLOBAL,
   getAddressId,
@@ -189,6 +191,8 @@ export interface SphereCreateOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  accounting?: AccountingModuleConfig | boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -228,6 +232,8 @@ export interface SphereLoadOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  accounting?: AccountingModuleConfig | boolean;
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
   password?: string;
   /**
@@ -275,6 +281,8 @@ export interface SphereImportOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  accounting?: AccountingModuleConfig | boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
   password?: string;
   /**
@@ -337,6 +345,8 @@ export interface SphereInitOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  accounting?: AccountingModuleConfig | boolean;
   /** Optional password to encrypt/decrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -439,6 +449,7 @@ export class Sphere {
   private _communications: CommunicationsModule;
   private _groupChat: GroupChatModule | null = null;
   private _market: MarketModule | null = null;
+  private _accounting: AccountingModule | null = null;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -461,6 +472,7 @@ export class Sphere {
     priceProvider?: PriceProvider,
     groupChatConfig?: GroupChatModuleConfig,
     marketConfig?: MarketModuleConfig,
+    accountingConfig?: AccountingModuleConfig,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -476,6 +488,7 @@ export class Sphere {
     this._communications = createCommunicationsModule();
     this._groupChat = groupChatConfig ? createGroupChatModule(groupChatConfig) : null;
     this._market = marketConfig ? createMarketModule(marketConfig) : null;
+    this._accounting = accountingConfig ? createAccountingModule(accountingConfig) : null;
   }
 
   // ===========================================================================
@@ -552,6 +565,7 @@ export class Sphere {
     // Resolve groupChat config: true → use network-default relays
     const groupChat = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const market = Sphere.resolveMarketConfig(options.market);
+    const accounting = Sphere.resolveAccountingConfig(options.accounting);
 
     const walletExists = await Sphere.exists(options.storage);
 
@@ -566,6 +580,7 @@ export class Sphere {
         price: options.price,
         groupChat,
         market,
+        accounting,
         password: options.password,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
@@ -602,6 +617,7 @@ export class Sphere {
       price: options.price,
       groupChat,
       market,
+      accounting,
       password: options.password,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
@@ -653,6 +669,20 @@ export class Sphere {
   }
 
   /**
+   * Resolve accounting module config from Sphere.init() options.
+   * - `true` → enable with defaults
+   * - `AccountingModuleConfig` → pass through
+   * - `false`/`undefined` → no accounting module
+   */
+  private static resolveAccountingConfig(
+    config: AccountingModuleConfig | boolean | undefined,
+  ): AccountingModuleConfig | undefined {
+    if (config === false || config === undefined) return undefined;
+    if (config === true) return {};
+    return config;
+  }
+
+  /**
    * Configure TokenRegistry in the main bundle context.
    *
    * The provider factory functions (createBrowserProviders / createNodeProviders)
@@ -694,6 +724,7 @@ export class Sphere {
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
+    const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
 
     const sphere = new Sphere(
       options.storage,
@@ -704,6 +735,7 @@ export class Sphere {
       options.price,
       groupChatConfig,
       marketConfig,
+      accountingConfig,
     );
     sphere._password = options.password ?? null;
 
@@ -787,6 +819,7 @@ export class Sphere {
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
+    const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
 
     const sphere = new Sphere(
       options.storage,
@@ -797,6 +830,7 @@ export class Sphere {
       options.price,
       groupChatConfig,
       marketConfig,
+      accountingConfig,
     );
     sphere._password = options.password ?? null;
 
@@ -897,6 +931,7 @@ export class Sphere {
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
+    const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
 
     const sphere = new Sphere(
       options.storage,
@@ -907,6 +942,7 @@ export class Sphere {
       options.price,
       groupChatConfig,
       marketConfig,
+      accountingConfig,
     );
     sphere._password = options.password ?? null;
 
@@ -1138,6 +1174,11 @@ export class Sphere {
   /** Market module (intent bulletin board). Null if not configured. */
   get market(): MarketModule | null {
     return this._market;
+  }
+
+  /** Accounting module (invoicing). Null if not configured. */
+  get accounting(): AccountingModule | null {
+    return this._accounting;
   }
 
   // ===========================================================================
@@ -2244,10 +2285,38 @@ export class Sphere {
       emitEvent,
     });
 
+    if (this._accounting) {
+      const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
+      if (accountingTokenStorage) {
+        // Resolve trustBase from oracle for invoice proof verification
+        let trustBase: Uint8Array = new Uint8Array();
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          trustBase = (this._oracle as any).getTrustBase?.() ?? new Uint8Array();
+        } catch {
+          // Oracle may not support getTrustBase — accounting will work without proof verification
+        }
+
+        this._accounting.initialize({
+          payments: this._payments,
+          tokenStorage: accountingTokenStorage,
+          oracle: this._oracle,
+          trustBase,
+          identity: this._identity!,
+          getActiveAddresses: () => this.getActiveAddresses(),
+          emitEvent,
+          on: this.on.bind(this),
+          storage: this._storage,
+          communications: this._communications,
+        });
+      }
+    }
+
     await this._payments.load();
     await this._communications.load();
     await this._groupChat?.load();
     await this._market?.load();
+    await this._accounting?.load();
 
     // After loading from local storage, sync with remote (IPFS) to restore
     // tokens that exist remotely but not locally (e.g. after address switch
@@ -3393,6 +3462,7 @@ export class Sphere {
     this._communications.destroy();
     this._groupChat?.destroy();
     this._market?.destroy();
+    this._accounting?.destroy();
 
     await this._transport.disconnect();
     await this._storage.disconnect();
@@ -3825,10 +3895,38 @@ export class Sphere {
       emitEvent,
     });
 
+    if (this._accounting) {
+      const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
+      if (accountingTokenStorage) {
+        // Resolve trustBase from oracle for invoice proof verification
+        let trustBase: Uint8Array = new Uint8Array();
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          trustBase = (this._oracle as any).getTrustBase?.() ?? new Uint8Array();
+        } catch {
+          // Oracle may not support getTrustBase — accounting will work without proof verification
+        }
+
+        this._accounting.initialize({
+          payments: this._payments,
+          tokenStorage: accountingTokenStorage,
+          oracle: this._oracle,
+          trustBase,
+          identity: this._identity!,
+          getActiveAddresses: () => this.getActiveAddresses(),
+          emitEvent,
+          on: this.on.bind(this),
+          storage: this._storage,
+          communications: this._communications,
+        });
+      }
+    }
+
     await this._payments.load();
     await this._communications.load();
     await this._groupChat?.load();
     await this._market?.load();
+    await this._accounting?.load();
   }
 
   // ===========================================================================
