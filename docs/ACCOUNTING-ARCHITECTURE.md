@@ -15,7 +15,7 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 | **Invoice IS a token** | An invoice is a minted on-chain token — the invoice terms live in the token's genesis `tokenData` field. There are no external metadata fields outside the token itself. The token ID (guaranteed unique by the aggregator) is the invoice ID. |
 | **Local-first accounting** | Each party computes invoice status from its own token inventory — no shared on-chain state, no consensus needed. Status is **never** stored for non-terminal invoices; it is always derived on-demand. Terminal invoices have frozen balances persisted locally. |
 | **On-chain referenced balances** | Invoice balances are derived **exclusively** from token transfers whose on-chain `TransferTransactionData.message` field references the invoice. The reference is embedded in the cryptographic proof chain (aggregator SMT), not in the Nostr transport layer. A persistent invoice-transfer index captures expanded per-coin entries by scanning token transaction histories — queried in-memory, no rescan at query time. Physical token inventory is irrelevant to invoice accounting. |
-| **Read-only dependency on PaymentsModule** | AccountingModule reads from `PaymentsModule` (getTokens, events) and scans token transaction histories for on-chain invoice references. It never calls `send()` directly except for auto-return, where it invokes `send()` to return tokens for terminated invoices. |
+| **Read-only dependency on PaymentsModule** | AccountingModule reads from `PaymentsModule` (getTokens, events) and scans token transaction histories for on-chain invoice references. It calls `send()` only in two cases: (1) `returnInvoicePayment()` for explicit manual returns, and (2) auto-return, where it invokes `send()` to return tokens for terminated invoices. All other interactions are read-only. |
 | **Outbound payment blocking for terminated invoices** | Outgoing forward payments (`INV:<id>:F`) referencing a locally terminated (CLOSED or CANCELLED) invoice are **blocked** — the transfer is prevented and an exception is thrown. This is enforced at the `payInvoice()` / memo-construction layer, not in `PaymentsModule.send()`. |
 | **Non-blocking inbound observer** | Accounting errors during inbound transfer processing MUST NEVER break the token transfer flow. Inbound transfers are atomic — they either happen fully or not at all. The accounting module is a side-effect observer that processes inbound transfers after the fact. |
 | **Idempotent event re-firing** | The same event (with the same or updated `confirmed` flag) may fire multiple times for the same underlying transfer. Event consumers MUST be idempotent — handling a re-fired event must produce the same result as handling it once. This is the fundamental contract. |
@@ -161,7 +161,7 @@ The invoice is **fully covered** only when every target address has received eve
 
 For **non-terminal invoices** (OPEN, PARTIAL, COVERED, EXPIRED), status is a **dynamic property** derived on-demand from the persistent invoice-transfer index (§3.7). The index captures expanded per-coin transfer entries at processing time. `getInvoiceStatus()` reads from the in-memory index and balance cache — no history scan at query time.
 
-For **terminal invoices** (CLOSED, CANCELLED), the balances are **frozen and persisted**. Once an invoice reaches a terminal state, the frozen balance snapshot is stored locally and returned on subsequent queries without recomputation. New transfers referencing a terminated invoice do not change the frozen balances or status — but they may trigger auto-return behavior (see Section 4.5). The `allConfirmed` field in frozen balances is an exception: it is **dynamically derived** from PaymentsModule on each query (checking whether all related tokens now have confirmed proofs), not frozen at the time of termination. This ensures that tokens confirmed after termination are accurately reflected.
+For **terminal invoices** (CLOSED, CANCELLED), the balances are **frozen and persisted**. Once an invoice reaches a terminal state, the frozen balance snapshot is stored locally and returned on subsequent queries without recomputation. New transfers referencing a terminated invoice do not change the frozen balances or status — but they may trigger auto-return behavior (see Section 4.5). The `allConfirmed` field is NOT stored in `FrozenInvoiceBalances` — it is a computed field on `InvoiceStatus` only, **dynamically derived** from PaymentsModule on each query (checking whether all related tokens now have confirmed proofs). This ensures that tokens confirmed after termination are accurately reflected without storing stale confirmation state.
 
 ### 3.5 Multi-Asset Tokens
 
@@ -523,10 +523,11 @@ Each party independently derives invoice status from their own perspective — s
 A new token type constant (similar to `UNICITY_TOKEN_TYPE_HEX` for nametags):
 
 ```
-INVOICE_TOKEN_TYPE_HEX = SHA-256("unicity.invoice.v1")
+INVOICE_TOKEN_TYPE_HEX = SHA-256(UTF-8("unicity.invoice.v1"))
+// i.e., bytesToHex(sha256(new TextEncoder().encode('unicity.invoice.v1')))
 ```
 
-This distinguishes invoice tokens from currency tokens, nametags, and future NFTs.
+The input is UTF-8 encoded bytes, not a raw string hash. This distinguishes invoice tokens from currency tokens, nametags, and future NFTs.
 
 ## 6. Memo-Referenced Payments
 
@@ -552,10 +553,12 @@ INV:<invoiceId>[:<direction>] [optional free text]
 
 | Direction | On-chain `dir` | Transport memo | Meaning | Affects balance | Auto-returnable | Who can send |
 |-----------|---------------|----------------|---------|-----------------|-----------------|--------------|
-| Forward | `F` (or omitted) | `:F` | Payment towards covering the invoice | +coveredAmount (increases net) | Yes (if invoice terminated) | Anyone |
+| Forward | `F` | `:F` (or omitted in transport memo) | Payment towards covering the invoice | +coveredAmount (increases net) | Yes (if invoice terminated) | Anyone |
 | Back | `B` | `:B` | Manual return/refund | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
 | Return-for-closed | `RC` | `:RC` | Auto-return because invoice is closed | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
 | Return-for-cancelled | `RX` | `:RX` | Auto-return because invoice is cancelled | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
+
+**On-chain vs transport:** The on-chain `inv.dir` field always contains an explicit direction code (`F`, `B`, `RC`, or `RX`) — it is never omitted. The "or omitted" case applies only to the transport memo format, where an absent direction defaults to forward during parsing (backward compatibility with pre-module transfers). All memos generated by `buildInvoiceMemo()` always include the direction code. See SPEC §4.1/§4.2 for the full format.
 
 All return directions (`:B`, `:RC`, `:RX`) have the same effect on balance computation — they increase `returnedAmount`, which decreases the net covered balance. The distinction between `:B`, `:RC`, and `:RX` is semantic: it communicates _why_ the tokens were returned.
 
@@ -603,6 +606,7 @@ this.accounting = createAccountingModule(
     storage: this.storage,
     getActiveAddresses: () => this.getActiveAddresses(),
     emitEvent: (type, data) => this.emit(type, data),
+    communications: this.communications,  // optional: enables receipt/cancellation DMs
   }
 );
 
@@ -612,6 +616,8 @@ this.accounting = createAccountingModule(
 //   - Inverse: orphaned terminal set entries (in set but no frozen balances) -> recompute and freeze
 // And crash recovery (pending auto-return ledger entries -> retry or mark completed)
 // And ledger pruning (remove completed entries older than 30 days)
+// Post-subscribe: one-time re-scan for the load-subscribe gap (SPEC §7.6 step 7b)
+// CommunicationsModule: subscribe to DMs for receipt/cancellation detection (SPEC §5.11)
 await this.accounting.load();
 
 // Cleanup
@@ -936,6 +942,12 @@ Sender receives the cancellation notice DM:
 | Cancellation notice reason or deal description too long | **Throw `INVOICE_MEMO_TOO_LONG`** — max 4096 characters per field |
 | Cancellation notice DM delivery failure (per-sender) | Collect in `failedNotices` — does not throw, does not block other notices |
 | Incoming cancellation notice DM parse failure | Ignore silently — treat as regular DM, no error event |
+| Return amount exceeds per-sender balance | **Throw `INVOICE_RETURN_EXCEEDS_BALANCE`** — cap enforced per (target, sender, coinId) |
+| Receipt/notice memo too long | **Throw `INVOICE_MEMO_TOO_LONG`** — max 4096 characters per field |
+| Any public method called after destroy() | **Throw `MODULE_DESTROYED`** — module is destroyed |
+| Global auto-return within 5s cooldown | **Throw `RATE_LIMITED`** — `setAutoReturn('*')` rate-limited |
+
+> **Note:** This table covers the most operationally significant error scenarios. For the complete list of 31 error codes with their exact conditions, see [ACCOUNTING-SPEC.md §10](./ACCOUNTING-SPEC.md#10-error-codes).
 
 ## 11. Future Extensions
 

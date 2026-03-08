@@ -226,6 +226,7 @@ interface InvoiceSenderBalance {
  *   returnedAmount = sum of all back/return payment amounts referencing this invoice for this target:coinId
  *                    (includes :B, :RC, and :RX directions)
  *   netCoveredAmount = max(0, coveredAmount - returnedAmount)   // defensive floor; validation prevents negative
+ *   surplusAmount = max(0, netCoveredAmount - requestedAmount) // overpayment beyond requested
  *
  * Note: These balances reflect memo-referenced transfers only.
  * Whether the underlying tokens are still in the wallet is irrelevant.
@@ -442,7 +443,9 @@ interface InvoiceRef {
   readonly invoiceId: string;
   /** Parsed invoice terms from token genesis */
   readonly terms: InvoiceTerms;
-  /** Whether this wallet created the invoice (based on terms.creator matching identity) */
+  /** Whether this wallet created the invoice (based on terms.creator matching identity).
+   *  For anonymous invoices (terms.creator is undefined), this is always false — even
+   *  for the wallet that created the invoice. */
   readonly isCreator: boolean;
   /** Whether this invoice has been locally cancelled */
   readonly cancelled: boolean;
@@ -773,6 +776,10 @@ class AccountingModule {
    * Because state filtering requires async status computation, this method
    * is async.
    *
+   * SIDE EFFECT: State-filtered queries call getInvoiceStatus() internally,
+   * which may trigger implicit close for COVERED + all-confirmed invoices
+   * (see §5.1 step 7c, §9.1). This is inherent to the local-first model.
+   *
    * Pagination: offset and limit are applied AFTER all filters (state,
    * createdByMe, targetingMe). offset=10 means skip the first 10 invoices
    * that pass all filters. Implementations MAY optimize terminal-state
@@ -946,6 +953,7 @@ class AccountingModule {
    *
    * @param invoiceId - Invoice token ID, or '*' for global setting
    * @param enabled - Whether auto-return is enabled
+   * @throws SphereError with RATE_LIMITED if invoiceId is '*' and called within 5-second cooldown
    */
   async setAutoReturn(invoiceId: string | '*', enabled: boolean): Promise<void>;
 
@@ -1096,10 +1104,14 @@ class AccountingModule {
    *    (captures the map snapshot at flag-set time)
    *
    * The `destroyed` flag is checked in TWO places:
-   * - At the TOP of every PUBLIC METHOD (getInvoiceStatus, payInvoice,
-   *   closeInvoice, cancelInvoice, returnInvoicePayment, setAutoReturn,
-   *   sendInvoiceReceipts, sendCancellationNotices).
-   *   If set, the method throws immediately without entering the gate.
+   * - At the TOP of every PUBLIC METHOD that performs I/O or state mutation:
+   *   createInvoice, importInvoice, getInvoiceStatus, getInvoices,
+   *   closeInvoice, cancelInvoice, payInvoice, returnInvoicePayment,
+   *   setAutoReturn, sendInvoiceReceipts, sendCancellationNotices,
+   *   getRelatedTransfers.
+   *   If set, the method throws `MODULE_DESTROYED` immediately without entering the gate.
+   *   EXEMPT: getInvoice(), getAutoReturnSettings(), parseInvoiceMemo() — these are
+   *   synchronous, read-only, in-memory operations that cannot cause harm after destroy.
    * - At the TOP of every gate `fn` body. If set, the fn returns immediately
    *   without storage writes (catches operations queued before flag was set).
    *
@@ -1143,7 +1155,7 @@ interface PayInvoiceParams {
   readonly targetIndex: number;
   /** Which asset within that target (index into target.assets). Defaults to 0. */
   readonly assetIndex?: number;
-  /** Amount to pay (defaults to remaining needed to cover the asset) */
+  /** Amount to pay in smallest units (defaults to remaining needed to cover the asset). Same convention as TransferRequest.amount. */
   readonly amount?: string;
   /** Optional free text appended to memo */
   readonly freeText?: string;
@@ -1195,7 +1207,7 @@ interface PayInvoiceParams {
 interface ReturnPaymentParams {
   /** Recipient address (original sender to return tokens to) */
   readonly recipient: string;
-  /** Amount to return */
+  /** Amount to return in smallest units (same convention as TransferRequest.amount) */
   readonly amount: string;
   /** Coin ID */
   readonly coinId: string;
@@ -1641,6 +1653,8 @@ invoice-id    = 64HEXDIG
 direction     = "F" / "B" / "RC" / "RX"
 free-text     = *CHAR
 ```
+
+**Note:** The optional `[ ":" direction ]` applies only for **parsing** — backward compatibility with pre-module transfers that may lack a direction suffix. All memos **generated** by `buildInvoiceMemo()` (§4.6) always include the direction code explicitly (e.g., `:F`, `:B`). Outbound memos never omit the direction.
 
 ### 4.4 Transport Memo Regex
 
@@ -3822,6 +3836,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Rule | Error |
 |------|-------|
 | For specific invoiceId (not `'*'`): invoice token must exist locally | `INVOICE_NOT_FOUND` |
+| `invoiceId === '*'` called within 5-second cooldown of previous `'*'` call | `RATE_LIMITED` |
 
 ### 8.8 getInvoiceStatus / getRelatedTransfers Validation
 
@@ -4126,7 +4141,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_NOT_TERMINATED` | Invoice must be closed or cancelled before sending receipts | `sendInvoiceReceipts()` on non-terminal invoice |
 | `INVOICE_NOT_CANCELLED` | Invoice must be cancelled before sending cancellation notices | `sendCancellationNotices()` on non-CANCELLED invoice |
 | `COMMUNICATIONS_UNAVAILABLE` | CommunicationsModule is required for sending DMs | `sendInvoiceReceipts()` or `sendCancellationNotices()` without CommunicationsModule |
-| `MODULE_DESTROYED` | AccountingModule is destroyed | Any public method called after `destroy()` completes |
+| `MODULE_DESTROYED` | AccountingModule is destroyed | Any I/O or state-mutating public method called after `destroy()` completes. Exempt: `getInvoice()`, `getAutoReturnSettings()`, `parseInvoiceMemo()` (synchronous, in-memory, read-only). |
 
 Note: `INVOICE_INVALID_ID` and `INVOICE_MINT_FAILED` are thrown from internal utilities (`buildInvoiceMemo` and the minting flow respectively), not from §8 validation tables. They are included here for completeness.
 
