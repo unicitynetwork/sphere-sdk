@@ -134,6 +134,7 @@ export class AccountingModule {
   // ---------------------------------------------------------------------------
 
   private destroyed = false;
+  private loadPromise: Promise<void> | null = null;
 
   // ---------------------------------------------------------------------------
   // Invoice token cache: invoiceId → parsed InvoiceTerms
@@ -274,6 +275,20 @@ export class AccountingModule {
     this.ensureInitialized();
     this.ensureNotDestroyed();
 
+    // Re-entry guard: if load() is already in progress, return the same promise
+    if (this.loadPromise) {
+      return this.loadPromise;
+    }
+
+    this.loadPromise = this._doLoad();
+    try {
+      await this.loadPromise;
+    } finally {
+      this.loadPromise = null;
+    }
+  }
+
+  private async _doLoad(): Promise<void> {
     const deps = this.deps!;
 
     // ------------------------------------------------------------------
@@ -453,6 +468,10 @@ export class AccountingModule {
    * After calling destroy(), all public methods will throw `MODULE_DESTROYED`.
    */
   destroy(): void {
+    // Set destroyed flag FIRST to prevent concurrent operations from seeing
+    // partially cleared state during cleanup
+    this.destroyed = true;
+
     // Unsubscribe from PaymentsModule events
     for (const unsub of this.unsubscribePayments) {
       try { unsub(); } catch { /* ignore */ }
@@ -465,8 +484,6 @@ export class AccountingModule {
 
     // Clear all in-memory state
     this._clearInMemoryState();
-
-    this.destroyed = true;
 
     if (this.config.debug) {
       logger.debug(LOG_TAG, 'Module destroyed');

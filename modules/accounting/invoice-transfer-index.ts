@@ -512,30 +512,55 @@ export class InvoiceTransferIndex {
         const transferId = bytesToHex(dataHash.data);
 
         // -------------------------------------------------------------------
-        // Step 5: Resolve sender from tx and token state
+        // Step 5: Resolve sender address
         //
-        // tx.predicate at index N is the NEW owner's predicate (recipient of
-        // transaction N). The SENDER is identified by the predicate at index N-1
-        // (or genesis.data.recipient for absIdx === 0).
+        // Primary: extract from sourceState.predicate in the current tx's data.
+        //   TransferTransactionData stores the PREVIOUS state (sender's predicate)
+        //   in sourceState. This is always present for valid transfers and works
+        //   for ALL transaction indices (no absIdx === 0 special case needed).
         //
-        // NOTE: absIdx is the ABSOLUTE index — guard uses absIdx === 0, not
-        // relative to startIndex. Previous-predicate lookup uses absIdx - 1.
+        // Fallback 1: previous transaction predicate (tx[N-1].predicate is the
+        //   new owner after tx N-1 = sender of tx N).
+        //
+        // Fallback 2: genesis.data.recipient for absIdx === 0 (the initial token
+        //   owner who is making the first transfer).
         // -------------------------------------------------------------------
-        let senderAddress: string | null;
-        if (absIdx === 0) {
-          senderAddress = token.genesis.data.recipient;
-        } else {
+        let senderAddress: string | null = null;
+
+        // Primary: sourceState.predicate from current transaction data
+        const sourceStatePredicate = (txData as Record<string, unknown> | undefined)?.['sourceState'];
+        if (sourceStatePredicate && typeof sourceStatePredicate === 'object') {
+          const predicateHex = (sourceStatePredicate as Record<string, unknown>)['predicate'];
+          if (typeof predicateHex === 'string' && predicateHex.length > 0) {
+            try {
+              await ensureSdkImports();
+              const predicate = UnmaskedPredicate!.fromCBOR(hexToBytes(predicateHex));
+              const pubkeyHex = bytesToHex(predicate.publicKey);
+              senderAddress = await deriveDirectAddress(pubkeyHex);
+            } catch {
+              // Masked predicate — try fallbacks
+            }
+          }
+        }
+
+        // Fallback 1: previous transaction predicate
+        if (senderAddress === null && absIdx > 0) {
           try {
             await ensureSdkImports();
             const prevPredicate = transactions[absIdx - 1]!.predicate;
-            const predicate = UnmaskedPredicate!.fromCBOR(hexToBytes(prevPredicate));
-            // predicate.publicKey is a Uint8Array — convert to hex for address derivation
-            const pubkeyHex = bytesToHex(predicate.publicKey);
-            senderAddress = await deriveDirectAddress(pubkeyHex);
+            if (prevPredicate && prevPredicate.length > 0) {
+              const predicate = UnmaskedPredicate!.fromCBOR(hexToBytes(prevPredicate));
+              const pubkeyHex = bytesToHex(predicate.publicKey);
+              senderAddress = await deriveDirectAddress(pubkeyHex);
+            }
           } catch {
-            // Masked predicate or empty — sender unknown
-            senderAddress = null;
+            // Masked predicate or empty — try fallback 2
           }
+        }
+
+        // Fallback 2: genesis.data.recipient (initial token owner for first transfer)
+        if (senderAddress === null && absIdx === 0) {
+          senderAddress = token.genesis.data.recipient;
         }
 
         // -------------------------------------------------------------------

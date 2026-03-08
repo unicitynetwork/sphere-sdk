@@ -902,8 +902,10 @@ function freezeTarget(
 /**
  * Freeze a single InvoiceCoinAssetStatus.
  *
- * For CLOSED: all per-sender balances are reset to zero; the latest sender
- * (if identified) receives the surplus as their frozen net balance.
+ * For CLOSED: all per-sender balances are reset to zero.
+ * Surplus is distributed to senders in reverse chronological order (latest
+ * sender first), capped at each sender's actual net contribution. This
+ * prevents the exploit where a 1-unit last payment captures the entire surplus.
  *
  * For CANCELLED: per-sender balances are preserved exactly as computed.
  *
@@ -928,11 +930,56 @@ function freezeCoinAsset(
       netBalance: sb.netBalance,
     }));
   } else {
-    // CLOSED: reset all per-sender balances to zero
-    // Latest sender for this target:coinId receives the surplus
-    const surplusAmount = coinAsset.surplusAmount;
+    // CLOSED: reset all per-sender balances to zero, then distribute surplus.
+    //
+    // Surplus distribution algorithm:
+    // 1. Latest sender gets min(surplus, their_net_contribution)
+    // 2. Remaining surplus distributed to other senders in iteration order,
+    //    each capped at their net contribution.
+    // This ensures no sender receives more surplus than they actually paid.
+    const totalSurplus = parseBigInt(coinAsset.surplusAmount);
+    let remainingSurplus = totalSurplus;
+
+    // Build a map of sender -> their returnable surplus (capped at net contribution)
+    const senderSurplusMap = new Map<string, bigint>();
+
+    // First pass: allocate to latest sender (priority)
+    if (latestSender !== undefined && remainingSurplus > 0n) {
+      const latestSb = coinAsset.senderBalances.find(
+        (sb) => sb.senderAddress === latestSender,
+      );
+      if (latestSb) {
+        const latestNet = parseBigInt(latestSb.netBalance);
+        const allocated = latestNet < remainingSurplus ? latestNet : remainingSurplus;
+        if (allocated > 0n) {
+          senderSurplusMap.set(latestSender, allocated);
+          remainingSurplus -= allocated;
+        }
+      }
+    }
+
+    // Second pass: distribute remaining surplus to other senders (reverse order)
+    // Reverse iteration gives priority to more recent senders
+    if (remainingSurplus > 0n) {
+      for (let i = coinAsset.senderBalances.length - 1; i >= 0; i--) {
+        const sb = coinAsset.senderBalances[i]!;
+        if (sb.senderAddress === latestSender) continue; // already allocated
+        if (remainingSurplus <= 0n) break;
+
+        const senderNet = parseBigInt(sb.netBalance);
+        const allocated = senderNet < remainingSurplus ? senderNet : remainingSurplus;
+        if (allocated > 0n) {
+          senderSurplusMap.set(
+            sb.senderAddress,
+            (senderSurplusMap.get(sb.senderAddress) ?? 0n) + allocated,
+          );
+          remainingSurplus -= allocated;
+        }
+      }
+    }
 
     frozenSenderBalances = coinAsset.senderBalances.map((sb) => {
+      const allocatedSurplus = senderSurplusMap.get(sb.senderAddress) ?? 0n;
       const isLatest =
         latestSender !== undefined && sb.senderAddress === latestSender;
       return {
@@ -940,8 +987,8 @@ function freezeCoinAsset(
         ...(sb.isRefundAddress === true ? { isRefundAddress: true as const } : {}),
         ...(sb.senderPubkey !== undefined ? { senderPubkey: sb.senderPubkey } : {}),
         contacts: sb.contacts.slice(),
-        // Reset to zero for CLOSED, except latest sender gets the surplus
-        netBalance: isLatest ? surplusAmount : '0',
+        // Frozen netBalance = their allocated share of surplus (capped at their contribution)
+        netBalance: allocatedSurplus.toString(),
         ...(isLatest && latestSender !== undefined ? { latestSenderAddress: latestSender } : {}),
       };
     });

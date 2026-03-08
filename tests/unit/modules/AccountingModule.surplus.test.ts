@@ -912,4 +912,54 @@ describe('AccountingModule.surplus.test - freezeBalances() surplus assignment', 
     expect(usduCoin.latestSenderAddress).toBe('DIRECT://bob');
     expect(usduCoin.frozenSenderBalances[0]!.netBalance).toBe('30');
   });
+
+  it('Edge 10: Multi-transfer same sender — accumulation into single senderBalance entry', () => {
+    const target = 'DIRECT://target_e10';
+    const terms = createTerms(target, 'UCT', '100');
+    // Same sender sends 3 separate transfers (multi-token scenario)
+    const entries: InvoiceTransferRef[] = [
+      createForwardTransfer('tx_e10a', 'DIRECT://alice', target, 'UCT', '40', 100),
+      createForwardTransfer('tx_e10b', 'DIRECT://alice', target, 'UCT', '40', 200),
+      createForwardTransfer('tx_e10c', 'DIRECT://alice', target, 'UCT', '40', 300),
+    ];
+    const walletAddresses = new Set<string>();
+    const status = computeInvoiceStatus('inv_e10', terms, entries, null, walletAddresses);
+    // Alice appears once in senderBalances with forwarded=120, net=120
+    expect(status.targets[0]!.coinAssets[0]!.senderBalances).toHaveLength(1);
+    expect(status.targets[0]!.coinAssets[0]!.senderBalances[0]!.netBalance).toBe('120');
+
+    const latestSenderMap = new Map([
+      [target, new Map([['UCT', 'DIRECT://alice']])],
+    ]);
+    const frozen = freezeBalances(terms, status, 'CLOSED', true, latestSenderMap);
+    const frozenCoin = frozen.targets[0]!.coinAssets[0]!;
+    // surplus=20 (120-100), alice gets min(20,120)=20
+    expect(frozenCoin.surplusAmount).toBe('20');
+    expect(frozenCoin.frozenSenderBalances).toHaveLength(1);
+    expect(frozenCoin.frozenSenderBalances[0]!.netBalance).toBe('20');
+  });
+
+  it('Edge 11: 78-digit BigInt boundary — maximum valid amount through surplus distribution', () => {
+    const target = 'DIRECT://target_e11';
+    // Requested = 1 smallest unit
+    const terms = createTerms(target, 'UCT', '1');
+    // 78 nines = maximum valid amount per isValidAmount (length <= 78)
+    const maxAmount = '9'.repeat(78);
+    const entries: InvoiceTransferRef[] = [
+      createForwardTransfer('tx_e11a', 'DIRECT://alice', target, 'UCT', maxAmount, 100),
+    ];
+    const walletAddresses = new Set<string>();
+    const status = computeInvoiceStatus('inv_e11', terms, entries, null, walletAddresses);
+    // surplus = 78-nines - 1
+    const expectedSurplus = (BigInt(maxAmount) - 1n).toString();
+    expect(status.targets[0]!.coinAssets[0]!.surplusAmount).toBe(expectedSurplus);
+
+    const latestSenderMap = new Map([
+      [target, new Map([['UCT', 'DIRECT://alice']])],
+    ]);
+    const frozen = freezeBalances(terms, status, 'CLOSED', true, latestSenderMap);
+    const frozenCoin = frozen.targets[0]!.coinAssets[0]!;
+    // Alice gets min(surplus, 78-nines) = surplus (since 78-nines > surplus)
+    expect(frozenCoin.frozenSenderBalances[0]!.netBalance).toBe(expectedSurplus);
+  });
 });
