@@ -506,7 +506,7 @@ export interface SphereEventMap {
   'invoice:irrelevant': {
     invoiceId: string;
     transfer: import('../modules/accounting/types').InvoiceTransferRef;
-    reason: 'unknown_address' | 'unknown_asset' | 'unknown_address_and_asset' | 'self_payment' | 'no_coin_data' | 'unauthorized_return';
+    reason: import('../modules/accounting/types').IrrelevantTransfer['reason'];
     confirmed: boolean;
   };
   'invoice:auto_returned': {

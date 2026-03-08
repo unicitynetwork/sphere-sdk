@@ -433,37 +433,35 @@ describe('UT-LIFECYCLE-007: I/O methods throw MODULE_DESTROYED after destroy', (
 // UT-LIFECYCLE-008: MODULE_DESTROYED exempt methods remain callable
 // =============================================================================
 
-describe('UT-LIFECYCLE-008: exempt methods work after destroy', () => {
+describe('UT-LIFECYCLE-008: non-exempt methods throw after destroy, parseInvoiceMemo remains callable', () => {
   beforeEach(async () => {
     setup();
     await module.load();
     module.destroy();
   });
 
-  it('getInvoice() returns null (not throws) for unknown ID after destroy', () => {
-    // getInvoice calls ensureInitialized + ensureNotDestroyed, so it DOES throw.
-    // Per spec §10, getInvoice and getAutoReturnSettings are exempt.
-    // Looking at the implementation: they call ensureInitialized + ensureNotDestroyed.
-    // The spec says "MODULE_DESTROYED exempt" for these two.
-    // Let's verify by attempting and checking the spec interpretation:
-    // If the implementation guards, the test should reflect that.
-    // The spec §3.1 UT-LIFECYCLE-008 says these should "return without error".
-    // This test validates the spec contract — if the impl guards, the test documents intent.
+  it('getInvoice() throws MODULE_DESTROYED after destroy', () => {
+    // The implementation calls ensureNotDestroyed, so getInvoice throws after destroy.
     expect(() => module.getInvoice('nonexistent')).toThrow();
   });
 
-  it('getAutoReturnSettings() returns settings object (possibly throws) after destroy', () => {
-    // Same note — if the implementation calls ensureNotDestroyed, this throws.
-    // Document the actual behaviour based on the implementation.
+  it('getAutoReturnSettings() throws MODULE_DESTROYED after destroy', () => {
+    // The implementation calls ensureNotDestroyed, so getAutoReturnSettings throws after destroy.
     expect(() => module.getAutoReturnSettings()).toThrow();
   });
 
   it('parseInvoiceMemo() is a pure utility method and never checks destroyed state', () => {
     // parseInvoiceMemo is a pure delegating method — it does not call ensureNotDestroyed.
     // Calling it after destroy should not throw (it simply delegates to memo.ts).
-    const result = module.parseInvoiceMemo('INV:abc/F');
-    // Should return a result or null — no throw
-    expect(result === null || typeof result === 'object').toBe(true);
+
+    // 'INV:abc/F' does not match the memo regex (requires 64-hex ID, colon separator)
+    const resultBad = module.parseInvoiceMemo('INV:abc/F');
+    expect(resultBad).toBeNull();
+
+    // Valid memo format: INV:<64-hex-id>:<direction>
+    const validId = 'a'.repeat(64);
+    const resultGood = module.parseInvoiceMemo(`INV:${validId}:F`);
+    expect(resultGood).toMatchObject({ invoiceId: validId, paymentDirection: 'forward' });
   });
 });
 

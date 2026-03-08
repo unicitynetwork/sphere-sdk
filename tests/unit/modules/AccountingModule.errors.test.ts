@@ -405,16 +405,17 @@ describe('SphereError structure', () => {
   it('SphereError has name, code, and message', async () => {
     await module.load();
 
-    try {
-      await module.createInvoice({ targets: [] });
-    } catch (e) {
+    await expect(
+      module.createInvoice({ targets: [] }),
+    ).rejects.toSatisfy((e: unknown) => {
       expect(e).toBeInstanceOf(SphereError);
       const se = e as SphereError;
       expect(se.name).toBe('SphereError');
       expect(se.code).toBe('INVOICE_NO_TARGETS');
       expect(typeof se.message).toBe('string');
       expect(se.message.length).toBeGreaterThan(0);
-    }
+      return true;
+    });
   });
 });
 

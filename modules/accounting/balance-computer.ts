@@ -978,13 +978,22 @@ function freezeCoinAsset(
       }
     }
 
-    // Assign any undistributed remainder to latest sender (or first sender as fallback)
-    // This ensures sum(frozenNetBalances) == totalSurplus for CLOSED invoices.
+    // Assign any undistributed remainder to the sender with the highest net contribution.
+    // This prevents inflating a zero-balance sender's frozen net balance beyond their actual payment,
+    // which would enable over-return. Ensures sum(frozenNetBalances) == totalSurplus for CLOSED invoices.
     if (remainingSurplus > 0n && coinAsset.senderBalances.length > 0) {
-      const fallbackSender = latestSender ?? coinAsset.senderBalances[0]!.senderAddress;
+      let bestSender = latestSender ?? coinAsset.senderBalances[0]!.senderAddress;
+      let bestNet = 0n;
+      for (const sb of coinAsset.senderBalances) {
+        const senderNet = BigInt(sb.forwardedAmount) - BigInt(sb.returnedAmount);
+        if (senderNet > bestNet) {
+          bestNet = senderNet;
+          bestSender = sb.senderAddress;
+        }
+      }
       senderSurplusMap.set(
-        fallbackSender,
-        (senderSurplusMap.get(fallbackSender) ?? 0n) + remainingSurplus,
+        bestSender,
+        (senderSurplusMap.get(bestSender) ?? 0n) + remainingSurplus,
       );
     }
 

@@ -282,20 +282,24 @@ export class InvoiceTransferIndex {
     if (!this.storage || this.dirtyInvoices.size === 0) return;
 
     const dirtySnapshot = new Set(this.dirtyInvoices);
-    this.dirtyInvoices.clear();
 
     // Step 1: Write per-invoice ledger entries
+    // Only remove from dirtyInvoices after each successful write (not upfront)
+    // to survive process crashes between clear and write completion.
     let anyLedgerWriteFailed = false;
     for (const invoiceId of dirtySnapshot) {
       const entryMap = this.invoiceLedger.get(invoiceId);
-      if (!entryMap) continue;
+      if (!entryMap) {
+        this.dirtyInvoices.delete(invoiceId);
+        continue;
+      }
       const entries = Array.from(entryMap.values());
       try {
         await this.storage.set(this.getInvoiceLedgerKey(invoiceId), JSON.stringify(entries));
+        this.dirtyInvoices.delete(invoiceId);
       } catch (err) {
         logger.warn('InvoiceTransferIndex', `Failed to flush inv_ledger:${invoiceId}`, err);
-        // Re-mark as dirty so next flush retries
-        this.dirtyInvoices.add(invoiceId);
+        // Keep in dirtyInvoices so next flush retries
         anyLedgerWriteFailed = true;
       }
     }
@@ -618,7 +622,10 @@ export class InvoiceTransferIndex {
             coinId,
             amount,
             destinationAddress,
-            timestamp: Date.now(),
+            // Use 0 as sentinel — on-chain transactions don't carry wall-clock timestamps.
+            // Date.now() would be wrong after crash-recovery rescans. The module uses
+            // ledger insertion order (Map iteration order) for latestSender, not timestamp.
+            timestamp: 0,
             confirmed: tx.inclusionProof !== null,
             senderAddress,
             ...(refundAddress !== undefined ? { refundAddress } : {}),

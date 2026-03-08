@@ -468,11 +468,11 @@ Market Examples:
   npm run cli -- market-feed --rest                                  Fetch recent (REST fallback)
 
 Invoice Examples:
-  npm run cli -- invoice-create --target @alice --coin UCT --amount 10.00
+  npm run cli -- invoice-create --target @alice --coin UCT --amount 1000000
   npm run cli -- invoice-create --terms invoice-terms.json
   npm run cli -- invoice-list --state OPEN,PARTIAL --limit 5
   npm run cli -- invoice-status a1b2c3d4
-  npm run cli -- invoice-pay a1b2c3d4 --amount 5.00
+  npm run cli -- invoice-pay a1b2c3d4 --amount 500000
   npm run cli -- invoice-close a1b2c3d4 --auto-return
   npm run cli -- invoice-parse-memo "INV:a1b2c3d4...:F"
 
@@ -2560,16 +2560,29 @@ async function main() {
         }
 
         const stateIdx = args.indexOf('--state');
+        const limitIdx2 = args.indexOf('--limit');
         const createdByMe = args.includes('--role') && args[args.indexOf('--role') + 1] === 'creator';
         const targetingMe = args.includes('--role') && args[args.indexOf('--role') + 1] === 'payer';
         const stateFilter = stateIdx !== -1 ? args[stateIdx + 1] : undefined;
 
+        const validStates = new Set(['OPEN', 'PARTIAL', 'COVERED', 'CLOSED', 'CANCELLED', 'EXPIRED']);
         const options: import('../modules/accounting/types').GetInvoicesOptions = {};
         if (createdByMe) options.createdByMe = true;
         if (targetingMe) options.targetingMe = true;
         if (stateFilter) {
           const stateValues = stateFilter.split(',').map(s => s.trim());
+          const invalid = stateValues.filter(s => !validStates.has(s));
+          if (invalid.length > 0) {
+            console.error(`Invalid state(s): ${invalid.join(', ')}. Valid: ${[...validStates].join(', ')}`);
+            process.exit(1);
+          }
           options.state = stateValues.length === 1 ? stateValues[0] as any : stateValues as any;
+        }
+        if (limitIdx2 !== -1 && args[limitIdx2 + 1]) {
+          const limit = parseInt(args[limitIdx2 + 1], 10);
+          if (!Number.isNaN(limit) && limit > 0) {
+            options.limit = limit;
+          }
         }
 
         const invoices = await sphere.accounting.getInvoices(options);
@@ -2653,8 +2666,9 @@ async function main() {
         }
         const invoiceId = matched[0].invoiceId;
 
-        await sphere.accounting.closeInvoice(invoiceId);
-        console.log(`Invoice ${invoiceId} closed.`);
+        const autoReturn = args.includes('--auto-return');
+        await sphere.accounting.closeInvoice(invoiceId, autoReturn ? { autoReturn: true } : undefined);
+        console.log(`Invoice ${invoiceId} closed.${autoReturn ? ' Auto-return triggered.' : ''}`);
 
         await closeSphere();
         break;
@@ -2789,9 +2803,15 @@ async function main() {
           process.exit(1);
         }
 
+        const returnAmount = args[amountIdx3 + 1];
+        if (!/^\d+$/.test(returnAmount)) {
+          console.error('--amount must be a non-negative integer string (smallest unit, e.g. 1000000)');
+          process.exit(1);
+        }
+
         const returnParams: import('../modules/accounting/types').ReturnPaymentParams = {
           recipient: args[recipientIdx + 1],
-          amount: args[amountIdx3 + 1],
+          amount: returnAmount,
           coinId: args[coinIdx3 + 1],
         };
 

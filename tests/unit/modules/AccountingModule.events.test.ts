@@ -141,14 +141,13 @@ describe('AccountingModule — Events', () => {
   // -------------------------------------------------------------------------
   // UT-EVENTS-003b: invoice:return_received or irrelevant fires on :B back-direction transfer
   // -------------------------------------------------------------------------
-  it('UT-EVENTS-003b: invoice:return_received fires on :B back-direction transfer', async () => {
+  it('UT-EVENTS-003b: invoice:irrelevant fires with unauthorized_return on :B back-direction transfer from unresolvable sender', async () => {
     const invoiceId = injectInvoice(module, makeTerms());
 
     // :B comes from a target to the payer — sender is the target address.
-    // In the transfer:incoming pipeline, senderAddress cannot be resolved from
-    // transport pubkey alone (set to null), so the implementation may fire either
-    // invoice:return_received (if it can verify the sender) or invoice:irrelevant
-    // with reason 'unauthorized_return' (if sender is masked/null).
+    // However, the senderPubkey (default mock value) cannot be resolved to a
+    // DIRECT address by the transport layer, so the implementation classifies
+    // this as an unauthorized_return (sender address is null/unresolvable).
     const transfer = makeIncomingTransfer(
       invoiceId,
       'B',
@@ -161,11 +160,11 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', transfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    // Either return_received (if sender resolved) or irrelevant:unauthorized_return (if sender masked)
-    const returnCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:return_received');
-    const irrelevantCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:irrelevant');
-    const unauthorizedCalls = irrelevantCalls.filter(([, p]: [string, any]) => p.reason === 'unauthorized_return');
-    expect(returnCalls.length + unauthorizedCalls.length).toBeGreaterThan(0);
+    // senderPubkey is a random mock key that cannot be resolved → unauthorized_return
+    expect(emitEvent).toHaveBeenCalledWith(
+      'invoice:irrelevant',
+      expect.objectContaining({ invoiceId, reason: 'unauthorized_return' }),
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -394,14 +393,13 @@ describe('AccountingModule — Events', () => {
   // -------------------------------------------------------------------------
   // UT-EVENTS-012: invoice:return_received or irrelevant fires on :RC transfer
   // -------------------------------------------------------------------------
-  it('UT-EVENTS-012: invoice:return_received fires on :RC transfer from a target', async () => {
+  it('UT-EVENTS-012: invoice:irrelevant fires with unauthorized_return on :RC transfer from unresolvable sender', async () => {
     const invoiceId = injectInvoice(module, makeTerms());
 
     // :RC — return-of-closed, comes FROM a target address TO the payer.
-    // In the transfer:incoming pipeline, senderAddress cannot be determined from
-    // transport pubkey, so the implementation may fire either invoice:return_received
-    // (if the implementation can resolve the sender) or invoice:irrelevant with
-    // reason 'unauthorized_return' (if senderAddress is null/unresolvable).
+    // The senderPubkey (default mock value) cannot be resolved to a DIRECT
+    // address by the transport layer, so the implementation classifies this
+    // as an unauthorized_return (sender address is null/unresolvable).
     const rcTransfer = makeIncomingTransfer(
       invoiceId,
       'RC',
@@ -413,11 +411,11 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', rcTransfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    // Accept either return_received or irrelevant:unauthorized_return
-    const returnCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:return_received');
-    const irrelevantCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:irrelevant');
-    const unauthorizedCalls = irrelevantCalls.filter(([, p]: [string, any]) => p.reason === 'unauthorized_return');
-    expect(returnCalls.length + unauthorizedCalls.length).toBeGreaterThan(0);
+    // senderPubkey is a random mock key that cannot be resolved → unauthorized_return
+    expect(emitEvent).toHaveBeenCalledWith(
+      'invoice:irrelevant',
+      expect.objectContaining({ invoiceId, reason: 'unauthorized_return' }),
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -471,9 +469,11 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', transfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    const irrelevantCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:irrelevant');
-    // May emit unauthorized_return or unknown_address depending on implementation
-    expect(irrelevantCalls.length).toBeGreaterThan(0);
+    // Sender is not a target address → unauthorized_return
+    expect(emitEvent).toHaveBeenCalledWith(
+      'invoice:irrelevant',
+      expect.objectContaining({ invoiceId, reason: 'unauthorized_return' }),
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -504,6 +504,13 @@ describe('AccountingModule — Events', () => {
     // The self-payment is classified as irrelevant in the balance computation
     // (state should be PARTIAL/OPEN since the self-payment contribution is excluded)
     expect(['PARTIAL', 'OPEN']).toContain(status.state);
+
+    // Self-payment detection is in computeInvoiceStatus (balance-computer), not the event
+    // pipeline. getInvoiceStatus() returns irrelevantTransfers in the status object but does
+    // NOT emit invoice:irrelevant events. Verify via the returned status data instead.
+    expect(status.irrelevantTransfers).toBeDefined();
+    expect(status.irrelevantTransfers!.length).toBeGreaterThan(0);
+    expect(status.irrelevantTransfers![0].reason).toBe('self_payment');
   });
 
   // -------------------------------------------------------------------------
@@ -547,11 +554,16 @@ describe('AccountingModule — Events', () => {
     await module.closeInvoice(invoiceId, { autoReturn: true });
     await new Promise((r) => setTimeout(r, 30));
 
-    // At minimum the closed event fired; auto_returned fires if balance is present
+    // invoice:closed must fire for any closeInvoice() call
     expect(emitEvent).toHaveBeenCalledWith(
       'invoice:closed',
       expect.objectContaining({ invoiceId }),
     );
+
+    // invoice:auto_returned is NOT expected here because the invoice ledger is
+    // empty (no forward payments were made), so there is no surplus or balance
+    // to return. auto_returned only fires when closeInvoice detects a positive
+    // balance that needs to be sent back to payers.
   });
 
   // -------------------------------------------------------------------------
@@ -623,7 +635,7 @@ describe('AccountingModule — Events', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ledgerMap = (module as any).invoiceLedger.get(invoiceId) as Map<string, any> | undefined;
     expect(ledgerMap).toBeDefined();
-    expect(ledgerMap!.size).toBeGreaterThan(0);
+    expect(ledgerMap!.size).toBe(1);
     const entries = Array.from(ledgerMap!.values()).filter(
       (e: InvoiceTransferRef) => e.paymentDirection === 'forward',
     );

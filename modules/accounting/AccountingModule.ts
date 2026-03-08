@@ -390,23 +390,48 @@ export class AccountingModule {
     // Terminal set entry exists but no frozen balances → log warning.
     // (Full recomputation from history is deferred to later tasks.)
     // ------------------------------------------------------------------
-    for (const invoiceId of this.cancelledInvoices) {
-      if (!this.frozenBalances.has(invoiceId)) {
+    // Build wallet address set for computeInvoiceStatus
+    const activeAddresses = deps.getActiveAddresses();
+    const walletAddresses = new Set(activeAddresses.map((a) => a.directAddress));
+
+    const reconstructFrozen = (invoiceId: string, terminalState: 'CLOSED' | 'CANCELLED', resetReturns: boolean) => {
+      const terms = this.invoiceTermsCache.get(invoiceId);
+      if (terms) {
         logger.warn(
           LOG_TAG,
-          `Reconcile (inverse): ${invoiceId} in CANCELLED set but no frozen balances — ` +
-            'recomputation deferred (will be handled by getInvoiceStatus)',
+          `Reconcile (inverse): ${invoiceId} in ${terminalState} set but no frozen balances — reconstructing from ledger`,
         );
+        const ledgerMap = this.invoiceLedger.get(invoiceId) ?? new Map();
+        const entries = Array.from(ledgerMap.values());
+        const status = computeInvoiceStatus(invoiceId, terms, entries, null, walletAddresses);
+        const frozen = freezeBalances(terms, status, terminalState, resetReturns);
+        this.frozenBalances.set(invoiceId, frozen);
+      } else {
+        logger.warn(
+          LOG_TAG,
+          `Reconcile (inverse): ${invoiceId} in ${terminalState} set but no terms — cannot reconstruct frozen balances`,
+        );
+      }
+    };
+
+    for (const invoiceId of this.cancelledInvoices) {
+      if (!this.frozenBalances.has(invoiceId)) {
+        reconstructFrozen(invoiceId, 'CANCELLED', false);
       }
     }
     for (const invoiceId of this.closedInvoices) {
       if (!this.frozenBalances.has(invoiceId)) {
-        logger.warn(
-          LOG_TAG,
-          `Reconcile (inverse): ${invoiceId} in CLOSED set but no frozen balances — ` +
-            'recomputation deferred (will be handled by getInvoiceStatus)',
-        );
+        reconstructFrozen(invoiceId, 'CLOSED', true);
       }
+    }
+    // Persist any reconstructed frozen balances
+    if (this.frozenBalances.size > 0) {
+      this.saveJsonToStorage(
+        STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
+        Object.fromEntries(this.frozenBalances),
+      ).catch((err) => {
+        logger.warn(LOG_TAG, `Failed to persist reconstructed frozen balances:`, err);
+      });
     }
 
     // ------------------------------------------------------------------
@@ -435,7 +460,9 @@ export class AccountingModule {
 
     // ------------------------------------------------------------------
     // Step 9: Subscribe to PaymentsModule events (MUST come after index build)
+    // Guard: if destroy() was called during async steps above, bail out
     // ------------------------------------------------------------------
+    if (this.destroyed) return;
     this._subscribeToPaymentsEvents();
 
     // ------------------------------------------------------------------
@@ -552,6 +579,10 @@ export class AccountingModule {
     this.invoiceGates.set(invoiceId, next);
     try {
       await current;
+      // Bail out if module was destroyed while waiting for the gate
+      if (this.destroyed) {
+        throw new SphereError('AccountingModule has been destroyed.', 'MODULE_DESTROYED');
+      }
       return await fn();
     } finally {
       resolve();
@@ -800,6 +831,10 @@ export class AccountingModule {
     const saltBuffer = await crypto.subtle.digest('SHA-256', saltInput);
     const salt = new Uint8Array(saltBuffer);
 
+    // Zero key material immediately — no longer needed after digest
+    signingKeyBytes.fill(0);
+    saltInput.fill(0);
+
     // ------------------------------------------------------------------
     // Steps 5–13: Mint token and store (mirrors NametagMinter pattern)
     // ------------------------------------------------------------------
@@ -972,21 +1007,9 @@ export class AccountingModule {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let sdkToken: any;
 
-      if (this.config.debug) {
-        // Skip verification in debug mode
-        logger.debug(LOG_TAG, 'Creating invoice token WITHOUT proof verification (debug mode)');
-        const tokenJson = {
-          version: '2.0',
-          state: tokenState.toJSON(),
-          genesis: genesisTransaction.toJSON(),
-          transactions: [],
-          nametags: [],
-        };
-        sdkToken = await SdkToken.fromJSON(tokenJson);
-      } else {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        sdkToken = await SdkToken.mint(trustBase as any, tokenState, genesisTransaction);
-      }
+      // Always verify against trust base — never skip proof verification
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sdkToken = await SdkToken.mint(trustBase as any, tokenState, genesisTransaction);
 
       if (this.config.debug) {
         logger.debug(LOG_TAG, 'Invoice token minted successfully');
@@ -1309,9 +1332,11 @@ export class AccountingModule {
       const uiToken = txfToToken(tokenId, token);
       await deps.payments.addToken(uiToken);
     } catch (err) {
-      logger.warn(LOG_TAG, `importInvoice: failed to store token ${tokenId}:`, err);
-      // Token storage failure is non-fatal for the cache (we still register the terms)
-      // but we log it prominently as a warning.
+      throw new SphereError(
+        `importInvoice: failed to persist token ${tokenId} — ${err instanceof Error ? err.message : String(err)}`,
+        'INVOICE_STORAGE_FAILED',
+        err instanceof Error ? err : undefined,
+      );
     }
 
     // ------------------------------------------------------------------
@@ -2564,9 +2589,15 @@ export class AccountingModule {
 
         // ------------------------------------------------------------------
         // Recipient resolution:
-        // 1. contacts[0].address
+        // 1. contacts[0].address (payer-provided — may differ from senderAddress
+        //    if payer explicitly set a contact address; this is by design to
+        //    support delegated/custodial payment flows)
         // 2. senderAddress (if isRefundAddress is falsy)
         // 3. unresolvable → record as failed
+        //
+        // NOTE: contacts[0].address is payer-controlled and validated during
+        // memo decoding (must be DIRECT:// format, ≤256 chars). The receipt
+        // contains balance info for this specific sender only, not wallet-wide.
         // ------------------------------------------------------------------
         let recipientAddress: string | null = null;
 
@@ -3075,8 +3106,7 @@ export class AccountingModule {
             (h) =>
               h.type === 'SENT' &&
               h.memo !== undefined &&
-              h.memo.includes(invoiceId) &&
-              h.memo.includes(dedupTransferId),
+              h.memo === memo,
           );
 
           if (alreadyReturned) {
@@ -3354,13 +3384,17 @@ export class AccountingModule {
       const transferId = key.slice(colonIdx + 1);
 
       // Secondary dedup: check if return already landed in history (§7.5)
-      // Look for outbound SENT entry whose memo references the originalTransferId
+      // Use exact memo match to prevent crafted-memo false positives
+      const expectedMemo = buildInvoiceMemo(
+        invoiceId,
+        transferId.startsWith('FROZEN:') ? 'RC' : 'B',
+        transferId,
+      );
       const alreadyReturned = history.find(
         (h) =>
           h.type === 'SENT' &&
           h.memo !== undefined &&
-          h.memo.includes(invoiceId) &&
-          h.memo.includes(transferId),
+          h.memo === expectedMemo,
       );
 
       if (alreadyReturned) {
@@ -4656,10 +4690,21 @@ export class AccountingModule {
         await this.autoReturnManager.markCompleted(invoiceId, sendParams.transferId, result.id);
       });
 
+      const returnRef: import('./types.js').InvoiceTransferRef = {
+        transferId: result.id,
+        direction: 'outbound',
+        paymentDirection: originalRef.paymentDirection === 'forward' ? 'return_closed' : originalRef.paymentDirection,
+        coinId: sendParams.coinId,
+        amount: sendParams.amount,
+        destinationAddress: sendParams.returnTo,
+        senderAddress: deps.identity.directAddress ?? '',
+        timestamp: Date.now(),
+        confirmed: false,
+      };
       deps.emitEvent('invoice:auto_returned', {
         invoiceId,
         originalTransfer: originalRef,
-        returnTransfer: originalRef,
+        returnTransfer: returnRef,
       });
     } catch (err) {
       logger.warn(LOG_TAG, `Auto-return send failed for ${invoiceId} → ${sendParams.returnTo}:`, err);

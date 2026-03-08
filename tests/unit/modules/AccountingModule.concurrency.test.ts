@@ -141,18 +141,10 @@ describe('UT-CONCURRENCY: gate releases on error', () => {
     await module.closeInvoice(invoiceId);
 
     // Second close should throw ALREADY_CLOSED, not deadlock
-    try {
-      await module.closeInvoice(invoiceId);
-    } catch (e) {
-      expect((e as SphereError).code).toBe('INVOICE_ALREADY_CLOSED');
-    }
+    await expect(module.closeInvoice(invoiceId)).rejects.toMatchObject({ code: 'INVOICE_ALREADY_CLOSED' });
 
     // Third attempt should also get the error (gate was released)
-    try {
-      await module.closeInvoice(invoiceId);
-    } catch (e) {
-      expect((e as SphereError).code).toBe('INVOICE_ALREADY_CLOSED');
-    }
+    await expect(module.closeInvoice(invoiceId)).rejects.toMatchObject({ code: 'INVOICE_ALREADY_CLOSED' });
   });
 });
 

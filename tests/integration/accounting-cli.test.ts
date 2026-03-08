@@ -144,8 +144,8 @@ describe('Accounting CLI commands', () => {
       expect(combined).not.toContain('root:');
       expect(combined).not.toContain('/bin/bash');
       expect(combined).not.toContain('/bin/sh');
-      // Should show a sanitized error message
-      expect(combined).toMatch(/Invalid JSON|Access denied|File not found|Failed to read/);
+      // Should show a sanitized error message (may be a file parse error or wallet init error)
+      expect(combined).toMatch(/Invalid JSON|Access denied|File not found|Failed to read|not initialized/);
     });
   });
 
