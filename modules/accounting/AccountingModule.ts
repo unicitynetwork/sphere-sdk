@@ -585,9 +585,7 @@ export class AccountingModule {
     // C3-R20 fix: Loop until _flushPromise is fully drained. A concurrent
     // _handleTokenChange can replace the reference between our await and the null
     // assignment, causing the replacement chain to escape the drain.
-    while (this._flushPromise) {
-      await this._flushPromise.catch(() => { /* swallow — flush errors are non-fatal on destroy */ });
-    }
+    await this._drainFlushPromise();
 
     // C2-R20 fix: Loop gate drain until empty. A one-shot snapshot misses gates
     // registered during the await (e.g., Phase 3 of in-flight auto-returns).
@@ -597,6 +595,11 @@ export class AccountingModule {
     while (this.invoiceGates.size > 0) {
       await Promise.allSettled(Array.from(this.invoiceGates.values()));
     }
+
+    // C1-R21 fix: Gated operations completing during the gate drain above may have
+    // scheduled new _flushPromise chains (e.g., _flushDirtyLedgerEntries from event
+    // pipeline code). Drain again to catch any flushes triggered by gated ops.
+    await this._drainFlushPromise();
 
     // C10 fix: Do NOT call _clearInMemoryState() here. After destroyed=true +
     // unsubscribe + gate drain, the module is inert — all public API methods check
@@ -3727,7 +3730,12 @@ export class AccountingModule {
       }
 
       // Increment retry counter before attempting send
-      await this.autoReturnManager.incrementRetry(invoiceId, transferId);
+      // W4-R21 fix: Wrap in try/catch so storage failure doesn't abort remaining entries
+      try {
+        await this.autoReturnManager.incrementRetry(invoiceId, transferId);
+      } catch {
+        logger.warn(LOG_TAG, `Crash recovery: failed to persist retry count for ${key} — continuing`);
+      }
 
       if (this.config.debug) {
         logger.debug(
@@ -4287,6 +4295,17 @@ export class AccountingModule {
     }
   }
 
+  /**
+   * Drain the `_flushPromise` chain until it's fully resolved.
+   * A concurrent `_handleTokenChange` can replace the reference between our
+   * await and the null assignment, so we loop until the field is null.
+   */
+  private async _drainFlushPromise(): Promise<void> {
+    while (this._flushPromise) {
+      await this._flushPromise.catch(() => { /* swallow — flush errors are non-fatal */ });
+    }
+  }
+
   // ===========================================================================
   // Internal: Event handlers
   // ===========================================================================
@@ -4419,7 +4438,8 @@ export class AccountingModule {
       this._markTokenEntriesConfirmed(token.id);
     }
     // Flush the confirmed-status updates
-    if (this.destroyed) return;
+    // C2-R21 fix: No destroyed check here — confirmed=true updates have no recovery path
+    // because transfer:confirmed events don't re-fire. Must persist even during shutdown.
     await this._flushDirtyLedgerEntries();
 
     // §6.2 transfer:confirmed step 1–4: re-fire events with confirmed=true
@@ -5286,6 +5306,10 @@ export class AccountingModule {
       });
     } catch (err) {
       logger.warn(LOG_TAG, `Auto-return send failed for ${invoiceId} → ${sendParams.returnTo}:`, err);
+
+      // W3-R21 fix: Increment retry count so crash recovery has a bounded retry limit.
+      // Without this, a persistently failing send would never reach MAX_RETRY_COUNT.
+      await this.autoReturnManager.incrementRetry(invoiceId, sendParams.transferId).catch(() => {});
 
       // Mark failed immediately (no gate — dedup ledger only)
       await this.autoReturnManager.markFailed(invoiceId, sendParams.transferId).catch(() => {});
