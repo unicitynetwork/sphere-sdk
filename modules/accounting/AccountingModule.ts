@@ -201,6 +201,9 @@ export class AccountingModule {
   /** W17: Tracks whether tokenScanState has been mutated since last flush. */
   private tokenScanDirty = false;
 
+  /** W2 fix: Serialization guard for _flushDirtyLedgerEntries. */
+  private _flushPromise: Promise<void> | null = null;
+
   // ---------------------------------------------------------------------------
   // Per-invoice concurrency gate (promise chain)
   // ---------------------------------------------------------------------------
@@ -288,17 +291,24 @@ export class AccountingModule {
     if (this.loadPromise) {
       return this.loadPromise;
     }
-    // W1 fix: If _loading is true but loadPromise is null (brief window in finally block),
-    // spin-wait until the flag clears, then re-check — avoids silent undefined return.
+    // C2 fix: If _loading is true but loadPromise is null (brief window in finally block),
+    // spin-wait until the flag clears, with destroy check and 10s timeout.
     if (this._loading) {
-      await new Promise<void>((resolve) => {
+      await new Promise<void>((resolve, reject) => {
+        let iterations = 0;
+        const MAX_ITERATIONS = 10000; // ~10 seconds
         const check = () => {
           if (!this._loading) resolve();
+          else if (this.destroyed) reject(new SphereError('AccountingModule has been destroyed.', 'MODULE_DESTROYED'));
+          else if (++iterations > MAX_ITERATIONS) reject(new SphereError('load() timed out waiting for prior load', 'NOT_INITIALIZED'));
           else setTimeout(check, 1);
         };
         check();
       });
-      // After the previous load completed, do not re-run — just return.
+      // After the previous load completed, verify module is still alive.
+      if (this.destroyed) {
+        throw new SphereError('AccountingModule has been destroyed.', 'MODULE_DESTROYED');
+      }
       return;
     }
 
@@ -472,7 +482,9 @@ export class AccountingModule {
     const walletAddresses = new Set(activeAddresses.map((a) => a.directAddress));
 
     let anyReconstructed = false;
-    const reconstructFrozen = (invoiceId: string, terminalState: 'CLOSED' | 'CANCELLED', resetReturns: boolean) => {
+    // C1 fix: 4th param of freezeBalances is `explicit` (whether the user explicitly closed),
+    // NOT `resetReturns`. After a crash, the original close type is unknown — default to false.
+    const reconstructFrozen = (invoiceId: string, terminalState: 'CLOSED' | 'CANCELLED', explicit: boolean) => {
       const terms = this.invoiceTermsCache.get(invoiceId);
       if (terms) {
         logger.warn(
@@ -482,7 +494,7 @@ export class AccountingModule {
         const ledgerMap = this.invoiceLedger.get(invoiceId) ?? new Map();
         const entries = Array.from(ledgerMap.values());
         const status = computeInvoiceStatus(invoiceId, terms, entries, null, walletAddresses);
-        const frozen = freezeBalances(terms, status, terminalState, resetReturns);
+        const frozen = freezeBalances(terms, status, terminalState, explicit);
         this.frozenBalances.set(invoiceId, frozen);
         anyReconstructed = true;
       } else {
@@ -500,7 +512,7 @@ export class AccountingModule {
     }
     for (const invoiceId of this.closedInvoices) {
       if (!this.frozenBalances.has(invoiceId)) {
-        reconstructFrozen(invoiceId, 'CLOSED', true);
+        reconstructFrozen(invoiceId, 'CLOSED', false);
       }
     }
     // C5 fix: Await the save — fire-and-forget risks losing reconstructed
@@ -1829,6 +1841,8 @@ export class AccountingModule {
    * @throws {SphereError} `NOT_INITIALIZED` — module not initialized.
    */
   getInvoice(invoiceId: string): InvoiceRef | null {
+    // W1: getInvoice() is intentionally exempt from ensureNotDestroyed() per spec §10 —
+    // it is synchronous, read-only, in-memory. Same exemption as getAutoReturnSettings().
     this.ensureInitialized();
 
     const terms = this.invoiceTermsCache.get(invoiceId);
@@ -2194,7 +2208,8 @@ export class AccountingModule {
     if (params.amount !== undefined) {
       sendAmount = params.amount;
     } else {
-      const requested = BigInt(requestedAmountStr);
+      // C4 fix: use _safeBigInt to avoid SyntaxError on corrupted stored amounts
+      const requested = AccountingModule._safeBigInt(requestedAmountStr);
       const ledgerEntries = this.invoiceLedger.get(invoiceId)
         ? Array.from(this.invoiceLedger.get(invoiceId)!.values())
         : [];
@@ -2285,9 +2300,9 @@ export class AccountingModule {
       );
     }
 
-    // Validate amount: must be a positive integer string
-    if (!params.amount || !/^[1-9]\d*$/.test(params.amount)) {
-      throw new SphereError('Invalid amount: must be a positive integer string', 'INVOICE_INVALID_AMOUNT');
+    // W4 fix: Validate amount: positive integer string, capped at 78 digits to prevent BigInt DoS
+    if (!params.amount || !/^[1-9]\d*$/.test(params.amount) || params.amount.length > 78) {
+      throw new SphereError('Invalid amount: must be a positive integer string (max 78 digits)', 'INVOICE_INVALID_AMOUNT');
     }
 
     // §8.6 step 3: Balance check and send — serialized inside the per-invoice gate.
@@ -2745,7 +2760,7 @@ export class AccountingModule {
 
       for (const coinAsset of frozenTarget.coinAssets) {
         const [coinId, requestedAmountStr] = coinAsset.coin;
-        const requestedAmount = BigInt(requestedAmountStr);
+        const requestedAmount = AccountingModule._safeBigInt(requestedAmountStr);
 
         for (const frozenSender of coinAsset.frozenSenderBalances) {
           const key = frozenSender.senderAddress;
@@ -3015,7 +3030,7 @@ export class AccountingModule {
 
       for (const coinAsset of frozenTarget.coinAssets) {
         const [coinId, requestedAmountStr] = coinAsset.coin;
-        const requestedAmount = BigInt(requestedAmountStr);
+        const requestedAmount = AccountingModule._safeBigInt(requestedAmountStr);
 
         for (const frozenSender of coinAsset.frozenSenderBalances) {
           const key = frozenSender.senderAddress;
@@ -4068,7 +4083,9 @@ export class AccountingModule {
             if (i === 0) return (txf.genesis?.data?.recipient ?? '');
             return '';
           })(),
-          timestamp: Date.now(),
+          // W7 fix: use 0 sentinel (matching InvoiceTransferIndex convention) — Date.now()
+          // would produce incorrect timestamps on crash-recovery rescans.
+          timestamp: 0,
           confirmed: tx.inclusionProof !== null,
           senderAddress,
           ...(payload.inv.ra !== undefined ? { refundAddress: payload.inv.ra } : {}),
@@ -4213,10 +4230,15 @@ export class AccountingModule {
     // _handleTransferConfirmed) will call _flushDirtyLedgerEntries() as
     // part of their normal flow. For token changes that DON'T trigger
     // an event (e.g., sync), we schedule an async flush.
-    if (this.dirtyLedgerEntries.size > 0) {
-      this._flushDirtyLedgerEntries().catch((err) => {
+    // W2 fix: Serialize flushes to prevent concurrent interleaved writes
+    if (this.dirtyLedgerEntries.size > 0 || this.tokenScanDirty) {
+      const doFlush = async () => {
+        if (this._flushPromise) await this._flushPromise;
+        await this._flushDirtyLedgerEntries();
+      };
+      this._flushPromise = doFlush().catch((err) => {
         logger.warn(LOG_TAG, 'Error flushing ledger after token change:', err);
-      });
+      }).finally(() => { this._flushPromise = null; });
     }
   }
 
@@ -4763,8 +4785,13 @@ export class AccountingModule {
                 totalReturned += AccountingModule._safeBigInt(ref.amount);
               }
             }
-            // Include the current return amount
-            totalReturned += AccountingModule._safeBigInt(syntheticRef.amount);
+            // W3 fix: Only add synthetic ref amount if it wasn't already indexed in the ledger.
+            // _processTokenTransactions runs before this handler and may have already
+            // created a ledger entry with the same transferId — adding again double-counts.
+            const syntheticKey = `${syntheticRef.transferId}::${coinId}`;
+            if (!innerMap.has(syntheticKey)) {
+              totalReturned += AccountingModule._safeBigInt(syntheticRef.amount);
+            }
 
             if (totalReturned > totalForwarded) {
               deps.emitEvent('invoice:over_refund_warning', {
@@ -5379,8 +5406,10 @@ export class AccountingModule {
     // always > 0 after first scan, causing unnecessary writes on every event).
     if (this.dirtyLedgerEntries.size === 0 && !this.tokenScanDirty) return;
 
-    // Step 1: Write dirty invoice ledger entries (delete per-write for crash safety)
+    // C3 fix: Step 1 uses direct storage.set() — failures abort steps 2-3 to prevent
+    // watermark advancement past un-persisted ledger entries.
     const written = new Set<string>();
+    let step1Failed = false;
     for (const invoiceId of this.dirtyLedgerEntries) {
       const innerMap = this.invoiceLedger.get(invoiceId);
       if (!innerMap) continue;
@@ -5388,12 +5417,25 @@ export class AccountingModule {
       for (const [k, v] of innerMap.entries()) {
         entries[k] = v;
       }
-      await this.saveJsonToStorage(`${INV_LEDGER_PREFIX}${invoiceId}`, entries);
-      written.add(invoiceId);
+      try {
+        await this.deps!.storage.set(
+          this.getStorageKey(`${INV_LEDGER_PREFIX}${invoiceId}`),
+          JSON.stringify(entries),
+        );
+        written.add(invoiceId);
+      } catch (err) {
+        logger.warn(LOG_TAG, `Failed to persist ledger for invoice ${invoiceId} — aborting flush`, err);
+        step1Failed = true;
+        break;
+      }
     }
     for (const id of written) {
       this.dirtyLedgerEntries.delete(id);
     }
+
+    // C3: If any step-1 write failed, skip steps 2-3 to prevent watermark advancing
+    // past un-persisted entries. Next flush will retry.
+    if (step1Failed) return;
 
     // Step 2: Write token_scan_state
     const scanStateObj: Record<string, number> = {};

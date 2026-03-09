@@ -655,7 +655,8 @@ export function createTestTransfer(
         inclusionProof,
         data: {
           message: messageHex,
-          senderAddress: sender,
+          // W9 fix: include recipient in tx.data (read by _processTokenTransactions for destinationAddress)
+          recipient,
         },
       },
     ],

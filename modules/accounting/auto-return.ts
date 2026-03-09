@@ -125,11 +125,11 @@ export class AutoReturnManager {
     const cutoff = Date.now() - PRUNE_TTL_MS;
     let pruned = false;
     for (const [key, entry] of this.ledger.entries()) {
-      if (
-        entry.status === 'completed' &&
-        entry.completedAt !== undefined &&
-        entry.completedAt < cutoff
-      ) {
+      // W6 fix: also prune failed entries older than PRUNE_TTL_MS to prevent unbounded growth
+      const isOldCompleted = entry.status === 'completed' && entry.completedAt !== undefined && entry.completedAt < cutoff;
+      const failedAge = entry.lastRetryAt ?? entry.intentAt;
+      const isOldFailed = entry.status === 'failed' && failedAge < cutoff;
+      if (isOldCompleted || isOldFailed) {
         this.ledger.delete(key);
         pruned = true;
       }
@@ -371,11 +371,11 @@ export class AutoReturnManager {
     const cutoff = Date.now() - PRUNE_TTL_MS;
     let pruned = false;
     for (const [key, entry] of this.ledger.entries()) {
-      if (
-        entry.status === 'completed' &&
-        entry.completedAt !== undefined &&
-        entry.completedAt < cutoff
-      ) {
+      // W6 fix: also prune failed entries older than PRUNE_TTL_MS to prevent unbounded growth
+      const isOldCompleted = entry.status === 'completed' && entry.completedAt !== undefined && entry.completedAt < cutoff;
+      const failedAge = entry.lastRetryAt ?? entry.intentAt;
+      const isOldFailed = entry.status === 'failed' && failedAge < cutoff;
+      if (isOldCompleted || isOldFailed) {
         this.ledger.delete(key);
         pruned = true;
       }

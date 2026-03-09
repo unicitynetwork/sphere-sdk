@@ -466,7 +466,14 @@ export class InvoiceTransferIndex {
 
         const rawMessageHex = (tx.data as Record<string, unknown> | undefined)?.['message'];
         let messageBytes: Uint8Array | null = null;
-        if (typeof rawMessageHex === 'string' && rawMessageHex.length > 0) {
+        // C5 fix: validate hex format before hexToBytes — odd-length or non-hex chars
+        // produce silent corruption (NaN→0 bytes) rather than throwing.
+        if (
+          typeof rawMessageHex === 'string' &&
+          rawMessageHex.length > 0 &&
+          rawMessageHex.length % 2 === 0 &&
+          /^[0-9a-fA-F]*$/.test(rawMessageHex)
+        ) {
           try {
             messageBytes = hexToBytes(rawMessageHex);
           } catch {
@@ -708,6 +715,18 @@ export class InvoiceTransferIndex {
 
     // Update watermark to last successfully processed index
     this.tokenScanState.set(tokenId, lastSuccessIdx);
+
+    // W5 fix: clean up watermarkRetries entries for indices now past the watermark.
+    // Without this, entries for transactions that failed once/twice but then succeeded
+    // (watermark advanced past them) accumulate indefinitely.
+    for (const key of this.watermarkRetries.keys()) {
+      if (key.startsWith(`${tokenId}:`)) {
+        const idx = parseInt(key.slice(tokenId.length + 1), 10);
+        if (idx < lastSuccessIdx) {
+          this.watermarkRetries.delete(key);
+        }
+      }
+    }
 
     return newEntries;
   }
