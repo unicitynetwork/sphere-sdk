@@ -135,6 +135,7 @@ export class AccountingModule {
 
   private destroyed = false;
   private loadPromise: Promise<void> | null = null;
+  private _loading = false;
 
   // ---------------------------------------------------------------------------
   // Invoice token cache: invoiceId → parsed InvoiceTerms
@@ -193,6 +194,12 @@ export class AccountingModule {
 
   /** Dirty invoiceIds whose ledger entries need to be flushed to storage. */
   private dirtyLedgerEntries: Set<string> = new Set();
+
+  /** Count of unknown (not in invoiceTermsCache) invoice IDs in the ledger. */
+  private unknownLedgerCount = 0;
+
+  /** W17: Tracks whether tokenScanState has been mutated since last flush. */
+  private tokenScanDirty = false;
 
   // ---------------------------------------------------------------------------
   // Per-invoice concurrency gate (promise chain)
@@ -275,15 +282,20 @@ export class AccountingModule {
     this.ensureInitialized();
     this.ensureNotDestroyed();
 
-    // Re-entry guard: if load() is already in progress, return the same promise
+    // Re-entry guard: if load() is already in progress, return the same promise.
+    // C11 fix: use _loading flag to prevent triple-call race where loadPromise
+    // is cleared in finally before a third caller can see it.
     if (this.loadPromise) {
       return this.loadPromise;
     }
+    if (this._loading) return;
 
+    this._loading = true;
     this.loadPromise = this._doLoad();
     try {
       await this.loadPromise;
     } finally {
+      this._loading = false;
       this.loadPromise = null;
     }
   }
@@ -356,6 +368,10 @@ export class AccountingModule {
       logger.warn(LOG_TAG, 'Failed to enumerate tokens via PaymentsModule:', err);
     }
 
+    // W16: destroyed check between major steps — prevents partial state population
+    // if destroy() was called while _doLoad() is in progress.
+    if (this.destroyed) return;
+
     // ------------------------------------------------------------------
     // Step 4: Load terminal sets
     // ------------------------------------------------------------------
@@ -370,6 +386,8 @@ export class AccountingModule {
       [],
     );
     for (const id of closedRaw) this.closedInvoices.add(id);
+
+    if (this.destroyed) return;
 
     // ------------------------------------------------------------------
     // Step 5: Load frozen balances
@@ -404,6 +422,8 @@ export class AccountingModule {
       await this._persistTerminalSets();
     }
 
+    if (this.destroyed) return;
+
     // ------------------------------------------------------------------
     // Step 6: Load auto-return settings
     // ------------------------------------------------------------------
@@ -422,6 +442,8 @@ export class AccountingModule {
     // (Full implementation deferred; we load the ledger here for completeness.)
     // ------------------------------------------------------------------
     await this._loadAndRecoverAutoReturnLedger();
+
+    if (this.destroyed) return;
 
     // ------------------------------------------------------------------
     // Step 8: Populate invoice-transfer index (§5.4.4)
@@ -469,14 +491,13 @@ export class AccountingModule {
         reconstructFrozen(invoiceId, 'CLOSED', true);
       }
     }
-    // Persist only if we actually reconstructed any frozen balances (W4 fix)
+    // C5 fix: Await the save — fire-and-forget risks losing reconstructed
+    // frozen balances on crash, leaving recovery in a loop.
     if (anyReconstructed) {
-      this.saveJsonToStorage(
+      await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
-      ).catch((err) => {
-        logger.warn(LOG_TAG, `Failed to persist reconstructed frozen balances:`, err);
-      });
+      );
     }
 
     // ------------------------------------------------------------------
@@ -505,7 +526,8 @@ export class AccountingModule {
 
     // Emit deferred reconciliation events now that the module is fully initialized
     for (const { event, payload } of deferredEvents) {
-      deps.emitEvent(event as keyof SphereEventMap, payload as never);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      deps.emitEvent(event as keyof SphereEventMap, payload as any);
     }
 
     if (this.config.debug) {
@@ -536,15 +558,17 @@ export class AccountingModule {
     try { this.unsubscribeDMs?.(); } catch { /* ignore */ }
     this.unsubscribeDMs = null;
 
-    // Await all in-flight gated operations before clearing state.
+    // Await all in-flight gated operations before declaring destruction complete.
     // Each gate value is the tail of a per-invoice promise chain;
-    // awaiting all tails ensures no operation is mid-flight when we clear.
+    // awaiting all tails ensures no operation is mid-flight.
     if (this.invoiceGates.size > 0) {
       await Promise.allSettled(Array.from(this.invoiceGates.values()));
     }
 
-    // Clear all in-memory state
-    this._clearInMemoryState();
+    // C10 fix: Do NOT call _clearInMemoryState() here. After destroyed=true +
+    // unsubscribe + gate drain, the module is inert — all public API methods check
+    // ensureNotDestroyed(). Clearing state while in-flight ops may still hold
+    // references causes them to write into emptied maps, corrupting state.
 
     if (this.config.debug) {
       logger.debug(LOG_TAG, 'Module destroyed');
@@ -579,6 +603,20 @@ export class AccountingModule {
         'MODULE_DESTROYED',
       );
     }
+  }
+
+  // ===========================================================================
+  // Safe BigInt parse helper
+  // ===========================================================================
+
+  /**
+   * Parse a string as BigInt with validation. Returns 0n for invalid input
+   * (consistent with balance-computer.ts parseBigInt).
+   */
+  private static _safeBigInt(amount: string): bigint {
+    if (!amount || amount.length > 78) return 0n;
+    if (!/^(0|[1-9]\d*)$/.test(amount)) return 0n;
+    return BigInt(amount);
   }
 
   // ===========================================================================
@@ -819,7 +857,11 @@ export class AccountingModule {
       }
     }
 
-    // Oracle available — must have getStateTransitionClient
+    // Oracle available — must have getStateTransitionClient.
+    // NOTE (C3): The OracleProvider interface does not expose getStateTransitionClient(),
+    // but the concrete UnicityAggregatorProvider implementation does. The `as any` cast
+    // is a design compromise — changing the interface requires a cross-SDK breaking change.
+    // The optional chain ensures a graceful error if the method is absent.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const stClient = (deps.oracle as any).getStateTransitionClient?.();
     if (!stClient) {
@@ -862,8 +904,15 @@ export class AccountingModule {
     // Step 4: Generate deterministic salt — SHA-256(signingKey || invoiceBytes)
     // ------------------------------------------------------------------
     const privateKeyHex = deps.identity.privateKey;
+    if (!privateKeyHex) {
+      throw new SphereError('Private key required for invoice creation', 'NOT_INITIALIZED');
+    }
+    const hexMatches = privateKeyHex.match(/.{1,2}/g);
+    if (!hexMatches) {
+      throw new SphereError('Invalid private key format', 'NOT_INITIALIZED');
+    }
     const signingKeyBytes = new Uint8Array(
-      privateKeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)),
+      hexMatches.map((byte) => parseInt(byte, 16)),
     );
     const saltInput = new Uint8Array(signingKeyBytes.length + invoiceBytesEncoded.length);
     saltInput.set(signingKeyBytes, 0);
@@ -1376,6 +1425,17 @@ export class AccountingModule {
           'INVOICE_INVALID_PROOF',
         );
       }
+
+      // C7 fix: Verify that the JSON-supplied tokenId matches the cryptographically
+      // computed token identity. Without this check, an attacker can submit a valid
+      // proof for token X while claiming it is token Y, poisoning the ledger cache.
+      const canonicalTokenId = sdkToken.id?.toJSON?.() ?? null;
+      if (canonicalTokenId && canonicalTokenId !== tokenId) {
+        throw new SphereError(
+          `Invoice import failed: tokenId mismatch — JSON claims ${tokenId} but cryptographic identity is ${canonicalTokenId}`,
+          'INVOICE_INVALID_DATA',
+        );
+      }
     } catch (err) {
       if (err instanceof SphereError) throw err;
       throw new SphereError(
@@ -1401,6 +1461,10 @@ export class AccountingModule {
     // ------------------------------------------------------------------
     // Step 7: Register in invoiceTermsCache
     // ------------------------------------------------------------------
+    // W11: Decrement unknown count if this invoice was previously indexed as unknown
+    if (this.invoiceLedger.has(tokenId) && !this.invoiceTermsCache.has(tokenId)) {
+      this.unknownLedgerCount = Math.max(0, this.unknownLedgerCount - 1);
+    }
     this.invoiceTermsCache.set(tokenId, terms);
 
     if (!this.invoiceLedger.has(tokenId)) {
@@ -1546,6 +1610,9 @@ export class AccountingModule {
         }
 
         // Re-verify inside the gate: recompute to confirm still COVERED + allConfirmed
+        // Recompute walletAddresses inside the gate to avoid stale data (W15 fix)
+        const gateActiveAddresses = this.deps!.getActiveAddresses();
+        const gateWalletAddresses = new Set(gateActiveAddresses.map((a) => a.directAddress));
         const reEntries = this.invoiceLedger.get(invoiceId)
           ? Array.from(this.invoiceLedger.get(invoiceId)!.values())
           : [];
@@ -1554,7 +1621,7 @@ export class AccountingModule {
           terms,
           reEntries,
           null,
-          walletAddresses,
+          gateWalletAddresses,
         );
 
         if (reStatus.state === 'COVERED' && reStatus.allConfirmed) {
@@ -1837,16 +1904,18 @@ export class AccountingModule {
       // Freeze balances for CLOSED state
       const frozen = freezeBalances(terms, status, 'CLOSED', true, latestSenderMap);
 
-      // Persist in crash-safe order: terminal set FIRST, then frozen balances
-      this.closedInvoices.add(invoiceId);
-      await this.saveJsonToStorage(
-        STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
-        Array.from(this.closedInvoices),
-      );
+      // Persist in crash-safe order: frozen balances FIRST, then terminal set.
+      // The terminal set write is the commit point — if we crash between writes,
+      // the invoice is NOT terminal on recovery (safe to re-close).
       this.frozenBalances.set(invoiceId, frozen);
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+      );
+      this.closedInvoices.add(invoiceId);
+      await this.saveJsonToStorage(
+        STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
+        Array.from(this.closedInvoices),
       );
 
       // Fire event
@@ -1931,16 +2000,18 @@ export class AccountingModule {
       // latestSenderMap is not used for CANCELLED (all balances preserved as-is)
       const frozen = freezeBalances(terms, status, 'CANCELLED', false);
 
-      // Persist in crash-safe order: terminal set FIRST, then frozen balances
-      this.cancelledInvoices.add(invoiceId);
-      await this.saveJsonToStorage(
-        STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
-        Array.from(this.cancelledInvoices),
-      );
+      // Persist in crash-safe order: frozen balances FIRST, then terminal set.
+      // The terminal set write is the commit point — if we crash between writes,
+      // the invoice is NOT terminal on recovery (safe to re-cancel).
       this.frozenBalances.set(invoiceId, frozen);
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+      );
+      this.cancelledInvoices.add(invoiceId);
+      await this.saveJsonToStorage(
+        STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
+        Array.from(this.cancelledInvoices),
       );
 
       // Fire event
@@ -2124,8 +2195,11 @@ export class AccountingModule {
 
     // §4.7: Auto-populate contact from identity.directAddress when not explicitly provided.
     // Every outbound invoice payment must carry contact info for the target to reach the payer.
+    if (!deps.identity.directAddress) {
+      throw new SphereError('directAddress required for invoice payments', 'NOT_INITIALIZED');
+    }
     const effectiveContact: { address: string; url?: string } = params.contact ?? {
-      address: deps.identity.directAddress!,
+      address: deps.identity.directAddress,
     };
 
     if (this.config.debug) {
@@ -2186,6 +2260,11 @@ export class AccountingModule {
       );
     }
 
+    // Validate amount: must be a positive integer string
+    if (!params.amount || !/^[1-9]\d*$/.test(params.amount)) {
+      throw new SphereError('Invalid amount: must be a positive integer string', 'INVOICE_INVALID_AMOUNT');
+    }
+
     // §8.6 step 3: Balance check and send — serialized inside the per-invoice gate.
     // The gate prevents concurrent returns from both passing the balance check before
     // either's send completes (§5.9). A 60-second timeout is applied to send() per spec.
@@ -2238,7 +2317,7 @@ export class AccountingModule {
             if (fca.coin[0] !== coinId) continue;
             const fsb = fca.frozenSenderBalances.find((s) => s.senderAddress === senderAddress);
             if (fsb) {
-              frozenBaseline = BigInt(fsb.netBalance);
+              frozenBaseline = AccountingModule._safeBigInt(fsb.netBalance);
             }
             break;
           }
@@ -2265,7 +2344,7 @@ export class AccountingModule {
           ) {
             const effectiveSender = entry.refundAddress ?? entry.senderAddress;
             if (effectiveSender === senderAddress) {
-              postFreezeForward += BigInt(entry.amount);
+              postFreezeForward += AccountingModule._safeBigInt(entry.amount);
             }
           }
 
@@ -2278,7 +2357,7 @@ export class AccountingModule {
           ) {
             const effectiveRecipient = entry.destinationAddress;
             if (effectiveRecipient === senderAddress) {
-              postFreezeReturned += BigInt(entry.amount);
+              postFreezeReturned += AccountingModule._safeBigInt(entry.amount);
             }
           }
         }
@@ -2298,7 +2377,7 @@ export class AccountingModule {
         const senderBalance = coinAssetStatus?.senderBalances.find(
           (sb) => sb.senderAddress === senderAddress,
         );
-        senderNetBalance = senderBalance ? BigInt(senderBalance.netBalance) : 0n;
+        senderNetBalance = senderBalance ? AccountingModule._safeBigInt(senderBalance.netBalance) : 0n;
       }
 
       // §8.6 balance cap validation
@@ -2435,7 +2514,7 @@ export class AccountingModule {
       // Reset 'failed' ledger entries to 'pending' for all affected invoices
       for (const id of terminatedIds) {
         for (const transferId of this.autoReturnManager.getFailedTransferIds(id)) {
-          this.autoReturnManager.resetToPending(id, transferId);
+          await this.autoReturnManager.resetToPending(id, transferId);
         }
       }
 
@@ -2471,7 +2550,7 @@ export class AccountingModule {
 
       // Reset 'failed' ledger entries for this invoice
       for (const transferId of this.autoReturnManager.getFailedTransferIds(invoiceId)) {
-        this.autoReturnManager.resetToPending(invoiceId, transferId);
+        await this.autoReturnManager.resetToPending(invoiceId, transferId);
       }
 
       // If enabling and the invoice is already terminated, trigger immediate auto-return
@@ -3208,7 +3287,7 @@ export class AccountingModule {
         const coinId = fca.coin[0];
 
         for (const fsb of fca.frozenSenderBalances) {
-          const netBalance = BigInt(fsb.netBalance);
+          const netBalance = AccountingModule._safeBigInt(fsb.netBalance);
           if (netBalance <= 0n) continue;
 
           const recipient = fsb.senderAddress;
@@ -3222,13 +3301,15 @@ export class AccountingModule {
           if (this.autoReturnManager.isDone(invoiceId, dedupTransferId)) continue;
 
           // Secondary dedup: check transaction history for an existing return
+          // W13: Require type === 'SENT' AND on-chain confirmation (transferId or txHash)
           const history = deps.payments.getHistory();
           const memo = buildInvoiceMemo(invoiceId, direction, dedupTransferId);
           const alreadyReturned = history.find(
             (h) =>
               h.type === 'SENT' &&
               h.memo !== undefined &&
-              h.memo === memo,
+              h.memo === memo &&
+              h.transferId, // must have a confirmed transfer ID
           );
 
           if (alreadyReturned) {
@@ -3339,10 +3420,12 @@ export class AccountingModule {
     direction: 'RC' | 'RX',
     deps: AccountingModuleDependencies,
   ): Promise<void> {
+    let failedCount = 0;
+
     for (const ft of frozen.targets) {
       for (const fca of ft.coinAssets) {
         for (const fsb of fca.frozenSenderBalances) {
-          const netBalance = BigInt(fsb.netBalance);
+          const netBalance = AccountingModule._safeBigInt(fsb.netBalance);
           if (netBalance <= 0n) continue;
 
           const recipient = fsb.senderAddress;
@@ -3358,12 +3441,14 @@ export class AccountingModule {
           if (existing?.status === 'failed') continue;
 
           // Secondary dedup: check transaction history for an existing return
+          // W13: Require type === 'SENT' AND on-chain confirmation (transferId or txHash)
           const history = deps.payments.getHistory();
           const alreadyReturned = history.find(
             (h) =>
               h.type === 'SENT' &&
               h.memo !== undefined &&
-              h.memo === memo,
+              h.memo === memo &&
+              h.transferId, // must have a confirmed transfer ID
           );
 
           if (alreadyReturned) {
@@ -3390,6 +3475,7 @@ export class AccountingModule {
               );
             }
           } catch (err) {
+            failedCount++;
             logger.warn(
               LOG_TAG,
               `Termination auto-return (${direction}) failed for ${invoiceId} → ${recipient} ${amount} ${coinId}:`,
@@ -3404,6 +3490,11 @@ export class AccountingModule {
           }
         }
       }
+    }
+
+    // W14: Log summary if any returns failed
+    if (failedCount > 0) {
+      logger.warn(LOG_TAG, `${failedCount} auto-return(s) failed for invoice ${invoiceId} — retry via setAutoReturn()`);
     }
   }
 
@@ -3433,7 +3524,9 @@ export class AccountingModule {
     this.autoReturnLastGlobalSet = 0;
     this.autoReturnManager.clear();
     this.invoiceLedger.clear();
+    this.unknownLedgerCount = 0;
     this.tokenScanState.clear();
+    this.tokenScanDirty = false;
     this.tokenInvoiceMap.clear();
     this.balanceCache.clear();
     this.dirtyLedgerEntries.clear();
@@ -3518,10 +3611,11 @@ export class AccountingModule {
 
     for (const { key, entry } of pendingEntries) {
       // Parse invoiceId and transferId from key: "{invoiceId}:{transferId}"
-      const colonIdx = key.indexOf(':');
-      if (colonIdx === -1) continue;
-      const invoiceId = key.slice(0, colonIdx);
-      const transferId = key.slice(colonIdx + 1);
+      // W7: Use fixed-width split since invoiceId is always 64 hex chars.
+      // This avoids fragility with colons in transferId values.
+      if (key.length < 66 || key[64] !== ':') continue;
+      const invoiceId = key.slice(0, 64);
+      const transferId = key.slice(65);
 
       // Secondary dedup: check if return already landed in history (§7.5)
       // Use exact memo match to prevent crafted-memo false positives.
@@ -3848,6 +3942,7 @@ export class AccountingModule {
       let payload: TransferMessagePayload | null = null;
       try {
         const hexStr = tx.data['message'] as string;
+        if (!hexStr || hexStr.length > 8192) continue;
         const matches = hexStr.match(/.{1,2}/g);
         if (!matches) continue;
         const bytes = new Uint8Array(matches.map((b) => parseInt(b, 16)));
@@ -3872,12 +3967,8 @@ export class AccountingModule {
       // are indexed only up to the cap.
       const MAX_UNKNOWN_INVOICE_IDS = 500;
       if (!this.invoiceTermsCache.has(invoiceId) && !this.invoiceLedger.has(invoiceId)) {
-        // Count how many unknown invoice IDs are in the ledger
-        let unknownCount = 0;
-        for (const id of this.invoiceLedger.keys()) {
-          if (!this.invoiceTermsCache.has(id)) unknownCount++;
-        }
-        if (unknownCount >= MAX_UNKNOWN_INVOICE_IDS) {
+        // W11: O(1) check using cached counter instead of full ledger scan
+        if (this.unknownLedgerCount >= MAX_UNKNOWN_INVOICE_IDS) {
           // Skip indexing this unknown invoice — cap reached.
           // importInvoice() will do a full rescan for this invoice if needed.
           continue;
@@ -3925,6 +4016,10 @@ export class AccountingModule {
 
         if (!this.invoiceLedger.has(invoiceId)) {
           this.invoiceLedger.set(invoiceId, new Map());
+          // W11: Increment unknown count if this invoice is not known
+          if (!this.invoiceTermsCache.has(invoiceId)) {
+            this.unknownLedgerCount++;
+          }
         }
         const ledger = this.invoiceLedger.get(invoiceId)!;
         if (ledger.has(dedupKey)) continue; // dedup
@@ -3935,28 +4030,32 @@ export class AccountingModule {
           paymentDirection,
           coinId,
           amount,
-          destinationAddress: (tx.data as Record<string, unknown>)['recipient'] as string ?? txf.genesis?.data?.recipient ?? '',
+          // W2: For non-genesis tx, only use tx-level recipient — genesis recipient is the first owner, not the destination.
+          destinationAddress: ((tx.data as Record<string, unknown>)['recipient'] as string) ?? (i === 0 ? (txf.genesis?.data?.recipient ?? '') : ''),
           timestamp: Date.now(),
           confirmed: tx.inclusionProof !== null,
           senderAddress,
           ...(payload.inv.ra !== undefined ? { refundAddress: payload.inv.ra } : {}),
         };
 
-        // C1+C2 fix: Remove any provisional entry that this on-chain entry supersedes.
+        // Remove ALL provisional entries that this on-chain entry supersedes.
         // Provisional entries (from returnInvoicePayment sync update) have keys
         // like "provisional:{uuid}::{coinId}". When the real tokenId:txIndex entry
-        // arrives, we remove ONE matching provisional to prevent double-counting.
+        // arrives, we remove all matching provisionals to prevent double-counting.
         // Match on coinId + paymentDirection only (not amount) because token splits
         // may produce different on-chain amounts than the requested return amount.
+        const provisionalKeysToDelete: string[] = [];
         for (const [existingKey, existingRef] of ledger) {
           if (
             existingKey.startsWith('provisional:') &&
             existingRef.coinId === coinId &&
             existingRef.paymentDirection === paymentDirection
           ) {
-            ledger.delete(existingKey);
-            break; // one on-chain entry supersedes one provisional
+            provisionalKeysToDelete.push(existingKey);
           }
+        }
+        for (const pKey of provisionalKeysToDelete) {
+          ledger.delete(pKey);
         }
 
         ledger.set(dedupKey, ref);
@@ -3973,6 +4072,7 @@ export class AccountingModule {
 
     // Update watermark regardless of per-transaction errors
     this.tokenScanState.set(tokenId, transactions.length);
+    this.tokenScanDirty = true;
   }
 
   // ===========================================================================
@@ -4343,7 +4443,7 @@ export class AccountingModule {
     if (this.destroyed) return;
 
     const content = message.content;
-    if (!content) return;
+    if (!content || typeof content !== 'string') return;
 
     if (content.startsWith('invoice_receipt:')) {
       this._processReceiptDM(message);
@@ -4417,6 +4517,11 @@ export class AccountingModule {
 
     // §5.11 step 5b (invoice existence check): drop if invoice not known locally
     if (!this.invoiceTermsCache.has(invoiceId)) return;
+
+    // W5: Field-level validation before cast — ensure required fields have correct types
+    if (typeof raw['invoiceId'] !== 'string' || typeof raw['status'] !== 'string' && typeof raw['terminalState'] !== 'string') {
+      return; // malformed receipt
+    }
 
     const receipt: InvoiceReceiptPayload = raw as unknown as InvoiceReceiptPayload;
 
@@ -4896,9 +5001,13 @@ export class AccountingModule {
 
       const transferId = originalRef.transferId;
 
-      // Skip if already completed (failed entries are retried only via setAutoReturn())
-      if (this.autoReturnManager.isDone(invoiceId, transferId)) return null;
+      // W12: Skip if already completed OR already in flight (pending).
+      // isDone() only checks 'completed'; we also check 'pending' to prevent
+      // concurrent sends from both passing before either completes.
       const existing = this.autoReturnManager.getEntry(invoiceId, transferId);
+      if (existing && (existing.status === 'completed' || existing.status === 'pending')) {
+        return null;
+      }
       if (existing?.status === 'failed') return null;
 
       // §6.2: Resolve auto-return destination: refundAddress ?? senderAddress
@@ -5211,7 +5320,9 @@ export class AccountingModule {
    * 3. Write inv_ledger_index.
    */
   private async _flushDirtyLedgerEntries(): Promise<void> {
-    if (this.dirtyLedgerEntries.size === 0 && this.tokenScanState.size === 0) return;
+    // W17: Use tokenScanDirty flag instead of tokenScanState.size (which is
+    // always > 0 after first scan, causing unnecessary writes on every event).
+    if (this.dirtyLedgerEntries.size === 0 && !this.tokenScanDirty) return;
 
     // Step 1: Write dirty invoice ledger entries (delete per-write for crash safety)
     const written = new Set<string>();
@@ -5235,6 +5346,7 @@ export class AccountingModule {
       scanStateObj[tokenId] = count;
     }
     await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE, scanStateObj);
+    this.tokenScanDirty = false;
 
     // Step 3: Write INV_LEDGER_INDEX
     const indexMeta: InvLedgerIndex = {};

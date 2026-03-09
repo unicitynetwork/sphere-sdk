@@ -187,7 +187,17 @@ export class InvoiceTransferIndex {
       try {
         const raw = await this.storage.get(this.getInvoiceLedgerKey(invoiceId));
         if (!raw) continue;
-        const entries = JSON.parse(raw) as InvoiceTransferRef[];
+        const parsed = JSON.parse(raw);
+        let entries: InvoiceTransferRef[];
+        if (Array.isArray(parsed)) {
+          entries = parsed;
+        } else if (typeof parsed === 'object' && parsed !== null) {
+          // Handle Record<string, InvoiceTransferRef> format from AccountingModule
+          entries = Object.values(parsed) as InvoiceTransferRef[];
+        } else {
+          logger.warn('InvoiceTransferIndex', `Invalid ledger format for invoice ${invoiceId}`);
+          continue;
+        }
         const entryMap = new Map<string, InvoiceTransferRef>();
         for (const entry of entries) {
           const entryKey = `${entry.transferId}::${entry.coinId}`;
@@ -235,17 +245,18 @@ export class InvoiceTransferIndex {
     this.tokenInvoiceMap.clear();
     for (const [invoiceId, entryMap] of this.invoiceLedger) {
       for (const entry of entryMap.values()) {
-        // Derive tokenId from transferId is not directly possible here;
-        // we use the tokenInvoiceMap to be rebuilt incrementally when
-        // processTokenTransactions() runs.
-        // However, we can populate it from what we have:
-        // The entryKey is `${transferId}::${coinId}`. We don't store tokenId
-        // in InvoiceTransferRef, so tokenInvoiceMap must be rebuilt during
-        // processTokenTransactions(). We skip this step here and let
-        // processTokenTransactions() populate it on the gap-fill pass.
-        void entry; // suppress unused warning
+        // Rebuild tokenInvoiceMap from transferId format "tokenId:txIndex"
+        if (entry.transferId && !entry.transferId.startsWith('provisional:')) {
+          const colonIdx = entry.transferId.indexOf(':');
+          if (colonIdx > 0) {
+            const tokenId = entry.transferId.substring(0, colonIdx);
+            if (!this.tokenInvoiceMap.has(tokenId)) {
+              this.tokenInvoiceMap.set(tokenId, new Set());
+            }
+            this.tokenInvoiceMap.get(tokenId)!.add(invoiceId);
+          }
+        }
       }
-      void invoiceId;
     }
 
     // Reset watermarks for tokens pointing to corrupted invoices.
@@ -429,6 +440,8 @@ export class InvoiceTransferIndex {
       );
       return (await addressRef.toAddress()).address;
     };
+
+    let lastSuccessIdx = startIndex;
 
     for (let absIdx = startIndex; absIdx < transactions.length; absIdx++) {
       const tx = transactions[absIdx]!;
@@ -654,21 +667,25 @@ export class InvoiceTransferIndex {
           // Step 6j: Mark dirty
           this.dirtyInvoices.add(invoiceRef.invoiceId);
         }
+
+        // Mark this transaction as successfully processed
+        lastSuccessIdx = absIdx + 1;
       } catch (err) {
-        // Per spec §5.4.3 ERROR HANDLING: log and continue to the next
-        // transaction. This prevents a single malformed transaction from
-        // creating an infinite retry loop — the watermark advances past
-        // the failing index unconditionally below.
+        // Per spec §5.4.3 ERROR HANDLING: log and stop processing at the
+        // first error. The watermark only advances to the last successfully
+        // processed index, so the failing transaction will be retried on
+        // the next gap-fill pass.
         logger.warn(
           'InvoiceTransferIndex',
           `Error processing tx at absIdx=${absIdx} for tokenId=${tokenId}`,
           err,
         );
+        break; // stop at first error to retry on next gap-fill
       }
     }
 
-    // Update watermark regardless of per-transaction errors
-    this.tokenScanState.set(tokenId, transactions.length);
+    // Update watermark to last successfully processed index
+    this.tokenScanState.set(tokenId, lastSuccessIdx);
 
     return newEntries;
   }

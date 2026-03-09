@@ -32,6 +32,10 @@ import type {
   FrozenSenderBalance,
 } from './types.js';
 
+import { logger } from '../../core/logger.js';
+
+const LOG_TAG = 'BalanceComputer';
+
 // =============================================================================
 // Internal working types (not exported — implementation detail)
 // =============================================================================
@@ -91,7 +95,7 @@ function isValidAmount(amount: string): boolean {
  * defensive fallback rather than throwing (entries with bad amounts were
  * already filtered at indexing time, but defensive parsing is cheap here).
  */
-function parseBigInt(amount: string): bigint {
+export function parseBigInt(amount: string): bigint {
   if (!isValidAmount(amount)) return 0n;
   return BigInt(amount);
 }
@@ -999,6 +1003,9 @@ function freezeCoinAsset(
           bestSender,
           (senderSurplusMap.get(bestSender) ?? 0n) + remainingSurplus,
         );
+      }
+      if (remainingSurplus > 0n && bestSender === null) {
+        logger.warn(LOG_TAG, `Orphaned surplus ${remainingSurplus} for invoice — all senders have zero net contribution`);
       }
     }
 

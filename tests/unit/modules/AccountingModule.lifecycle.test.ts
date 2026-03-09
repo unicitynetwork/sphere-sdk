@@ -293,11 +293,11 @@ describe('UT-LIFECYCLE-005: destroy() unsubscribes from events', () => {
 });
 
 // =============================================================================
-// UT-LIFECYCLE-006: destroy() clears in-memory state
+// UT-LIFECYCLE-006: destroy() makes module inert (C10 fix: no longer clears state)
 // =============================================================================
 
-describe('UT-LIFECYCLE-006: destroy() clears in-memory state', () => {
-  it('clears invoiceTermsCache and other maps after destroy', async () => {
+describe('UT-LIFECYCLE-006: destroy() makes module inert', () => {
+  it('rejects all API calls after destroy (state preserved but inert)', async () => {
     setup();
 
     const terms = {
@@ -323,13 +323,18 @@ describe('UT-LIFECYCLE-006: destroy() clears in-memory state', () => {
     await module.load();
 
     // Verify it was loaded
-    const mod = module as unknown as { invoiceTermsCache: Map<string, unknown> };
+    const mod = module as unknown as { invoiceTermsCache: Map<string, unknown>; destroyed: boolean };
     expect(mod.invoiceTermsCache.size).toBeGreaterThan(0);
 
-    module.destroy();
+    await module.destroy();
 
-    // After destroy, in-memory cache should be cleared
-    expect(mod.invoiceTermsCache.size).toBe(0);
+    // C10 fix: destroy() no longer calls _clearInMemoryState() to avoid racing
+    // with in-flight gated operations. State is preserved but the destroyed flag
+    // prevents all public API access.
+    expect(mod.destroyed).toBe(true);
+
+    // All public methods should throw when destroyed
+    await expect(module.load()).rejects.toThrow('destroyed');
   });
 
   it('is idempotent — calling destroy() twice does not throw', async () => {

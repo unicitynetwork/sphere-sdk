@@ -37,7 +37,9 @@ const MAX_RETRY_COUNT = 5;
  * recovery. On completion the entry is updated to `status = 'completed'`.
  *
  * ### Key format
- * `{invoiceId}:{transferId}`  — both segments are colon-free (hex IDs).
+ * `{invoiceId}:{transferId}`  — invoiceId is always 64 hex chars (colon-free).
+ * transferId CAN contain colons (e.g., `FROZEN:addr:recipient:coinId`).
+ * Parsing uses fixed-width split: invoiceId = key.slice(0, 64), transferId = key.slice(65).
  *
  * ### Lifecycle
  * 1. `configure()` — inject storage and addressId
@@ -309,13 +311,12 @@ export class AutoReturnManager {
    * @param invoiceId  - Invoice token ID.
    * @param transferId - Original forward transfer ID.
    */
-  resetToPending(invoiceId: string, transferId: string): void {
+  async resetToPending(invoiceId: string, transferId: string): Promise<void> {
     const key = this.buildKey(invoiceId, transferId);
     const existing = this.ledger.get(key);
     if (!existing || existing.status !== 'failed') return;
     this.ledger.set(key, { ...existing, status: 'pending' });
-    // Async save — fire and forget (the entry is correct in memory immediately)
-    this.save().catch(() => {/* ignore */});
+    await this.save(true);
   }
 
   // ===========================================================================
@@ -349,8 +350,8 @@ export class AutoReturnManager {
     const prefix = `${invoiceId}:`;
     const result: string[] = [];
     for (const [key, entry] of this.ledger.entries()) {
-      if (key.startsWith(prefix) && entry.status === 'failed') {
-        const transferId = key.slice(prefix.length);
+      if (key.startsWith(prefix) && key.length > 65 && entry.status === 'failed') {
+        const transferId = key.slice(65);
         result.push(transferId);
       }
     }
@@ -380,7 +381,7 @@ export class AutoReturnManager {
       }
     }
     if (pruned) {
-      await this.save();
+      await this.save(true);
     }
   }
 

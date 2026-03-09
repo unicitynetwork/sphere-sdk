@@ -645,7 +645,7 @@ describe('AccountingModule.cancelInvoice()', () => {
 // ---------------------------------------------------------------------------
 
 describe('AccountingModule close/cancel: storage write ordering', () => {
-  it('terminal set is persisted before frozen balances on closeInvoice()', async () => {
+  it('frozen balances are persisted before terminal set on closeInvoice() (C12 crash safety)', async () => {
     const { module, mocks } = createTestAccountingModule();
     const invoiceId = 'ord01'.repeat(12) + '0000';
     const terms = buildTerms();
@@ -664,17 +664,19 @@ describe('AccountingModule close/cancel: storage write ordering', () => {
 
     await module.closeInvoice(invoiceId);
 
-    // closed_invoices should appear before frozen_balances
+    // C12 fix: frozen_balances should appear BEFORE closed_invoices.
+    // The terminal set write is the commit point — crash between writes means
+    // the invoice is NOT terminal on recovery (safe to re-close).
     const closedIdx = setOrder.findIndex((k) => k.endsWith('closed_invoices'));
     const frozenIdx = setOrder.findIndex((k) => k.endsWith('frozen_balances'));
     expect(closedIdx).toBeGreaterThanOrEqual(0);
     expect(frozenIdx).toBeGreaterThanOrEqual(0);
-    expect(closedIdx).toBeLessThan(frozenIdx);
+    expect(frozenIdx).toBeLessThan(closedIdx);
 
     module.destroy();
   });
 
-  it('terminal set is persisted before frozen balances on cancelInvoice()', async () => {
+  it('frozen balances are persisted before terminal set on cancelInvoice() (C12 crash safety)', async () => {
     const { module, mocks } = createTestAccountingModule();
     const invoiceId = 'ord02'.repeat(12) + '0000';
     const terms = buildTerms();
@@ -692,11 +694,12 @@ describe('AccountingModule close/cancel: storage write ordering', () => {
 
     await module.cancelInvoice(invoiceId);
 
+    // C12 fix: frozen_balances should appear BEFORE cancelled_invoices.
     const cancelledIdx = setOrder.findIndex((k) => k.endsWith('cancelled_invoices'));
     const frozenIdx = setOrder.findIndex((k) => k.endsWith('frozen_balances'));
     expect(cancelledIdx).toBeGreaterThanOrEqual(0);
     expect(frozenIdx).toBeGreaterThanOrEqual(0);
-    expect(cancelledIdx).toBeLessThan(frozenIdx);
+    expect(frozenIdx).toBeLessThan(cancelledIdx);
 
     module.destroy();
   });

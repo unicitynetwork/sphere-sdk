@@ -420,6 +420,7 @@ export class Sphere {
 
   // State
   private _initialized = false;
+  private _trackedAddressesLoaded = false;
   private _identity: MutableFullIdentity | null = null;
   private _masterKey: MasterKey | null = null;
   private _mnemonic: string | null = null;
@@ -2294,8 +2295,10 @@ export class Sphere {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           trustBase = (this._oracle as any).getTrustBase?.() ?? new Uint8Array();
         } catch {
-          // Oracle may not support getTrustBase — accounting will work without proof verification
+          logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
         }
+        // NOTE: If trustBase is empty, AccountingModule.importInvoice() will reject imports
+        // that require proof verification. createInvoice() is unaffected.
 
         this._accounting.initialize({
           payments: this._payments,
@@ -2353,9 +2356,15 @@ export class Sphere {
 
   /**
    * Internal getActiveAddresses without ensureReady() check.
-   * Used during initialization (AccountingModule.load()) when _initialized is still false.
+   * IMPORTANT: This method skips ensureReady() because it's called during initialization
+   * before _initialized is set. It REQUIRES that loadTrackedAddresses() has already completed.
+   * If this assertion fails, the initialization order in _doLoad() has been broken.
    */
   private _getActiveAddressesInternal(): TrackedAddress[] {
+    if (!this._trackedAddressesLoaded) {
+      logger.warn('Sphere', '_getActiveAddressesInternal called before tracked addresses loaded');
+      return [];
+    }
     const result: TrackedAddress[] = [];
     for (const entry of this._trackedAddresses.values()) {
       if (!entry.hidden) {
@@ -3473,11 +3482,15 @@ export class Sphere {
   async destroy(): Promise<void> {
     this.cleanupProviderEventSubscriptions();
 
+    // Destroy accounting FIRST — it may have in-flight operations using payments.send()
+    // Draining accounting gates before destroying payments prevents spurious pending entries
+    await this._accounting?.destroy();
+
+    // Now safe to destroy payments
     this._payments.destroy();
     this._communications.destroy();
     this._groupChat?.destroy();
     this._market?.destroy();
-    await this._accounting?.destroy();
 
     await this._transport.disconnect();
     await this._storage.disconnect();
@@ -3494,6 +3507,7 @@ export class Sphere {
     this._tokenStorageProviders.clear();
 
     this._initialized = false;
+    this._trackedAddressesLoaded = false;
     this._identity = null;
     this._trackedAddresses.clear();
     this._addressIdToIndex.clear();
@@ -3632,6 +3646,7 @@ export class Sphere {
 
     // Load tracked addresses registry (with migration from old format)
     await this.loadTrackedAddresses();
+    this._trackedAddressesLoaded = true;
     // Load nametag cache
     await this.loadAddressNametags();
 
@@ -3919,8 +3934,10 @@ export class Sphere {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           trustBase = (this._oracle as any).getTrustBase?.() ?? new Uint8Array();
         } catch {
-          // Oracle may not support getTrustBase — accounting will work without proof verification
+          logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
         }
+        // NOTE: If trustBase is empty, AccountingModule.importInvoice() will reject imports
+        // that require proof verification. createInvoice() is unaffected.
 
         this._accounting.initialize({
           payments: this._payments,
