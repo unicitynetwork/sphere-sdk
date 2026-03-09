@@ -582,6 +582,13 @@ export class AccountingModule {
     try { this.unsubscribeDMs?.(); } catch { /* ignore */ }
     this.unsubscribeDMs = null;
 
+    // W1-R18 fix: Await any pending flush before draining gates, so the flush
+    // doesn't race with storage teardown after destroy() returns.
+    if (this._flushPromise) {
+      await this._flushPromise.catch(() => { /* swallow — flush errors are non-fatal on destroy */ });
+      this._flushPromise = null;
+    }
+
     // Await all in-flight gated operations before declaring destruction complete.
     // Each gate value is the tail of a per-invoice promise chain;
     // awaiting all tails ensures no operation is mid-flight.
@@ -4062,6 +4069,13 @@ export class AccountingModule {
 
       // Create one ref per coin
       for (const [coinId, amount] of entries) {
+        // W6-R18 fix: validate coinId — on-chain coinData is untrusted. Reject empty,
+        // non-alphanumeric, or excessively long coinIds to prevent storage amplification
+        // and dedup-key collision (coinId containing '::' could corrupt composite keys).
+        if (!coinId || !/^[A-Za-z0-9]+$/.test(coinId) || coinId.length > 20) {
+          logger.warn(LOG_TAG, `Token ${tokenId} tx[${i}] has invalid coinId '${coinId}' — skipping`);
+          continue;
+        }
         // W12 fix: validate amount — must be a positive integer without leading zeros.
         // On-chain amounts of "0" are nonsensical for accounting; leading zeros indicate corruption.
         if (!amount || !/^[1-9][0-9]*$/.test(amount)) {
@@ -4246,11 +4260,18 @@ export class AccountingModule {
     // a newer flush's promise reference when an older flush's .finally() ran, allowing a third
     // flush to skip the await and run concurrently with the second.
     if (this.dirtyLedgerEntries.size > 0 || this.tokenScanDirty) {
-      this._flushPromise = (this._flushPromise ?? Promise.resolve())
+      // W2-R18 fix: Capture reference to null it after completion if unchanged,
+      // preventing unbounded promise chain growth in long-running sessions.
+      const p = (this._flushPromise ?? Promise.resolve())
         .then(() => this._flushDirtyLedgerEntries())
         .catch((err) => {
           logger.warn(LOG_TAG, 'Error flushing ledger after token change:', err);
+        })
+        .finally(() => {
+          // Only null if no newer flush has replaced this reference
+          if (this._flushPromise === p) this._flushPromise = null;
         });
+      this._flushPromise = p;
     }
   }
 

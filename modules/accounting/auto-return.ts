@@ -224,10 +224,23 @@ export class AutoReturnManager {
       intentAt: Date.now(),
       status: 'pending',
     };
+    // W4-R18 fix: Rollback in-memory entry if save fails — prevents stale pending
+    // entry from causing hasEntry()/isDone() to return incorrect results.
+    const previous = this.ledger.get(key);
     this.ledger.set(key, entry);
-    // W4 fix: Use critical=true so storage write failures propagate.
-    // The write-first pattern only provides crash safety if the write succeeds.
-    await this.save(true);
+    try {
+      // W4 fix: Use critical=true so storage write failures propagate.
+      // The write-first pattern only provides crash safety if the write succeeds.
+      await this.save(true);
+    } catch (err) {
+      // Rollback: restore previous entry or delete if none existed
+      if (previous) {
+        this.ledger.set(key, previous);
+      } else {
+        this.ledger.delete(key);
+      }
+      throw err;
+    }
   }
 
   /**
@@ -315,8 +328,14 @@ export class AutoReturnManager {
     const key = this.buildKey(invoiceId, transferId);
     const existing = this.ledger.get(key);
     if (!existing || existing.status !== 'failed') return;
+    // W5-R18 fix: Rollback to 'failed' if save fails
     this.ledger.set(key, { ...existing, status: 'pending' });
-    await this.save(true);
+    try {
+      await this.save(true);
+    } catch (err) {
+      this.ledger.set(key, existing);
+      throw err;
+    }
   }
 
   // ===========================================================================
@@ -350,8 +369,9 @@ export class AutoReturnManager {
     const prefix = `${invoiceId}:`;
     const result: string[] = [];
     for (const [key, entry] of this.ledger.entries()) {
-      if (key.startsWith(prefix) && key.length > 65 && entry.status === 'failed') {
-        const transferId = key.slice(65);
+      // W3-R18 fix: Use prefix.length instead of hardcoded 65 to support any invoiceId length
+      if (key.startsWith(prefix) && key.length > prefix.length && entry.status === 'failed') {
+        const transferId = key.slice(prefix.length);
         result.push(transferId);
       }
     }
