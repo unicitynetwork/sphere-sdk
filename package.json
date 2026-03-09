@@ -100,6 +100,7 @@
     "test:run": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:relay": "vitest run --config vitest.relay.config.ts",
+    "test:daemon": "vitest run --config vitest.daemon.config.ts",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit",
     "cli": "npx tsx cli/index.ts"
