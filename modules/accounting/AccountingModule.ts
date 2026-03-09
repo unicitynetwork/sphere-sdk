@@ -956,6 +956,14 @@ export class AccountingModule {
     // zeroing to the finally block after all signing operations are complete.
     saltInput.fill(0);
 
+    // CR-R20 fix: Guard trustBase before minting (matches importInvoice guard)
+    if (!trustBase || (trustBase instanceof Uint8Array && trustBase.length === 0)) {
+      throw new SphereError(
+        'Trust base unavailable — cannot mint invoice token. Ensure oracle supports getTrustBase().',
+        'INVOICE_ORACLE_REQUIRED',
+      );
+    }
+
     // ------------------------------------------------------------------
     // Steps 5–13: Mint token and store (mirrors NametagMinter pattern)
     // ------------------------------------------------------------------
@@ -1461,10 +1469,10 @@ export class AccountingModule {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const verifyResult = await sdkToken.verify(deps.trustBase as any);
       // C4-R17 fix: Token.verify() returns a VerificationResult object (always truthy),
-      // not a boolean. Check .isSuccessful for the actual result. Fall back to falsy check
-      // for SDK versions that might return boolean.
+      // not a boolean. Check .isSuccessful === true for strict validation, matching every
+      // other verify consumer in the SDK. Fall back to falsy check for legacy boolean returns.
       const verifyOk = typeof verifyResult === 'object' && verifyResult !== null
-        ? (verifyResult as { isSuccessful?: boolean }).isSuccessful !== false
+        ? (verifyResult as { isSuccessful?: boolean }).isSuccessful === true
         : !!verifyResult;
       if (!verifyOk) {
         throw new SphereError(
@@ -3828,6 +3836,7 @@ export class AccountingModule {
     // ------------------------------------------------------------------
     // Phase 1b: Load per-invoice ledger entries
     // ------------------------------------------------------------------
+    let scanStateReset = false; // Set true by corruption handler to prevent Phase 1c stale reload
     for (const invoiceId of this.invoiceLedger.keys()) {
       const key = this.getStorageKey(`${INV_LEDGER_PREFIX}${invoiceId}`);
       try {
@@ -3869,13 +3878,14 @@ export class AccountingModule {
         // For correctness, we'd need to know which tokens were in this invoice,
         // but without the entries we can't. Reset all watermarks as fallback.
         this.tokenScanState.clear();
+        scanStateReset = true; // Prevent Phase 1c from reloading stale TOKEN_SCAN_STATE
       }
     }
 
     // ------------------------------------------------------------------
-    // Phase 1c: Load TOKEN_SCAN_STATE (unless already reset due to corruption)
+    // Phase 1c: Load TOKEN_SCAN_STATE (unless corruption handler reset it)
     // ------------------------------------------------------------------
-    if (this.tokenScanState.size === 0) {
+    if (this.tokenScanState.size === 0 && !scanStateReset) {
       try {
         const rawScanState = await this.deps!.storage.get(
           this.getStorageKey(STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE),
@@ -5024,6 +5034,37 @@ export class AccountingModule {
           returnReason,
         });
 
+        // CR-R20 fix: Over-refund warning (matches _processInvoiceTransferEvent §6.2 step 3c)
+        if (senderAddr !== null) {
+          const coinId = syntheticRef.coinId;
+          const innerMap = this.invoiceLedger.get(invoiceId);
+          if (innerMap) {
+            let totalForwarded = 0n;
+            let totalReturned = 0n;
+            for (const ref of innerMap.values()) {
+              if (ref.coinId !== coinId) continue;
+              const effectiveSender = ref.refundAddress ?? ref.senderAddress;
+              if (effectiveSender !== senderAddr) continue;
+              if (ref.paymentDirection === 'forward') {
+                totalForwarded += AccountingModule._safeBigInt(ref.amount);
+              } else {
+                totalReturned += AccountingModule._safeBigInt(ref.amount);
+              }
+            }
+            // Add synthetic amount if not already indexed
+            totalReturned += AccountingModule._safeBigInt(syntheticRef.amount);
+            if (totalReturned > totalForwarded) {
+              deps.emitEvent('invoice:over_refund_warning', {
+                invoiceId,
+                senderAddress: senderAddr,
+                coinId,
+                forwardedAmount: totalForwarded.toString(),
+                returnedAmount: totalReturned.toString(),
+              });
+            }
+          }
+        }
+
         if (this.config.autoTerminateOnReturn) {
           if (paymentDirection === 'return_closed') {
             await this._terminateInvoice(invoiceId, 'CLOSED');
@@ -5186,7 +5227,8 @@ export class AccountingModule {
       const returnRef: import('./types.js').InvoiceTransferRef = {
         transferId: result.id,
         direction: 'outbound',
-        paymentDirection: originalRef.paymentDirection === 'forward' ? 'return_closed' : originalRef.paymentDirection,
+        // CR-R20 fix: Use terminal set membership (not original direction) to determine return type
+        paymentDirection: this.closedInvoices.has(invoiceId) ? 'return_closed' : 'return_cancelled',
         coinId: sendParams.coinId,
         amount: sendParams.amount,
         destinationAddress: sendParams.returnTo,
