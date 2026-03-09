@@ -490,6 +490,117 @@ const unsubscribe = sphere.on('transfer:incoming', handler);
 unsubscribe(); // Stop listening
 ```
 
+## Invoicing
+
+The `AccountingModule` handles the full invoice lifecycle — creation, status queries, payment, and closing. Enable it by passing `accounting: true` to `Sphere.init()`.
+
+> **Note:** The accounting module requires the Oracle (Aggregator) provider, which is included by default with `createNodeProviders()`.
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: true,   // Enable with defaults
+});
+
+const accounting = sphere.accounting!;
+```
+
+### Create an Invoice
+
+```typescript
+const result = await accounting.createInvoice({
+  targets: [
+    {
+      address: sphere.identity!.directAddress!,  // Pay to own address
+      assets: [
+        { coin: ['UCT', '1000000'] },            // 1 UCT in smallest units
+      ],
+    },
+  ],
+  memo: 'Order #1234',
+  dueDate: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 days from now
+});
+
+if (result.success) {
+  console.log('Invoice ID:', result.invoiceId);
+  console.log('Terms:', result.terms);
+}
+```
+
+### Check Invoice Status
+
+```typescript
+const status = await accounting.getInvoiceStatus(result.invoiceId!);
+
+// state: 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'EXPIRED'
+console.log('State:', status.state);
+console.log('All confirmed:', status.allConfirmed);
+
+for (const target of status.targets) {
+  for (const asset of target.assets) {
+    console.log(`  ${asset.coinId}: paid ${asset.totalForward} of ${asset.requested}`);
+  }
+}
+```
+
+### Pay an Invoice
+
+```typescript
+// Pay the first asset of the first target (defaults to the remaining needed amount)
+const transfer = await accounting.payInvoice(invoiceId, {
+  targetIndex: 0,
+  assetIndex: 0,    // Optional, defaults to 0
+});
+
+console.log('Transfer status:', transfer.status);
+```
+
+### List All Invoices
+
+```typescript
+// All invoices
+const all = await accounting.getInvoices();
+
+// Filter by state
+const open = await accounting.getInvoices({ state: 'OPEN' });
+const mine = await accounting.getInvoices({ createdByMe: true });
+```
+
+### Close an Invoice
+
+```typescript
+// Marks invoice as CLOSED; no further payments are attributed
+await accounting.closeInvoice(invoiceId);
+
+// Optionally auto-return any overpayments before closing
+await accounting.closeInvoice(invoiceId, { autoReturn: true });
+```
+
+### Listen to Invoice Events
+
+```typescript
+sphere.on('invoice:created', ({ invoiceId, confirmed }) => {
+  console.log('Invoice minted:', invoiceId, confirmed ? '(confirmed)' : '(unconfirmed)');
+});
+
+sphere.on('invoice:payment', ({ invoiceId, paymentDirection, confirmed }) => {
+  console.log(`Payment on ${invoiceId}: direction=${paymentDirection}`);
+});
+
+sphere.on('invoice:covered', ({ invoiceId, confirmed }) => {
+  console.log('Invoice fully covered:', invoiceId);
+});
+
+sphere.on('invoice:closed', ({ invoiceId, explicit }) => {
+  console.log('Invoice closed:', invoiceId, explicit ? '(by owner)' : '(auto)');
+});
+
+sphere.on('invoice:overpayment', ({ invoiceId, coinId, surplus }) => {
+  console.log(`Overpayment on ${invoiceId}: +${surplus} ${coinId}`);
+});
+```
+
 ## Error Handling
 
 ```typescript

@@ -359,6 +359,83 @@ sphere.on('connection:changed', (event) => {
 await sphere.communications.sendDM('@alice', 'Hello from the browser!');
 ```
 
+### Invoicing
+
+Enable the accounting module when initializing the wallet:
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: true,  // Enable with defaults
+});
+```
+
+**Create an invoice** (mints a token on-chain via the aggregator):
+
+```typescript
+const result = await sphere.accounting!.createInvoice({
+  targets: [
+    {
+      address: sphere.identity!.directAddress!,  // Pay to self (your DIRECT:// address)
+      assets: [
+        { coin: ['UCT', '5000000'] },             // Request 5 UCT (in smallest units)
+      ],
+    },
+  ],
+  memo: 'Order #1234',
+  dueDate: Date.now() + 7 * 24 * 60 * 60 * 1000, // Due in 7 days
+});
+
+console.log('Invoice ID:', result.invoiceId);
+```
+
+**Check invoice status:**
+
+```typescript
+const status = await sphere.accounting!.getInvoiceStatus(result.invoiceId!);
+// status.state: 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'EXPIRED'
+console.log('State:', status.state);
+```
+
+**Pay an invoice** (as the payer, after importing the invoice token):
+
+```typescript
+const transferResult = await sphere.accounting!.payInvoice(invoiceId, {
+  targetIndex: 0,  // Which target to pay (index into invoice.targets)
+  // amount: '5000000',  // Omit to pay the full remaining amount
+});
+```
+
+**Close an invoice** (only target parties may close):
+
+```typescript
+await sphere.accounting!.closeInvoice(invoiceId);
+```
+
+**List invoices:**
+
+```typescript
+const invoices = await sphere.accounting!.getInvoices({ createdByMe: true });
+for (const ref of invoices) {
+  console.log(ref.invoiceId, ref.terms.memo, ref.closed ? 'CLOSED' : 'OPEN');
+}
+```
+
+**Listen for invoice events:**
+
+```typescript
+sphere.on('invoice:payment', (event) => {
+  console.log(`Payment received for invoice ${event.data.invoiceId}`);
+});
+
+sphere.on('invoice:covered', (event) => {
+  console.log(`Invoice ${event.data.invoiceId} fully covered!`);
+});
+```
+
+> **Note:** `createInvoice()` requires the Oracle (Aggregator) provider, which is included automatically by `createBrowserProviders()`.
+
 ## Import Existing Wallet
 
 ```typescript
