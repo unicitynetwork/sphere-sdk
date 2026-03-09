@@ -982,20 +982,24 @@ function freezeCoinAsset(
     // This prevents inflating a zero-balance sender's frozen net balance beyond their actual payment,
     // which would enable over-return. Ensures sum(frozenNetBalances) == totalSurplus for CLOSED invoices.
     if (remainingSurplus > 0n && coinAsset.senderBalances.length > 0) {
-      let bestSender = latestSender ?? coinAsset.senderBalances[0]!.senderAddress;
+      let bestSender: string | null = null;
       let bestNet = 0n;
       for (const sb of coinAsset.senderBalances) {
-        const rawNet = BigInt(sb.forwardedAmount) - BigInt(sb.returnedAmount);
+        const rawNet = parseBigInt(sb.forwardedAmount) - parseBigInt(sb.returnedAmount);
         const senderNet = rawNet > 0n ? rawNet : 0n; // clamp: negative net → 0
         if (senderNet > bestNet) {
           bestNet = senderNet;
           bestSender = sb.senderAddress;
         }
       }
-      senderSurplusMap.set(
-        bestSender,
-        (senderSurplusMap.get(bestSender) ?? 0n) + remainingSurplus,
-      );
+      // Only allocate remainder if a sender with positive net contribution exists.
+      // If all senders have zero net, the remainder is orphaned (no valid recipient).
+      if (bestSender !== null && bestNet > 0n) {
+        senderSurplusMap.set(
+          bestSender,
+          (senderSurplusMap.get(bestSender) ?? 0n) + remainingSurplus,
+        );
+      }
     }
 
     frozenSenderBalances = coinAsset.senderBalances.map((sb) => {

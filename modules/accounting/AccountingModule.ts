@@ -3348,14 +3348,32 @@ export class AccountingModule {
           const recipient = fsb.senderAddress;
           const coinId = fca.coin[0];
           const amount = fsb.netBalance;
-          const memo = buildInvoiceMemo(invoiceId, direction);
           // Use a dedup key that identifies this frozen-balance return uniquely
           const dedupTransferId = `FROZEN:${ft.address}:${recipient}:${coinId}`;
+          const memo = buildInvoiceMemo(invoiceId, direction, dedupTransferId);
 
           // Skip if already done
           if (this.autoReturnManager.isDone(invoiceId, dedupTransferId)) continue;
           const existing = this.autoReturnManager.getEntry(invoiceId, dedupTransferId);
           if (existing?.status === 'failed') continue;
+
+          // Secondary dedup: check transaction history for an existing return
+          const history = deps.payments.getHistory();
+          const alreadyReturned = history.find(
+            (h) =>
+              h.type === 'SENT' &&
+              h.memo !== undefined &&
+              h.memo === memo,
+          );
+
+          if (alreadyReturned) {
+            await this.autoReturnManager.markCompleted(
+              invoiceId,
+              dedupTransferId,
+              alreadyReturned.transferId ?? alreadyReturned.id,
+            );
+            continue;
+          }
 
           // Write-first intent
           await this.autoReturnManager.recordIntent(invoiceId, dedupTransferId, {
@@ -3897,6 +3915,12 @@ export class AccountingModule {
 
       // Create one ref per coin
       for (const [coinId, amount] of entries) {
+        // Validate amount: must be a non-empty string of digits (no negatives, no decimals)
+        if (!amount || !/^\d+$/.test(amount)) {
+          logger.warn(LOG_TAG, `Token ${tokenId} tx[${i}] coin ${coinId} has invalid amount '${amount}' — skipping`);
+          continue;
+        }
+
         const dedupKey = `${transferId}::${coinId}`;
 
         if (!this.invoiceLedger.has(invoiceId)) {

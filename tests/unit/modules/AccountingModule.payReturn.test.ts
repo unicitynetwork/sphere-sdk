@@ -11,6 +11,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   createTestAccountingModule,
   createTestToken,
+  createTestTransfer,
   DEFAULT_TEST_IDENTITY,
   DEFAULT_TEST_TRACKED_ADDRESS,
   SphereError,
@@ -642,5 +643,127 @@ describe('AccountingModule.returnInvoicePayment()', () => {
       coinId: 'UCT',
     });
     expect(result).toBeDefined();
+  });
+
+  // =========================================================================
+  // Provisional entry lifecycle — UT-PAY-RET-PROV-001 through UT-PAY-RET-PROV-003
+  // =========================================================================
+
+  // UT-PAY-RET-PROV-001
+  it('UT-PAY-RET-PROV-001: provisional entry created after returnInvoicePayment', async () => {
+    const { module, mocks } = await setupReturnScenario('10000000');
+
+    await module.returnInvoicePayment(INVOICE_ID, {
+      recipient: SENDER_ADDRESS,
+      amount: '5000000',
+      coinId: 'UCT',
+    });
+
+    // Inspect the in-memory ledger for a provisional entry
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ledger = (module as any).invoiceLedger.get(INVOICE_ID) as Map<string, InvoiceTransferRef>;
+    expect(ledger).toBeDefined();
+
+    const provisionalEntries = Array.from(ledger.entries()).filter(
+      ([key]) => key.startsWith('provisional:'),
+    );
+    expect(provisionalEntries.length).toBeGreaterThanOrEqual(1);
+
+    const [, ref] = provisionalEntries[0]!;
+    expect(ref.direction).toBe('outbound');
+    expect(ref.paymentDirection).toBe('back');
+    expect(ref.coinId).toBe('UCT');
+    expect(ref.amount).toBe('5000000');
+  });
+
+  // UT-PAY-RET-PROV-002
+  it('UT-PAY-RET-PROV-002: provisional entry superseded by on-chain entry', async () => {
+    const { module, mocks } = await setupReturnScenario('10000000');
+
+    await module.returnInvoicePayment(INVOICE_ID, {
+      recipient: SENDER_ADDRESS,
+      amount: '5000000',
+      coinId: 'UCT',
+    });
+
+    // Verify provisional exists
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mod = module as any;
+    const ledgerBefore = mod.invoiceLedger.get(INVOICE_ID) as Map<string, InvoiceTransferRef>;
+    const provisionalsBefore = Array.from(ledgerBefore.keys()).filter((k: string) => k.startsWith('provisional:'));
+    expect(provisionalsBefore.length).toBeGreaterThanOrEqual(1);
+
+    // Simulate on-chain scan: call _processTokenTransactions with a token
+    // containing a matching return (back) transaction for the same invoice.
+    const txf = createTestTransfer(INVOICE_ID, 'B', '5000000', 'UCT', TARGET_ADDRESS, SENDER_ADDRESS);
+
+    mod._processTokenTransactions(txf.genesis.data.tokenId, txf, 0);
+
+    // Provisional should be removed and replaced by the real entry
+    const ledgerAfter = mod.invoiceLedger.get(INVOICE_ID) as Map<string, InvoiceTransferRef>;
+    const provisionalsAfter = Array.from(ledgerAfter.keys()).filter((k: string) => k.startsWith('provisional:'));
+    expect(provisionalsAfter.length).toBe(0);
+
+    // Real positional entry should exist
+    const realEntries = Array.from(ledgerAfter.keys()).filter(
+      (k: string) => !k.startsWith('provisional:') && k !== provisionalsBefore[0],
+    );
+    expect(realEntries.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // UT-PAY-RET-PROV-003
+  it('UT-PAY-RET-PROV-003: stale provisional entries cleaned up on load', async () => {
+    const terms = makeTerms();
+    const { module: module1, mocks: mocks1 } = createTestAccountingModule();
+    mocks1.payments._tokens = [makeInvoiceToken(terms)];
+
+    // Pre-seed ledger with forward entry and a stale provisional
+    const entryKey = `mock-transfer-001::UCT`;
+    const forwardEntry: InvoiceTransferRef = {
+      transferId: 'mock-transfer-001',
+      direction: 'inbound',
+      paymentDirection: 'forward',
+      coinId: 'UCT',
+      amount: '10000000',
+      destinationAddress: TARGET_ADDRESS,
+      timestamp: Date.now() - 5000,
+      confirmed: true,
+      senderAddress: SENDER_ADDRESS,
+    };
+    // Stale provisional: timestamp older than 10 minutes
+    const staleProvisionalKey = `provisional:stale-uuid-123::UCT`;
+    const staleProvisional: InvoiceTransferRef = {
+      transferId: 'provisional:stale-uuid-123',
+      direction: 'outbound',
+      paymentDirection: 'back',
+      coinId: 'UCT',
+      amount: '3000000',
+      destinationAddress: SENDER_ADDRESS,
+      timestamp: Date.now() - 15 * 60 * 1000, // 15 minutes ago (stale)
+      confirmed: false,
+      senderAddress: TARGET_ADDRESS,
+    };
+
+    await mocks1.storage.set(
+      `${STORAGE_PREFIX}_inv_ledger:${INVOICE_ID}`,
+      JSON.stringify({ [entryKey]: forwardEntry, [staleProvisionalKey]: staleProvisional }),
+    );
+    await mocks1.storage.set(
+      `${STORAGE_PREFIX}_inv_ledger_index`,
+      JSON.stringify({ [INVOICE_ID]: { terminated: false } }),
+    );
+
+    await module1.load();
+
+    // Verify the stale provisional was dropped during load
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ledger = (module1 as any).invoiceLedger.get(INVOICE_ID) as Map<string, InvoiceTransferRef>;
+    expect(ledger).toBeDefined();
+
+    const provisionals = Array.from(ledger.keys()).filter((k: string) => k.startsWith('provisional:'));
+    expect(provisionals.length).toBe(0);
+
+    // The forward entry should still be present
+    expect(ledger.has(entryKey)).toBe(true);
   });
 });

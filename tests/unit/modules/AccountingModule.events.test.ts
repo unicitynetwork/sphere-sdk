@@ -821,4 +821,67 @@ describe('AccountingModule — Events', () => {
     expect(warnCalls.length).toBeGreaterThan(0);
     expect(warnCalls[0][1]).toMatchObject({ invoiceId });
   });
+
+  // -------------------------------------------------------------------------
+  // UT-DIR-MISMATCH-001: On-chain direction preferred over transport memo direction
+  // -------------------------------------------------------------------------
+  it('UT-DIR-MISMATCH-001: on-chain direction preferred over transport memo direction', async () => {
+    const invoiceId = injectInvoice(module, makeTerms());
+
+    // Step 1: Pre-populate ledger with an on-chain entry that says "back"
+    // This simulates _processTokenTransactions having already indexed the
+    // on-chain message with direction 'B' (back).
+    const tokenId = 'dir_mismatch_token_' + 'c'.repeat(45);
+    const backRef = createTestTransferRef(invoiceId, 'back', '5000000', 'UCT', {
+      transferId: `${tokenId}:0`,
+      confirmed: false,
+      destinationAddress: 'DIRECT://sender_address_def456',
+      senderAddress: 'DIRECT://test_target_address_abc123',
+    });
+    const key = `${tokenId}:0::${backRef.coinId}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (module as any).invoiceLedger.set(invoiceId, new Map([[key, backRef]]));
+
+    // Step 2: Build an incoming transfer where the transport memo says "F" (forward)
+    // but the token ID matches the on-chain entry with direction "back".
+    // The W3 fix should prefer the on-chain direction.
+    const transfer: IncomingTransfer = {
+      id: 'transfer-dir-mismatch',
+      senderPubkey: '02' + 'b'.repeat(64),
+      memo: `INV:${invoiceId}:F`, // transport memo says "forward"
+      tokens: [
+        {
+          id: tokenId,
+          coinId: 'UCT',
+          amount: '5000000',
+          sdkData: JSON.stringify(createTestTransfer(
+            invoiceId,
+            'B', // on-chain says "back"
+            '5000000',
+            'UCT',
+            'DIRECT://test_target_address_abc123',
+            'DIRECT://sender_address_def456',
+          )),
+          confirmed: false,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
+      ],
+      receivedAt: Date.now(),
+    };
+
+    mocks.payments._emit('transfer:incoming', transfer);
+    await new Promise((r) => setTimeout(r, 30));
+
+    // The event pipeline should use the on-chain "back" direction, not the memo "forward".
+    // Since it's a "back" direction (return), and senderPubkey can't be resolved to a
+    // target address, it should fire unauthorized_return (same pattern as UT-EVENTS-003b).
+    // The key assertion is that the pipeline did NOT treat this as a forward payment.
+    const paymentCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:payment');
+    const forwardPayments = paymentCalls.filter(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ([, payload]: [string, any]) => payload.paymentDirection === 'forward',
+    );
+    // No forward payment events should have fired — the on-chain "back" overrides memo "F"
+    expect(forwardPayments.length).toBe(0);
+  });
 });

@@ -291,3 +291,56 @@ describe('UT-STORAGE: corrupted storage data handled gracefully', () => {
     expect(settings.global).toBe(false);
   });
 });
+
+// =============================================================================
+// Unknown invoice ID cap prevents unbounded growth (W5 fix)
+// =============================================================================
+
+describe('UT-STORAGE: unknown invoice ID cap (W5 fix)', () => {
+  beforeEach(() => setup());
+
+  it('UT-PROACTIVE-CAP-001: unknown invoice ID cap prevents unbounded growth', async () => {
+    await module.load();
+
+    const mod = module as any;
+
+    // Populate invoiceLedger with 500 unknown invoice IDs
+    // (not in invoiceTermsCache → "unknown")
+    const MAX_UNKNOWN = 500;
+    for (let i = 0; i < MAX_UNKNOWN; i++) {
+      const fakeInvoiceId = i.toString(16).padStart(64, '0');
+      mod.invoiceLedger.set(fakeInvoiceId, new Map());
+    }
+
+    // Verify we have 500 unknown IDs
+    let unknownCount = 0;
+    for (const id of mod.invoiceLedger.keys()) {
+      if (!mod.invoiceTermsCache.has(id)) unknownCount++;
+    }
+    expect(unknownCount).toBe(MAX_UNKNOWN);
+
+    // Create a transfer token referencing a NEW unknown invoice (ID #501)
+    const newUnknownId = 'f'.repeat(64);
+    const { createTestTransfer } = await import('./accounting-test-helpers.js');
+    const txf = createTestTransfer(newUnknownId, 'F', '1000000', 'UCT');
+
+    // Call _processTokenTransactions — should NOT add the new unknown invoice (cap reached)
+    mod._processTokenTransactions(txf.genesis.data.tokenId, txf, 0);
+
+    expect(mod.invoiceLedger.has(newUnknownId)).toBe(false);
+
+    // Now make one of the 500 IDs "known" by adding it to invoiceTermsCache
+    const knownId = (0).toString(16).padStart(64, '0');
+    mod.invoiceTermsCache.set(knownId, {
+      createdAt: Date.now(),
+      targets: [{ address: 'DIRECT://test_target_address_abc123', assets: [{ coin: ['UCT', '100'] }] }],
+    });
+
+    // Now unknown count = 499 (under cap). The new unknown should be accepted.
+    // Use a fresh tokenId to avoid watermark dedup.
+    const txf2 = createTestTransfer(newUnknownId, 'F', '1000000', 'UCT');
+    mod._processTokenTransactions(txf2.genesis.data.tokenId, txf2, 0);
+
+    expect(mod.invoiceLedger.has(newUnknownId)).toBe(true);
+  });
+});
