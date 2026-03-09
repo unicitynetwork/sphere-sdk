@@ -9,7 +9,7 @@
 
 import { vi } from 'vitest';
 import { AccountingModule, createAccountingModule } from '../../../modules/accounting/index.js';
-import { INVOICE_TOKEN_TYPE_HEX } from '../../../modules/accounting/serialization.js';
+import { INVOICE_TOKEN_TYPE_HEX, canonicalSerialize } from '../../../modules/accounting/serialization.js';
 import { encodeTransferMessage } from '../../../modules/accounting/memo.js';
 import type {
   AccountingModuleConfig,
@@ -536,7 +536,18 @@ export function createTestInvoice(overrides?: Partial<CreateInvoiceRequest>): Cr
  * @param tokenId - Optional 64-char hex token ID. Randomly generated if omitted.
  */
 export function createTestToken(terms: InvoiceTerms, tokenId?: string): TxfToken {
-  const id = tokenId ?? randomHex64();
+  // CR-H2/M1: Derive tokenId from canonical serialization when not explicitly provided.
+  // This ensures test tokens pass the importInvoice canonical hash check.
+  let id: string;
+  if (tokenId) {
+    id = tokenId;
+  } else {
+    // Use Node.js crypto for synchronous SHA-256 (avoids making this function async)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const nodeCrypto = require('crypto');
+    const serialized = canonicalSerialize(terms);
+    id = nodeCrypto.createHash('sha256').update(serialized).digest('hex');
+  }
 
   const inclusionProof: TxfInclusionProof = {
     authenticator: {

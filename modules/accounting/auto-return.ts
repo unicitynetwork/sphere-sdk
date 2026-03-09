@@ -306,14 +306,22 @@ export class AutoReturnManager {
     const key = this.buildKey(invoiceId, transferId);
     const existing = this.ledger.get(key);
     if (!existing) return 1;
+    // CR-M4 fix: Guard against mutating completed/failed entries
+    if (existing.status !== 'pending') return existing.retryCount ?? 0;
     const retryCount = (existing.retryCount ?? 0) + 1;
     const updated: AutoReturnLedgerEntry = {
       ...existing,
       retryCount,
       lastRetryAt: Date.now(),
     };
+    // CR-M4 fix: Rollback in-memory entry if save fails (matches recordIntent pattern)
     this.ledger.set(key, updated);
-    await this.save();
+    try {
+      await this.save();
+    } catch (err) {
+      this.ledger.set(key, existing);
+      throw err;
+    }
     return retryCount;
   }
 

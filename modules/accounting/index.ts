@@ -13,4 +13,3 @@ export {
   CODE_TO_DIRECTION,
 } from './memo';
 export { canonicalSerialize, INVOICE_TOKEN_TYPE_HEX } from './serialization';
-export { InvoiceTransferIndex } from './invoice-transfer-index';

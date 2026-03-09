@@ -55,6 +55,7 @@ import type {
 } from './types.js';
 import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage } from './memo.js';
 import { AutoReturnManager } from './auto-return.js';
+import { canonicalSerialize } from './serialization.js';
 import { computeInvoiceStatus, freezeBalances } from './balance-computer.js';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token.js';
@@ -924,7 +925,6 @@ export class AccountingModule {
     // ------------------------------------------------------------------
     // Step 3: Canonical Serialize
     // ------------------------------------------------------------------
-    const { canonicalSerialize } = await import('./serialization.js');
     const invoiceBytes = canonicalSerialize(terms);
 
     // Check serialized size ≤ 64 KB
@@ -1017,6 +1017,15 @@ export class AccountingModule {
         .digest();
       const invoiceTokenId = new TokenId(hash.imprint);
       const invoiceId = invoiceTokenId.toJSON(); // 64-char lowercase hex
+
+      // CR-M5 fix: Check for duplicate before submitting to aggregator (matches importInvoice).
+      // Same terms → same SHA-256 → same tokenId. Prevents double-mint attempts.
+      if (this.invoiceTermsCache.has(invoiceId)) {
+        throw new SphereError(
+          `Invoice already exists locally: ${invoiceId}`,
+          'INVOICE_ALREADY_EXISTS',
+        );
+      }
 
       // Step 5: Create MintTransactionData
       const invoiceTokenType = new TokenType(
@@ -1452,6 +1461,22 @@ export class AccountingModule {
       );
     }
 
+    // CR-M1 fix: Verify that canonical re-serialization of parsed terms produces
+    // a hash matching the on-chain tokenId. This cryptographically binds the
+    // human-readable terms to the on-chain commitment, preventing an attacker from
+    // submitting terms with extra fields or alternate key ordering.
+    const reSerializedBytes = new TextEncoder().encode(canonicalSerialize(terms));
+    const reHashBuffer = await crypto.subtle.digest('SHA-256', reSerializedBytes);
+    const reHashHex = Array.from(new Uint8Array(reHashBuffer))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    if (reHashHex !== tokenId) {
+      throw new SphereError(
+        'Invoice import failed: parsed terms do not match on-chain token ID (canonical hash mismatch).',
+        'INVOICE_INVALID_DATA',
+      );
+    }
+
     // ------------------------------------------------------------------
     // Step 5: Verify inclusion proof (SECURITY CRITICAL)
     // We reconstruct the SDK token from JSON and call token.verify() against
@@ -1473,12 +1498,9 @@ export class AccountingModule {
       const sdkToken = await SdkToken.fromJSON(token as any);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const verifyResult = await sdkToken.verify(deps.trustBase as any);
-      // C4-R17 fix: Token.verify() returns a VerificationResult object (always truthy),
-      // not a boolean. Check .isSuccessful === true for strict validation, matching every
-      // other verify consumer in the SDK. Fall back to falsy check for legacy boolean returns.
-      const verifyOk = typeof verifyResult === 'object' && verifyResult !== null
-        ? (verifyResult as { isSuccessful?: boolean }).isSuccessful === true
-        : !!verifyResult;
+      // CR-M2 fix: Token.verify() always returns a VerificationResult object.
+      // Check .isSuccessful === true for strict validation (no boolean fallback).
+      const verifyOk = (verifyResult as { isSuccessful?: boolean }).isSuccessful === true;
       if (!verifyOk) {
         throw new SphereError(
           'Invoice import failed: inclusion proof is invalid.',
@@ -3450,19 +3472,23 @@ export class AccountingModule {
               err,
             );
 
-            // Check if max retries exceeded
-            const current = this.autoReturnManager.getEntry(invoiceId, dedupTransferId);
-            const retryCount = (current?.retryCount ?? 0) + 1;
-            if (retryCount >= AutoReturnManager.MAX_RETRY_COUNT) {
-              await this.autoReturnManager.markFailed(invoiceId, dedupTransferId);
-              deps.emitEvent('invoice:auto_return_failed', {
-                invoiceId,
-                transferId: dedupTransferId,
-                reason: 'send_failed',
-                refundAddress: fsb.refundAddress,
-              });
-            } else {
-              await this.autoReturnManager.incrementRetry(invoiceId, dedupTransferId);
+            // CR-M3 fix: Always increment retry count first, then check if max exceeded.
+            // This ensures the persisted retryCount reflects actual attempts, matching
+            // the crash recovery path and _executeEventAutoReturn pattern.
+            try {
+              const retryCount = await this.autoReturnManager.incrementRetry(invoiceId, dedupTransferId);
+              if (retryCount >= AutoReturnManager.MAX_RETRY_COUNT) {
+                await this.autoReturnManager.markFailed(invoiceId, dedupTransferId);
+                deps.emitEvent('invoice:auto_return_failed', {
+                  invoiceId,
+                  transferId: dedupTransferId,
+                  reason: 'send_failed',
+                  refundAddress: fsb.refundAddress,
+                });
+              }
+              // else: leave as 'pending' — crash recovery will retry
+            } catch {
+              // Storage failure — entry stays 'pending' in memory
             }
           }
         }
@@ -4128,7 +4154,7 @@ export class AccountingModule {
             if (i === 0) return (txf.genesis?.data?.recipient ?? '');
             return '';
           })(),
-          // W7 fix: use 0 sentinel (matching InvoiceTransferIndex convention) — Date.now()
+          // W7 fix: use 0 sentinel — Date.now()
           // would produce incorrect timestamps on crash-recovery rescans.
           timestamp: 0,
           confirmed: tx.inclusionProof !== null,
@@ -5307,18 +5333,29 @@ export class AccountingModule {
     } catch (err) {
       logger.warn(LOG_TAG, `Auto-return send failed for ${invoiceId} → ${sendParams.returnTo}:`, err);
 
-      // W3-R21 fix: Increment retry count so crash recovery has a bounded retry limit.
-      // Without this, a persistently failing send would never reach MAX_RETRY_COUNT.
-      await this.autoReturnManager.incrementRetry(invoiceId, sendParams.transferId).catch(() => {});
-
-      // Mark failed immediately (no gate — dedup ledger only)
-      await this.autoReturnManager.markFailed(invoiceId, sendParams.transferId).catch(() => {});
-
-      deps.emitEvent('invoice:auto_return_failed', {
-        invoiceId,
-        transferId: sendParams.transferId,
-        reason: 'send_failed',
-      });
+      // CR-H1 fix: Match _executeAutoReturnFromFrozen retry pattern — only markFailed
+      // when retryCount >= MAX_RETRY_COUNT, otherwise leave as 'pending' for crash
+      // recovery to retry. Calling incrementRetry+markFailed unconditionally made
+      // event auto-returns single-attempt regardless of MAX_RETRY_COUNT.
+      try {
+        const retryCount = await this.autoReturnManager.incrementRetry(invoiceId, sendParams.transferId);
+        if (retryCount >= AutoReturnManager.MAX_RETRY_COUNT) {
+          await this.autoReturnManager.markFailed(invoiceId, sendParams.transferId);
+          deps.emitEvent('invoice:auto_return_failed', {
+            invoiceId,
+            transferId: sendParams.transferId,
+            reason: 'send_failed',
+          });
+        }
+        // else: leave as 'pending' — crash recovery will retry up to MAX_RETRY_COUNT
+      } catch {
+        // Storage failure — entry stays 'pending' in memory, crash recovery will retry
+        deps.emitEvent('invoice:auto_return_failed', {
+          invoiceId,
+          transferId: sendParams.transferId,
+          reason: 'send_failed',
+        });
+      }
     }
   }
 
