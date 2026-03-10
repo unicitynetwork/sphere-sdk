@@ -31,13 +31,13 @@ import type { InvoiceMemoRef, TransferMessagePayload } from './types.js';
  *
  * @see ACCOUNTING-SPEC.md §4.4
  */
-export const INVOICE_MEMO_REGEX = /^INV:([0-9a-fA-F]{64})(?::(F|B|RC|RX))?(?: (.+))?$/;
+export const INVOICE_MEMO_REGEX = /^INV:([0-9a-fA-F]{64,68})(?::(F|B|RC|RX))?(?: (.+))?$/;
 
 /**
  * Regex for validating a 64-character lowercase/uppercase hex invoice ID.
  * Used by {@link buildInvoiceMemo} before constructing outbound memos.
  */
-export const INVOICE_ID_REGEX = /^[0-9a-fA-F]{64}$/;
+export const INVOICE_ID_REGEX = /^[0-9a-fA-F]{64,68}$/;
 
 /**
  * Maps the canonical payment direction name to its wire code.

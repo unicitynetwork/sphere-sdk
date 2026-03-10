@@ -724,12 +724,20 @@ export class AccountingModule {
     const terms = this.invoiceTermsCache.get(invoiceId);
     if (!terms) return false;
 
-    const activeAddresses = this.deps!.getActiveAddresses();
     const targetAddresses = new Set(terms.targets.map((t) => t.address));
 
+    // Primary check: active (tracked) addresses
+    const activeAddresses = this.deps!.getActiveAddresses();
     for (const addr of activeAddresses) {
       if (targetAddresses.has(addr.directAddress)) return true;
     }
+
+    // Fallback: identity's own direct address (covers cases where tracked
+    // addresses haven't loaded yet, e.g. right after startup or in instant-mode
+    // flows where events fire before address tracking is fully initialized).
+    const ownDirectAddress = this.deps!.identity?.directAddress;
+    if (ownDirectAddress && targetAddresses.has(ownDirectAddress)) return true;
+
     return false;
   }
 
@@ -855,10 +863,10 @@ export class AccountingModule {
 
         if (hasCoin) {
           const [coinId, amount] = asset.coin!;
-          // CoinId: /^[A-Za-z0-9]+$/, ≤20 chars, non-empty
-          if (!coinId || !/^[A-Za-z0-9]+$/.test(coinId) || coinId.length > 20) {
+          // CoinId: /^[A-Za-z0-9]+$/, ≤68 chars (supports short symbols and hex hashes), non-empty
+          if (!coinId || !/^[A-Za-z0-9]+$/.test(coinId) || coinId.length > 68) {
             throw new SphereError(
-              'Coin ID must be non-empty, alphanumeric only, max 20 characters',
+              'Coin ID must be non-empty, alphanumeric only, max 68 characters',
               'INVOICE_INVALID_COIN',
             );
           }
@@ -1669,6 +1677,7 @@ export class AccountingModule {
     // Build wallet addresses set for self-payment detection
     const activeAddresses = this.deps!.getActiveAddresses();
     const walletAddresses = new Set(activeAddresses.map((a) => a.directAddress));
+    if (this.deps!.identity?.directAddress) walletAddresses.add(this.deps!.identity.directAddress);
 
     const status = computeInvoiceStatus(invoiceId, terms, entries, null, walletAddresses);
 
@@ -1962,6 +1971,9 @@ export class AccountingModule {
       const walletAddresses = new Set(
         deps.getActiveAddresses().map((a) => a.directAddress),
       );
+      // Fallback: include identity's own direct address (may not be in tracked addresses yet)
+      const ownDirect = deps.identity?.directAddress;
+      if (ownDirect) walletAddresses.add(ownDirect);
       const status = computeInvoiceStatus(invoiceId, terms, entries, null, walletAddresses);
 
       // Determine latest sender per target:coinId
@@ -2081,6 +2093,9 @@ export class AccountingModule {
       const walletAddresses = new Set(
         deps.getActiveAddresses().map((a) => a.directAddress),
       );
+      // Fallback: include identity's own direct address (may not be in tracked addresses yet)
+      const ownDirect = deps.identity?.directAddress;
+      if (ownDirect) walletAddresses.add(ownDirect);
       const status = computeInvoiceStatus(invoiceId, terms, entries, null, walletAddresses);
 
       // Freeze balances for CANCELLED state — per-sender balances preserved
@@ -2262,6 +2277,8 @@ export class AccountingModule {
         ? Array.from(this.invoiceLedger.get(invoiceId)!.values())
         : [];
       const walletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
+      const ownDirect = deps.identity?.directAddress;
+      if (ownDirect) walletAddresses.add(ownDirect);
       const liveStatus = computeInvoiceStatus(invoiceId, terms, ledgerEntries, null, walletAddresses);
       const targetStatus = liveStatus.targets.find((t) => t.address === target.address);
       const coinAssetStatus = targetStatus?.coinAssets.find((ca) => ca.coin[0] === coinId);
@@ -2364,8 +2381,16 @@ export class AccountingModule {
 
       // Determine which of our tracked addresses is the target for this invoice
       const targetAddressSet = new Set(terms.targets.map((t) => t.address));
-      const myTargetAddress = activeAddresses.find((a) => targetAddressSet.has(a.directAddress))
+      let myTargetAddress = activeAddresses.find((a) => targetAddressSet.has(a.directAddress))
         ?.directAddress;
+
+      // Fallback: use identity's own direct address (same as isTarget() fallback)
+      if (!myTargetAddress) {
+        const ownDirect = deps.identity?.directAddress;
+        if (ownDirect && targetAddressSet.has(ownDirect)) {
+          myTargetAddress = ownDirect;
+        }
+      }
 
       if (!myTargetAddress) {
         // Guard: isTarget() passed but no matching address found — defensive
@@ -2458,6 +2483,7 @@ export class AccountingModule {
           ? Array.from(this.invoiceLedger.get(invoiceId)!.values())
           : [];
         const walletAddresses = new Set(activeAddresses.map((a) => a.directAddress));
+        if (myTargetAddress) walletAddresses.add(myTargetAddress);
         const liveStatus = computeInvoiceStatus(invoiceId, terms, liveEntries, null, walletAddresses);
 
         const targetStatus = liveStatus.targets.find((t) => t.address === myTargetAddress);
@@ -4118,7 +4144,7 @@ export class AccountingModule {
         // W6-R18 fix: validate coinId — on-chain coinData is untrusted. Reject empty,
         // non-alphanumeric, or excessively long coinIds to prevent storage amplification
         // and dedup-key collision (coinId containing '::' could corrupt composite keys).
-        if (!coinId || !/^[A-Za-z0-9]+$/.test(coinId) || coinId.length > 20) {
+        if (!coinId || !/^[A-Za-z0-9]+$/.test(coinId) || coinId.length > 68) {
           logger.warn(LOG_TAG, `Token ${tokenId} tx[${i}] has invalid coinId '${coinId}' — skipping`);
           continue;
         }
@@ -4499,6 +4525,7 @@ export class AccountingModule {
 
       const entries = Array.from(innerMap.values());
       const walletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
+      if (deps.identity?.directAddress) walletAddresses.add(deps.identity.directAddress);
       const status = computeInvoiceStatus(invoiceId, terms, entries, null, walletAddresses);
 
       // W2 fix: Re-check terminal state before firing coverage events — a concurrent
@@ -4652,7 +4679,7 @@ export class AccountingModule {
 
     // §5.11 step 5c: invoiceId must be 64-char lowercase hex
     const invoiceId = raw['invoiceId'];
-    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64}$/.test(invoiceId)) return;
+    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64,68}$/.test(invoiceId)) return;
 
     // §5.11 step 5d: terminalState
     const terminalState = raw['terminalState'];
@@ -4750,7 +4777,7 @@ export class AccountingModule {
 
     // §5.12 step 5c: invoiceId must be 64-char lowercase hex
     const invoiceId = raw['invoiceId'];
-    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64}$/.test(invoiceId)) return;
+    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64,68}$/.test(invoiceId)) return;
 
     // §5.12 step 5d: senderContribution — object with non-empty senderAddress and bounded assets array
     const senderContribution = raw['senderContribution'];
@@ -4834,12 +4861,38 @@ export class AccountingModule {
     const deps = this.deps!;
     const terms = this.invoiceTermsCache.get(invoiceId)!;
 
-    const syntheticRef = this._buildSyntheticTransferRef(
+    let syntheticRef = this._buildSyntheticTransferRef(
       transfer,
       invoiceId,
       paymentDirection,
       confirmed,
     );
+
+    // Enrich synthetic ref with senderAddress/refundAddress/contact from ledger entries.
+    // _processTokenTransactions (called before us) extracts senderAddress from genesis
+    // recipient, and inv.ra/inv.ct from on-chain data into ledger entries. The synthetic
+    // ref built above only uses transport-level data (which has senderAddress=null for
+    // inbound transfers because transport pubkey ≠ chain address).
+    const ledger = this.invoiceLedger.get(invoiceId);
+    if (ledger) {
+      for (const token of transfer.tokens) {
+        if (!token.id) continue;
+        for (const [key, ref] of ledger) {
+          if (key.startsWith(`${token.id}:`)) {
+            syntheticRef = {
+              ...syntheticRef,
+              // Copy senderAddress from ledger when synthetic ref has null
+              ...(syntheticRef.senderAddress === null && ref.senderAddress !== null
+                ? { senderAddress: ref.senderAddress } : {}),
+              ...(ref.refundAddress !== undefined ? { refundAddress: ref.refundAddress } : {}),
+              ...(ref.contact !== undefined ? { contact: ref.contact } : {}),
+            };
+            break;
+          }
+        }
+        if (syntheticRef.senderAddress !== null) break; // found enrichment, stop searching
+      }
+    }
 
     const isReturn =
       paymentDirection === 'back' ||
@@ -4978,6 +5031,7 @@ export class AccountingModule {
 
     // §6.2 step 6: Non-terminal — match transfer against invoice targets and assets
     const walletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
+    if (deps.identity?.directAddress) walletAddresses.add(deps.identity.directAddress);
     const targetAddressSet = new Set(terms.targets.map((t) => t.address));
 
     const matchesTarget = targetAddressSet.has(syntheticRef.destinationAddress);
@@ -4988,6 +5042,29 @@ export class AccountingModule {
     const matchesAsset = matchesTarget && targetCoinIds.has(syntheticRef.coinId);
 
     if (matchesTarget && matchesAsset) {
+      // §6.2 step 6a-fix: Ensure ledger entry exists for instant-mode (v5split) tokens.
+      // In instant mode, split tokens arrive without TXF transactions/genesis, so
+      // _processTokenTransactions creates no ledger entries. Create a synthetic entry
+      // from the syntheticRef so that computeInvoiceStatus can track coverage.
+      if (!this.invoiceLedger.has(invoiceId)) {
+        this.invoiceLedger.set(invoiceId, new Map());
+      }
+      const existingLedger = this.invoiceLedger.get(invoiceId)!;
+      const syntheticKey = `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+      if (!existingLedger.has(syntheticKey)) {
+        // Check no real entry exists for this transfer (by transferId prefix match)
+        let hasRealEntry = false;
+        for (const [key] of existingLedger) {
+          if (key.includes(syntheticRef.transferId)) {
+            hasRealEntry = true;
+            break;
+          }
+        }
+        if (!hasRealEntry) {
+          existingLedger.set(syntheticKey, { ...syntheticRef });
+        }
+      }
+
       // §6.2 step 6a: Matches target + asset
       deps.emitEvent('invoice:payment', {
         invoiceId,
@@ -5174,6 +5251,7 @@ export class AccountingModule {
     }
 
     const walletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
+    if (deps.identity?.directAddress) walletAddresses.add(deps.identity.directAddress);
     const targetAddressSet = new Set(terms.targets.map((t) => t.address));
     const matchesTarget = targetAddressSet.has(syntheticRef.destinationAddress);
     const targetTerms = terms.targets.find((t) => t.address === syntheticRef.destinationAddress);
@@ -5183,6 +5261,22 @@ export class AccountingModule {
     const matchesAsset = matchesTarget && targetCoinIds.has(syntheticRef.coinId);
 
     if (matchesTarget && matchesAsset) {
+      // Ensure ledger entry exists (same v5split fix as _processInvoiceTransferEvent)
+      if (!this.invoiceLedger.has(invoiceId)) {
+        this.invoiceLedger.set(invoiceId, new Map());
+      }
+      const hLedger = this.invoiceLedger.get(invoiceId)!;
+      const hKey = `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+      if (!hLedger.has(hKey)) {
+        let hasReal = false;
+        for (const [k] of hLedger) {
+          if (k.includes(syntheticRef.transferId)) { hasReal = true; break; }
+        }
+        if (!hasReal) {
+          hLedger.set(hKey, { ...syntheticRef });
+        }
+      }
+
       deps.emitEvent('invoice:payment', {
         invoiceId,
         transfer: syntheticRef,
