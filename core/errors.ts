@@ -80,6 +80,11 @@ export type SphereErrorCode =
   | 'INVOICE_STORAGE_FAILED'
   | 'RATE_LIMITED'
   | 'COMMUNICATIONS_UNAVAILABLE'
+  // Token Spend Queue error codes
+  | 'SEND_QUEUE_TIMEOUT'
+  | 'SEND_INSUFFICIENT_BALANCE'
+  | 'SEND_RESERVATION_CANCELLED'
+  | 'SEND_QUEUE_FULL'
   | 'MODULE_DESTROYED';
 
 export class SphereError extends Error {
