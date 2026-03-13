@@ -137,6 +137,7 @@ export class AccountingModule {
   private destroyed = false;
   private loadPromise: Promise<void> | null = null;
   private _loading = false;
+  private _loadingDeferred: { promise: Promise<void>; resolve: () => void } | null = null;
 
   // ---------------------------------------------------------------------------
   // Invoice token cache: invoiceId → parsed InvoiceTerms
@@ -252,6 +253,9 @@ export class AccountingModule {
    * @param deps - Module dependencies provided by Sphere.
    */
   initialize(deps: AccountingModuleDependencies): void {
+    // W23-R2 fix: Reset destroyed flag so load() can proceed after destroy() + re-init
+    // (e.g., switchToAddress() calls destroy() then initialize() then load()).
+    this.destroyed = false;
     this.deps = deps;
     if (this.config.debug) {
       logger.debug(LOG_TAG, 'Initialized with dependencies');
@@ -293,19 +297,17 @@ export class AccountingModule {
       return this.loadPromise;
     }
     // C2 fix: If _loading is true but loadPromise is null (brief window in finally block),
-    // spin-wait until the flag clears, with destroy check and 10s timeout.
+    // wait for the deferred signal that the completing load resolves.
     if (this._loading) {
-      await new Promise<void>((resolve, reject) => {
-        let iterations = 0;
-        const MAX_ITERATIONS = 10000; // ~10 seconds
-        const check = () => {
-          if (!this._loading) resolve();
-          else if (this.destroyed) reject(new SphereError('AccountingModule has been destroyed.', 'MODULE_DESTROYED'));
-          else if (++iterations > MAX_ITERATIONS) reject(new SphereError('load() timed out waiting for prior load', 'NOT_INITIALIZED'));
-          else setTimeout(check, 1);
-        };
-        check();
-      });
+      if (!this._loadingDeferred) {
+        this._loadingDeferred = this._createDeferred();
+      }
+      await Promise.race([
+        this._loadingDeferred.promise,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new SphereError('load() timed out waiting for prior load', 'NOT_INITIALIZED')), 10_000),
+        ),
+      ]);
       // After the previous load completed, verify module is still alive.
       if (this.destroyed) {
         throw new SphereError('AccountingModule has been destroyed.', 'MODULE_DESTROYED');
@@ -320,7 +322,19 @@ export class AccountingModule {
     } finally {
       this._loading = false;
       this.loadPromise = null;
+      // Signal any waiters from the C2 deferred pattern
+      if (this._loadingDeferred) {
+        this._loadingDeferred.resolve();
+        this._loadingDeferred = null;
+      }
     }
+  }
+
+  /** Create a deferred promise (resolve callable externally). */
+  private _createDeferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => { resolve = r; });
+    return { promise, resolve };
   }
 
   private async _doLoad(): Promise<void> {
@@ -863,10 +877,10 @@ export class AccountingModule {
 
         if (hasCoin) {
           const [coinId, amount] = asset.coin!;
-          // CoinId: /^[A-Za-z0-9]+$/, ≤68 chars (supports short symbols and hex hashes), non-empty
-          if (!coinId || !/^[A-Za-z0-9]+$/.test(coinId) || coinId.length > 68) {
+          // CoinId: /^[A-Za-z0-9]+$/, ≤20 chars (per spec §createInvoice validation), non-empty
+          if (!coinId || !/^[A-Za-z0-9]+$/.test(coinId) || coinId.length > 20) {
             throw new SphereError(
-              'Coin ID must be non-empty, alphanumeric only, max 68 characters',
+              'Coin ID must be non-empty, alphanumeric only, max 20 characters',
               'INVOICE_INVALID_COIN',
             );
           }
@@ -1161,12 +1175,9 @@ export class AccountingModule {
       const tokenState = new TokenState(invoicePredicate, null);
 
       // Step 11: Create Token
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let sdkToken: any;
-
       // Always verify against trust base — never skip proof verification
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      sdkToken = await SdkToken.mint(trustBase as any, tokenState, genesisTransaction);
+      const sdkToken: any = await SdkToken.mint(trustBase as any, tokenState, genesisTransaction);
 
       if (this.config.debug) {
         logger.debug(LOG_TAG, 'Invoice token minted successfully');
@@ -2182,7 +2193,11 @@ export class AccountingModule {
       }
     });
 
-    // Re-check after gate release — narrow accepted race window per §5.9
+    // Re-check after gate release — best-effort guard. A concurrent close can still
+    // complete between this check and send() below (TOCTOU). This is an accepted race:
+    // payments that land on a just-terminated invoice will be auto-returned (§7.5).
+    // Gate is intentionally NOT held through send() to avoid blocking other invoice
+    // operations during the potentially long network call.
     if (this.closedInvoices.has(invoiceId) || this.cancelledInvoices.has(invoiceId)) {
       throw new SphereError(
         `Invoice is already terminated (closed or cancelled): ${invoiceId}`,
@@ -3403,6 +3418,16 @@ export class AccountingModule {
     direction: 'RC' | 'RX',
     deps: AccountingModuleDependencies,
   ): Promise<void> {
+    // W23 fix: Hoist getHistory() before the loop and build a memo→entry Map
+    // for O(1) lookup instead of O(n*m) linear scans.
+    const history = deps.payments.getHistory();
+    const historyByMemo = new Map<string, (typeof history)[number]>();
+    for (const h of history) {
+      if (h.type === 'SENT' && h.memo && h.transferId) {
+        historyByMemo.set(h.memo, h);
+      }
+    }
+
     for (const ft of frozen.targets) {
       for (const fca of ft.coinAssets) {
         const coinId = fca.coin[0];
@@ -3423,15 +3448,8 @@ export class AccountingModule {
 
           // Secondary dedup: check transaction history for an existing return
           // W13: Require type === 'SENT' AND on-chain confirmation (transferId or txHash)
-          const history = deps.payments.getHistory();
           const memo = buildInvoiceMemo(invoiceId, direction, dedupTransferId);
-          const alreadyReturned = history.find(
-            (h) =>
-              h.type === 'SENT' &&
-              h.memo !== undefined &&
-              h.memo === memo &&
-              h.transferId, // must have a confirmed transfer ID
-          );
+          const alreadyReturned = historyByMemo.get(memo);
 
           if (alreadyReturned) {
             await this.autoReturnManager.markCompleted(
@@ -3547,6 +3565,16 @@ export class AccountingModule {
   ): Promise<void> {
     let failedCount = 0;
 
+    // W23 fix: Hoist getHistory() before the loop and build a memo→entry Map
+    // for O(1) lookup instead of O(n*m) linear scans.
+    const history = deps.payments.getHistory();
+    const historyByMemo = new Map<string, (typeof history)[number]>();
+    for (const h of history) {
+      if (h.type === 'SENT' && h.memo && h.transferId) {
+        historyByMemo.set(h.memo, h);
+      }
+    }
+
     for (const ft of frozen.targets) {
       for (const fca of ft.coinAssets) {
         for (const fsb of fca.frozenSenderBalances) {
@@ -3567,14 +3595,7 @@ export class AccountingModule {
 
           // Secondary dedup: check transaction history for an existing return
           // W13: Require type === 'SENT' AND on-chain confirmation (transferId or txHash)
-          const history = deps.payments.getHistory();
-          const alreadyReturned = history.find(
-            (h) =>
-              h.type === 'SENT' &&
-              h.memo !== undefined &&
-              h.memo === memo &&
-              h.transferId, // must have a confirmed transfer ID
-          );
+          const alreadyReturned = historyByMemo.get(memo);
 
           if (alreadyReturned) {
             await this.autoReturnManager.markCompleted(
@@ -4068,6 +4089,10 @@ export class AccountingModule {
     let lastSuccessIdx = startIndex;
 
     for (let i = startIndex; i < transactions.length; i++) {
+      // W23-R2 fix: Advance watermark unconditionally so non-invoice transactions
+      // don't cause perpetual re-scanning on every event.
+      lastSuccessIdx = i + 1;
+
       const tx = transactions[i];
       if (!tx?.data?.['message']) continue;
 
@@ -4133,11 +4158,19 @@ export class AccountingModule {
       // Use positional transferId (avoids expensive async hash computation)
       const transferId = `${tokenId}:${i}`;
 
-      // Determine sender from genesis recipient (index 0) or prior transaction predicate
-      // We use a simple heuristic here: senderAddress from genesis recipient at index 0,
+      // Determine sender from genesis recipient (index 0) or prior transaction predicate.
+      // We use a simple heuristic: senderAddress from genesis recipient at index 0,
       // null for subsequent transactions (no async SDK calls available in sync context).
+      // For return directions (back/return_closed/return_cancelled), the genesis recipient
+      // is the original destination (the invoice target), NOT the return sender. Setting
+      // senderAddress from genesis recipient would cause the §6.2 step 3a check to
+      // incorrectly classify unauthorized returns as authorized. Use null instead.
+      const isReturnDirection =
+        paymentDirection === 'back' ||
+        paymentDirection === 'return_closed' ||
+        paymentDirection === 'return_cancelled';
       const senderAddress: string | null =
-        i === 0 ? (txf.genesis?.data?.recipient ?? null) : null;
+        isReturnDirection ? null : (i === 0 ? (txf.genesis?.data?.recipient ?? null) : null);
 
       // Create one ref per coin
       for (const [coinId, amount] of entries) {
@@ -4194,18 +4227,31 @@ export class AccountingModule {
         // arrives, we remove one matching provisional to prevent double-counting.
         // Match on coinId + paymentDirection only (not amount) because token splits
         // may produce different on-chain amounts than the requested return amount.
-        const provisionalKeysToDelete: string[] = [];
+        const keysToDelete: string[] = [];
         for (const [existingKey, existingRef] of ledger) {
           if (
             existingKey.startsWith('provisional:') &&
             existingRef.coinId === coinId &&
             existingRef.paymentDirection === paymentDirection
           ) {
-            provisionalKeysToDelete.push(existingKey);
+            keysToDelete.push(existingKey);
             break; // W8: one-for-one — remove only one provisional per on-chain entry
           }
         }
-        for (const pKey of provisionalKeysToDelete) {
+        // W23 fix: Also remove matching synthetic entries (from v5split instant-mode
+        // tokens that arrived before TXF data). Synthetic keys use
+        // "synthetic:{transportTransferId}::{coinId}" — match by coinId + direction.
+        for (const [existingKey, existingRef] of ledger) {
+          if (
+            existingKey.startsWith('synthetic:') &&
+            existingRef.coinId === coinId &&
+            existingRef.paymentDirection === paymentDirection
+          ) {
+            keysToDelete.push(existingKey);
+            break; // one-for-one — remove only one synthetic per on-chain entry
+          }
+        }
+        for (const pKey of keysToDelete) {
           ledger.delete(pKey);
         }
 
@@ -4220,9 +4266,7 @@ export class AccountingModule {
         this.tokenInvoiceMap.get(tokenId)!.add(invoiceId);
       }
 
-      // C4/W19 fix: advance watermark per-transaction, not unconditionally at end.
-      // This ensures errors don't permanently skip valid transactions.
-      lastSuccessIdx = i + 1;
+      // (watermark advancement moved to top of loop body — W23-R2 fix)
     }
 
     // Update watermark to last successfully processed index
@@ -4405,7 +4449,8 @@ export class AccountingModule {
     const memoRef = parseInvoiceMemo(memo);
     if (!memoRef) return;
 
-    let { invoiceId, paymentDirection } = memoRef;
+    const { invoiceId, paymentDirection: memoParsedDirection } = memoRef;
+    let paymentDirection = memoParsedDirection;
     const confirmed = false; // transfer:incoming = unconfirmed
     const deps = this.deps!;
 
@@ -4679,7 +4724,7 @@ export class AccountingModule {
 
     // §5.11 step 5c: invoiceId must be 64-char lowercase hex
     const invoiceId = raw['invoiceId'];
-    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64,68}$/.test(invoiceId)) return;
+    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64}$/.test(invoiceId)) return;
 
     // §5.11 step 5d: terminalState
     const terminalState = raw['terminalState'];
@@ -4777,7 +4822,7 @@ export class AccountingModule {
 
     // §5.12 step 5c: invoiceId must be 64-char lowercase hex
     const invoiceId = raw['invoiceId'];
-    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64,68}$/.test(invoiceId)) return;
+    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64}$/.test(invoiceId)) return;
 
     // §5.12 step 5d: senderContribution — object with non-empty senderAddress and bounded assets array
     const senderContribution = raw['senderContribution'];
@@ -5050,15 +5095,26 @@ export class AccountingModule {
         this.invoiceLedger.set(invoiceId, new Map());
       }
       const existingLedger = this.invoiceLedger.get(invoiceId)!;
-      const syntheticKey = `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+      // W23-R3 fix: Use token ID (not transfer ID) as the synthetic key so that
+      // both transfer:incoming and history:updated produce the same key for the
+      // same payment. This prevents double-counting while allowing multiple
+      // legitimate payments with the same coinId.
+      const firstTokenId = transfer.tokens.find((t) => t.id)?.id;
+      const syntheticKey = firstTokenId
+        ? `synthetic:${firstTokenId}::${syntheticRef.coinId}`
+        : `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
       if (!existingLedger.has(syntheticKey)) {
-        // Check no real entry exists for this transfer (by transferId prefix match)
+        // Check no real entry exists for this transfer's tokens (by tokenId prefix match).
         let hasRealEntry = false;
-        for (const [key] of existingLedger) {
-          if (key.includes(syntheticRef.transferId)) {
-            hasRealEntry = true;
-            break;
+        for (const tok of transfer.tokens) {
+          if (!tok.id) continue;
+          for (const [key] of existingLedger) {
+            if (key.startsWith(`${tok.id}:`) && key.endsWith(`::${syntheticRef.coinId}`)) {
+              hasRealEntry = true;
+              break;
+            }
           }
+          if (hasRealEntry) break;
         }
         if (!hasRealEntry) {
           existingLedger.set(syntheticKey, { ...syntheticRef });
@@ -5106,7 +5162,10 @@ export class AccountingModule {
         const reEntries = this.invoiceLedger.get(invoiceId)
           ? Array.from(this.invoiceLedger.get(invoiceId)!.values())
           : [];
-        const reStatus = computeInvoiceStatus(invoiceId, terms, reEntries, null, walletAddresses);
+        // W23 fix: Re-read walletAddresses inside gate (matches W7-R20 pattern in _handleTransferConfirmed)
+        const freshWalletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
+        if (deps.identity?.directAddress) freshWalletAddresses.add(deps.identity.directAddress);
+        const reStatus = computeInvoiceStatus(invoiceId, terms, reEntries, null, freshWalletAddresses);
         if (reStatus.state === 'COVERED' && reStatus.allConfirmed) {
           await this._terminateInvoice(invoiceId, 'CLOSED');
         }
@@ -5266,13 +5325,24 @@ export class AccountingModule {
         this.invoiceLedger.set(invoiceId, new Map());
       }
       const hLedger = this.invoiceLedger.get(invoiceId)!;
-      const hKey = `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+      // W23-R3 fix: Use token ID (not transfer ID) as the synthetic key — same
+      // approach as _processInvoiceTransferEvent. entry.tokenId comes from the
+      // history record and matches the token ID used in the transfer event.
+      const hKey = entry.tokenId
+        ? `synthetic:${entry.tokenId}::${syntheticRef.coinId}`
+        : `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
       if (!hLedger.has(hKey)) {
-        let hasReal = false;
-        for (const [k] of hLedger) {
-          if (k.includes(syntheticRef.transferId)) { hasReal = true; break; }
+        // Check for real entries for this specific token (scoped by tokenId, not broad coinId)
+        let hasRealEntry = false;
+        if (entry.tokenId) {
+          for (const [k] of hLedger) {
+            if (k.startsWith(`${entry.tokenId}:`) && k.endsWith(`::${syntheticRef.coinId}`)) {
+              hasRealEntry = true;
+              break;
+            }
+          }
         }
-        if (!hasReal) {
+        if (!hasRealEntry) {
           hLedger.set(hKey, { ...syntheticRef });
         }
       }
@@ -5313,7 +5383,10 @@ export class AccountingModule {
         const reEntries = this.invoiceLedger.get(invoiceId)
           ? Array.from(this.invoiceLedger.get(invoiceId)!.values())
           : [];
-        const reStatus = computeInvoiceStatus(invoiceId, terms, reEntries, null, walletAddresses);
+        // W23 fix: Re-read walletAddresses inside gate (matches W7-R20 pattern in _handleTransferConfirmed)
+        const freshWalletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
+        if (deps.identity?.directAddress) freshWalletAddresses.add(deps.identity.directAddress);
+        const reStatus = computeInvoiceStatus(invoiceId, terms, reEntries, null, freshWalletAddresses);
         if (reStatus.state === 'COVERED' && reStatus.allConfirmed) {
           await this._terminateInvoice(invoiceId, 'CLOSED');
         }

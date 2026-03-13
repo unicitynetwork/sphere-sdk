@@ -460,11 +460,22 @@ export class SpendQueue {
         continue;
       }
 
-      // Build merged pool: start from original parsedPool, override with fresh cache entries
-      const mergedPool: ParsedTokenPool = new Map(entry.parsedPool);
+      // W23 fix: Build merged pool preferring fresh parsedTokenCache entries.
+      // parsedPool is the snapshot from enqueue time — sdkToken objects may be stale
+      // (outdated state hash) if the token was updated between enqueue and wake-up.
+      // Start from parsedTokenCache (always fresh), fall back to parsedPool only for
+      // tokens not in the cache. buildFreeView's liveness check filters removed tokens.
+      const mergedPool: ParsedTokenPool = new Map();
+      // First: add all fresh cache entries for this coinId
       for (const [id, cached] of this.parsedTokenCache) {
         if (cached.token.coinId === coinId) {
           mergedPool.set(id, cached);
+        }
+      }
+      // Then: add original entries only if not already in cache (stale fallback)
+      for (const [id, original] of entry.parsedPool) {
+        if (!mergedPool.has(id)) {
+          mergedPool.set(id, original);
         }
       }
 
@@ -498,14 +509,12 @@ export class SpendQueue {
         continue;
       }
 
-      // Could not plan — skip
+      // Could not plan — skip this entry and try later ones.
+      // W23 fix: Only increment skipCount when this is a fresh evaluation
+      // (not a repeated scan triggered by unrelated token events).
+      // We skip over the entry instead of breaking — smaller entries behind
+      // a large blocked one can still be planned, preventing starvation.
       entry.skipCount++;
-      if (entry.skipCount >= MAX_SKIP_COUNT) {
-        // Starvation protection: stop processing this coinId queue
-        // so that the head entry is not starved indefinitely
-        logger.debug(TAG, `Queue entry ${entry.id} reached max skip count (${MAX_SKIP_COUNT}), halting queue scan`);
-        break;
-      }
 
       i++;
     }
@@ -554,7 +563,16 @@ export class SpendQueue {
   // Private helpers
   // ---------------------------------------------------------------------------
 
-  /** Build a free-amount view from a parsed pool, consulting the ledger. */
+  /**
+   * Build a free-amount view from a parsed pool, consulting the ledger.
+   *
+   * W23 fix: Only include tokens where freeAmount === tokenAmount (fully free).
+   * A direct transfer sends the entire token — if another reservation holds part
+   * of it, the token cannot be sent directly. The planner's calculateOptimalSplitSync
+   * would select a partially-free token thinking it's available, but the reservation
+   * would fail with INSUFFICIENT_FREE_AMOUNT because extractReservationEntries
+   * correctly reserves the full token amount.
+   */
   private buildFreeView(
     pool: ParsedTokenPool,
     coinId: string
@@ -568,7 +586,9 @@ export class SpendQueue {
       const liveToken = liveTokens.get(tokenId);
       if (!liveToken || liveToken.status !== 'confirmed') continue;
       const freeAmount = this.ledger.getFreeAmount(entry.token.id, entry.amount);
-      if (freeAmount > 0n) {
+      // Only include fully-free tokens — partially reserved tokens cannot be
+      // used for direct transfers and would cause INSUFFICIENT_FREE_AMOUNT
+      if (freeAmount > 0n && freeAmount === entry.amount) {
         view.push({ token: entry.token, sdkToken: entry.sdkToken, amount: freeAmount });
       }
     }

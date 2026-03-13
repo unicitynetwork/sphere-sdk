@@ -823,7 +823,7 @@ describe('SpendQueue', () => {
       await largeProm.catch(() => {});
     });
 
-    it('halts queue scan when head entry reaches MAX_SKIP_COUNT', () => {
+    it('continues queue scan past entry that reaches MAX_SKIP_COUNT', () => {
       const pool = buildPool([{ id: 'tok-1', coinId: 'UCT', amount: 50n }]);
       parsedTokenCache.set('tok-1', pool.get('tok-1')!);
 
@@ -851,17 +851,18 @@ describe('SpendQueue', () => {
       enq({ id: 'small-a', request: { amount: '50', coinId: 'UCT' }, parsedPool: pool, coinId: 'UCT', amount: 50n, enqueuedAt: Date.now() });
       enq({ id: 'small-b', request: { amount: '50', coinId: 'UCT' }, parsedPool: pool, coinId: 'UCT', amount: 50n, enqueuedAt: Date.now() });
 
-      // Round 10: large skipCount 9 -> 10, triggers break. small-a and small-b not processed.
+      // Round 10: large skipCount 9 -> 10, can't plan. Queue continues to small-a and small-b.
       spy.mockReset();
       spy.mockReturnValueOnce(null); // large
-      spy.mockReturnValueOnce(directPlan(pool.get('tok-1')!, 'UCT')); // would be small-a, but break fires first
+      spy.mockReturnValueOnce(directPlan(pool.get('tok-1')!, 'UCT')); // small-a served
+      spy.mockReturnValueOnce(null); // small-b can't plan (token reserved by small-a)
 
       queue.notifyChange('UCT');
 
-      // Planner called once (for large), then break -- starvation protection
-      expect(spy).toHaveBeenCalledTimes(1);
-      // Queue: large + small-a + small-b
-      expect(queue.size('UCT')).toBe(3);
+      // Planner called for all 3 entries — queue does not halt on blocked entry
+      expect(spy).toHaveBeenCalledTimes(3);
+      // Queue: large + small-b (small-a was served)
+      expect(queue.size('UCT')).toBe(2);
     });
 
     it('after head entry is served, later entries can proceed normally', async () => {

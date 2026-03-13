@@ -31,13 +31,13 @@ import type { InvoiceMemoRef, TransferMessagePayload } from './types.js';
  *
  * @see ACCOUNTING-SPEC.md §4.4
  */
-export const INVOICE_MEMO_REGEX = /^INV:([0-9a-fA-F]{64,68})(?::(F|B|RC|RX))?(?: (.+))?$/;
+export const INVOICE_MEMO_REGEX = /^INV:([0-9a-fA-F]{64})(?::(F|B|RC|RX))?(?: (.+))?$/;
 
 /**
  * Regex for validating a 64-character lowercase/uppercase hex invoice ID.
  * Used by {@link buildInvoiceMemo} before constructing outbound memos.
  */
-export const INVOICE_ID_REGEX = /^[0-9a-fA-F]{64,68}$/;
+export const INVOICE_ID_REGEX = /^[0-9a-fA-F]{64}$/;
 
 /**
  * Maps the canonical payment direction name to its wire code.
@@ -160,6 +160,7 @@ export function buildInvoiceMemo(
   // Then truncate to 256 Unicode code points (split on code points to handle
   // surrogate pairs for astral-plane characters correctly).
   const sanitized = freeText
+    // eslint-disable-next-line no-control-regex -- intentional: strip control chars from untrusted input
     ? [...freeText.replace(/[\x00-\x1f]/g, '')].slice(0, 256).join('').trim()
     : undefined;
 
@@ -277,6 +278,7 @@ export function decodeTransferMessage(messageBytes: Uint8Array | null | undefine
           typeof ctU === 'string' &&
           (ctU.startsWith('https://') || ctU.startsWith('wss://')) &&
           ctU.length <= 2048 &&
+          // eslint-disable-next-line no-control-regex -- intentional: reject control chars in URL
           !/[\x00-\x1f]/.test(ctU)
             ? ctU
             : undefined;
@@ -303,6 +305,7 @@ export function decodeTransferMessage(messageBytes: Uint8Array | null | undefine
   let txt: string | undefined;
   if (typeof raw['txt'] === 'string') {
     // Truncate to 1024 Unicode code points, strip control chars except \n \r
+    // eslint-disable-next-line no-control-regex -- intentional: strip control chars from untrusted input
     const stripped = raw['txt'].replace(/[\x00-\x09\x0b\x0c\x0e-\x1f]/g, '');
     const truncated = [...stripped].slice(0, 1024).join('');
     if (truncated.length > 0) {
@@ -406,6 +409,7 @@ export function parseInvoiceMemoForOnChain(
         typeof contact.url === 'string' &&
         (contact.url.startsWith('https://') || contact.url.startsWith('wss://')) &&
         contact.url.length <= 2048 &&
+        // eslint-disable-next-line no-control-regex -- intentional: reject control chars in URL
         !/[\x00-\x1f]/.test(contact.url)
       ) {
         validContact.u = contact.url;

@@ -2255,6 +2255,13 @@ export class Sphere {
    * Re-initialize modules after address switch
    */
   private async reinitializeModulesForNewAddress(): Promise<void> {
+    // W23 fix: Destroy the previous accounting module instance before re-init.
+    // This drains in-flight gated operations (auto-return, implicit close) that
+    // may hold stale ledger references from the previous address.
+    if (this._accounting) {
+      await this._accounting.destroy();
+    }
+
     const emitEvent = this.emitEvent.bind(this);
 
     this._payments.initialize({
@@ -3491,7 +3498,11 @@ export class Sphere {
 
     // Destroy accounting FIRST — it may have in-flight operations using payments.send()
     // Draining accounting gates before destroying payments prevents spurious pending entries
-    await this._accounting?.destroy();
+    try {
+      await this._accounting?.destroy();
+    } catch (err) {
+      logger.warn('Sphere', 'Accounting module destroy failed:', err);
+    }
 
     // Now safe to destroy payments
     this._payments.destroy();

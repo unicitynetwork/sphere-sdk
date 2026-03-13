@@ -497,15 +497,26 @@ export function computeInvoiceStatus(
       //   ref.destinationAddress == effectiveSender  (return goes TO original sender or refund addr)
       const returnRecipient = entry.destinationAddress;
       if (returnRecipient !== null && returnRecipient !== undefined) {
-        // Find existing sender accumulator keyed by returnRecipient
-        // (the return recipient is the original effectiveSender)
-        const senderAcc = coinAcc.senders.get(returnRecipient);
-        if (senderAcc) {
-          senderAcc.returned += amount;
-          // Do NOT merge contact on returns — contact is only on forward payments
+        // Find or create sender accumulator keyed by returnRecipient
+        // (the return recipient is the original effectiveSender).
+        // W23-R2 fix: Create accumulator if missing to prevent aggregate/per-sender
+        // mismatch. Without this, returnedAmount is counted in aggregate but no
+        // sender's returned amount decreases, enabling over-return on CANCELLED invoices.
+        let senderAcc = coinAcc.senders.get(returnRecipient);
+        if (!senderAcc) {
+          senderAcc = {
+            forwarded: 0n,
+            returned: 0n,
+            isRefundAddress: undefined,
+            senderPubkey: undefined,
+            senderNametag: undefined,
+            contactDedupKeys: new Set(),
+            contacts: [],
+          };
+          coinAcc.senders.set(returnRecipient, senderAcc);
         }
-        // If no senderAcc exists for this returnRecipient, no per-sender tracking
-        // (this can happen with out-of-band returns that bypass returnInvoicePayment())
+        senderAcc.returned += amount;
+        // Do NOT merge contact on returns — contact is only on forward payments
       }
     }
   }

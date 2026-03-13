@@ -360,9 +360,7 @@ INVOICES (Accounting):
   invoice-list [options]              List invoices
                                       --state <states>    Filter by state (OPEN,PARTIAL,etc.)
                                       --limit <n>         Max results
-                                      --json              Output as JSON array
   invoice-status <id-or-prefix>       Show invoice status and balances
-                                      --json              Output as JSON
   invoice-close <id-or-prefix>        Close an invoice
                                       --auto-return       Trigger auto-return on close
   invoice-cancel <id-or-prefix>       Cancel an invoice (as target)
@@ -380,7 +378,6 @@ INVOICES (Accounting):
                                       --disable           Disable auto-return
                                       --invoice <id>      Target specific invoice
   invoice-transfers <id-or-prefix>    List invoice transfers chronologically
-                                      --json              Output as JSON array
   invoice-export <id-or-prefix>       Export invoice to JSON file
   invoice-parse-memo <memo-string>    Parse an invoice memo string
 
@@ -2532,8 +2529,18 @@ async function main() {
         let tokenJson: unknown;
         try {
           tokenJson = JSON.parse(fs.readFileSync(path.resolve(tokenFile), 'utf8'));
-        } catch (err) {
-          console.error(`Failed to read token file "${tokenFile}": ${err instanceof Error ? err.message : err}`);
+        } catch (err: unknown) {
+          // W23-R2 fix: Sanitize error messages to avoid leaking file system paths
+          const code = (err as NodeJS.ErrnoException)?.code;
+          if (code === 'ENOENT') {
+            console.error(`Token file not found: "${tokenFile}"`);
+          } else if (code === 'EACCES') {
+            console.error(`Permission denied reading: "${tokenFile}"`);
+          } else if (err instanceof SyntaxError) {
+            console.error(`Invalid JSON in token file: "${tokenFile}"`);
+          } else {
+            console.error(`Failed to read token file: "${tokenFile}"`);
+          }
           process.exit(1);
         }
 

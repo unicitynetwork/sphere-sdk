@@ -29,7 +29,7 @@ import type {
   NametagData,
 } from '../../types/txf';
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
-import { TokenSplitCalculator } from './TokenSplitCalculator';
+import { TokenSplitCalculator, type SplitPlan, type TokenWithAmount } from './TokenSplitCalculator';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
@@ -1009,17 +1009,29 @@ export class PaymentsModule {
   /**
    * Send tokens to recipient
    * Supports automatic token splitting when exact amount is needed
+   *
+   * @param request - Transfer request.
+   * @param internal - Internal options (not part of the public API).
+   *   `existingReservationId` and `existingSplitPlan` allow callers (e.g. instantSplitSend)
+   *   to pass an already-acquired reservation, skipping the planSend() critical section.
    */
-  async send(request: TransferRequest): Promise<TransferResult> {
+  async send(
+    request: TransferRequest,
+    internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
+  ): Promise<TransferResult> {
     this.ensureInitialized();
 
     // Use mutable result for building the transfer
     const result: { -readonly [K in keyof TransferResult]: TransferResult[K] } = {
-      id: crypto.randomUUID(),
+      id: internal?.existingReservationId ?? crypto.randomUUID(),
       status: 'pending',
       tokens: [],
       tokenTransfers: [],
     };
+
+    // W23-R2 fix: Track tokens committed on-chain so the error handler doesn't
+    // restore already-spent tokens (e.g., split source token after on-chain split).
+    const committedOnChainTokenIds = new Set<string>();
 
     try {
       // Resolve recipient once — single network query
@@ -1041,26 +1053,33 @@ export class PaymentsModule {
         throw new SphereError('Trust base not available. Oracle provider must implement getTrustBase()', 'AGGREGATOR_ERROR');
       }
 
-      // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
-      const parsedPool = await this.spendPlanner.buildParsedPool(
-        Array.from(this.tokens.values()),
-        request.coinId
-      );
+      let splitPlan: SplitPlan;
 
-      // ── Spend Queue: SYNCHRONOUS CRITICAL SECTION (no awaits) ──────────────
-      // planSend reads free amounts, runs split calculation, and creates a
-      // reservation atomically. No concurrent send() can interleave here.
-      const planResult = this.spendPlanner.planSend(
-        request, parsedPool, this.reservationLedger, this.spendQueue, result.id
-      );
-
-      let splitPlan;
-      if (planResult === 'queued') {
-        // Wait for change tokens to arrive and wake this entry
-        const queueResult = await this.spendQueue.waitForEntry(result.id);
-        splitPlan = queueResult.splitPlan;
+      if (internal?.existingSplitPlan) {
+        // W23 fix: Reuse the reservation + plan from instantSplitSend to avoid
+        // the cancel-then-reacquire race window.
+        splitPlan = internal.existingSplitPlan;
       } else {
-        splitPlan = planResult.splitPlan;
+        // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
+        const parsedPool = await this.spendPlanner.buildParsedPool(
+          Array.from(this.tokens.values()),
+          request.coinId
+        );
+
+        // ── Spend Queue: SYNCHRONOUS CRITICAL SECTION (no awaits) ──────────────
+        // planSend reads free amounts, runs split calculation, and creates a
+        // reservation atomically. No concurrent send() can interleave here.
+        const planResult = this.spendPlanner.planSend(
+          request, parsedPool, this.reservationLedger, this.spendQueue, result.id
+        );
+
+        if (planResult === 'queued') {
+          // Wait for change tokens to arrive and wake this entry
+          const queueResult = await this.spendQueue.waitForEntry(result.id);
+          splitPlan = queueResult.splitPlan;
+        } else {
+          splitPlan = planResult.splitPlan;
+        }
       }
 
       if (!splitPlan) {
@@ -1068,7 +1087,7 @@ export class PaymentsModule {
       }
 
       // Collect all tokens involved
-      const tokensToSend: Token[] = splitPlan.tokensToTransferDirectly.map(t => t.uiToken);
+      const tokensToSend: Token[] = splitPlan.tokensToTransferDirectly.map((t: TokenWithAmount) => t.uiToken);
       if (splitPlan.tokenToSplit) {
         tokensToSend.push(splitPlan.tokenToSplit.uiToken);
       }
@@ -1122,6 +1141,9 @@ export class PaymentsModule {
             recipientAddress,
             onChainMessage,
           );
+
+          // Mark split source token as committed on-chain — cannot be restored on error
+          committedOnChainTokenIds.add(splitPlan.tokenToSplit!.uiToken.id);
 
           // Save change token
           const changeTokenData = splitResult.tokenForSender.toJSON();
@@ -1183,6 +1205,8 @@ export class PaymentsModule {
           if (submitResponse.status !== 'SUCCESS' && submitResponse.status !== 'REQUEST_ID_EXISTS') {
             throw new SphereError(`Transfer commitment failed: ${submitResponse.status}`, 'TRANSFER_FAILED');
           }
+          // W23-R3 fix: Mark token as committed on-chain — cannot be restored on error
+          committedOnChainTokenIds.add(token.id);
 
           const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
           const transferTx = commitment.toTransaction(inclusionProof);
@@ -1268,17 +1292,21 @@ export class PaymentsModule {
             }
           );
           logger.debug('Payments', `Split bundle built: splitGroupId=${builtSplit.splitGroupId}`);
+          // W23-R3 fix: Mark split source token as committed on-chain in instant mode too.
+          // buildSplitBundle submits the burn commitment; if subsequent steps fail,
+          // the catch block must NOT restore this already-spent token.
+          committedOnChainTokenIds.add(splitPlan.tokenToSplit!.uiToken.id);
         }
 
         // 2. Prepare direct token entries in parallel — does NOT send
         const directCommitments = await Promise.all(
-          splitPlan.tokensToTransferDirectly.map(tw =>
+          splitPlan.tokensToTransferDirectly.map((tw: TokenWithAmount) =>
             this.createSdkCommitment(tw.uiToken, recipientAddress, signingService, onChainMessage)
           )
         );
 
         const directTokenEntries: DirectTokenEntry[] = splitPlan.tokensToTransferDirectly.map(
-          (tw, i) => ({
+          (tw: TokenWithAmount, i: number) => ({
             sourceToken: JSON.stringify(tw.sdkToken.toJSON()),
             commitmentData: JSON.stringify(directCommitments[i].toJSON()),
             amount: tw.uiToken.amount,
@@ -1430,8 +1458,20 @@ export class PaymentsModule {
       result.status = 'failed';
       result.error = error instanceof Error ? error.message : String(error);
 
-      // Restore tokens and re-add to spend queue cache
+      // Restore tokens and re-add to spend queue cache.
+      // W23-R2/R3 fix: Skip tokens that were already committed on-chain or removed
+      // (tombstoned) during this send. Restoring those would create phantom tokens.
       for (const token of result.tokens) {
+        if (committedOnChainTokenIds.has(token.id)) {
+          logger.warn('Payments', `Skipping restoration of on-chain-committed token ${token.id}`);
+          continue;
+        }
+        // Skip tokens that were already removeToken()'d (archived + tombstoned)
+        // during a partially-successful conservative send loop
+        if (!this.tokens.has(token.id)) {
+          logger.warn('Payments', `Skipping restoration of already-removed token ${token.id}`);
+          continue;
+        }
         token.status = 'confirmed';
         this.tokens.set(token.id, token);
         if (token.sdkData) {
@@ -1590,13 +1630,13 @@ export class PaymentsModule {
       }
 
       if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
-        // For direct transfers without split, release reservation and fall back to standard flow.
-        // send() will create its own reservation. Notify AFTER send() completes so a racing
-        // queued entry doesn't grab the freed tokens before send() can re-reserve.
-        this.reservationLedger.cancel(reservationId);
+        // W23 fix: For direct transfers without split, fall back to standard send()
+        // but pass the existing reservation ID so send() can reuse it instead of
+        // creating a new one. This closes the race window where freed tokens could
+        // be grabbed by a concurrent queued entry between cancel and re-reserve.
         logger.debug('Payments', 'No split required, falling back to standard send()');
         try {
-          const result = await this.send(request);
+          const result = await this.send(request, { existingReservationId: reservationId, existingSplitPlan: splitPlan });
           return {
             success: result.status === 'completed',
             criticalPathDurationMs: performance.now() - startTime,
