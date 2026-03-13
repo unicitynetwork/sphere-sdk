@@ -1496,6 +1496,7 @@ export class PaymentsModule {
     const startTime = performance.now();
 
     let reservationId: string | undefined;
+    let tokenToSplitRef: Token | undefined;
 
     try {
       // Resolve recipient once — single network query
@@ -1542,22 +1543,27 @@ export class PaymentsModule {
 
       if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
         // For direct transfers without split, release reservation and fall back to standard flow.
-        // send() will create its own reservation.
+        // send() will create its own reservation. Notify AFTER send() completes so a racing
+        // queued entry doesn't grab the freed tokens before send() can re-reserve.
         this.reservationLedger.cancel(reservationId);
-        this.spendQueue.notifyChange(request.coinId);
         logger.debug('Payments', 'No split required, falling back to standard send()');
-        const result = await this.send(request);
-        return {
-          success: result.status === 'completed',
-          criticalPathDurationMs: performance.now() - startTime,
-          error: result.error,
-        };
+        try {
+          const result = await this.send(request);
+          return {
+            success: result.status === 'completed',
+            criticalPathDurationMs: performance.now() - startTime,
+            error: result.error,
+          };
+        } finally {
+          this.spendQueue.notifyChange(request.coinId);
+        }
       }
 
       logger.debug('Payments', `InstantSplit: amount=${splitPlan.splitAmount}, remainder=${splitPlan.remainderAmount}`);
 
       // Mark token as transferring
       const tokenToSplit = splitPlan.tokenToSplit.uiToken;
+      tokenToSplitRef = tokenToSplit;
       tokenToSplit.status = 'transferring';
       this.tokens.set(tokenToSplit.id, tokenToSplit);
       this.parsedTokenCache.delete(tokenToSplit.id);
@@ -1665,12 +1671,30 @@ export class PaymentsModule {
     } catch (error) {
       // Cancel reservation on exception (only if one was created)
       if (reservationId) {
-        try {
-          this.reservationLedger.cancel(reservationId);
-        } finally {
-          this.spendQueue.notifyChange(request.coinId);
+        this.reservationLedger.cancel(reservationId);
+      }
+
+      // Restore token from 'transferring' back to 'confirmed' if it was marked
+      if (tokenToSplitRef && tokenToSplitRef.status === 'transferring') {
+        tokenToSplitRef.status = 'confirmed';
+        this.tokens.set(tokenToSplitRef.id, tokenToSplitRef);
+        if (tokenToSplitRef.sdkData) {
+          try {
+            const parsed = JSON.parse(tokenToSplitRef.sdkData);
+            const sdkToken = await SdkToken.fromJSON(parsed);
+            const amount = this.extractCoinAmountForCache(sdkToken, tokenToSplitRef.coinId);
+            if (amount > 0n) {
+              this.parsedTokenCache.set(tokenToSplitRef.id, { token: tokenToSplitRef, sdkToken, amount });
+            }
+          } catch { /* parse failure — skip */ }
         }
       }
+
+      // Notify queue after all restoration is complete
+      if (reservationId) {
+        this.spendQueue.notifyChange(request.coinId);
+      }
+
       const errorMessage = error instanceof Error ? error.message : String(error);
       return {
         success: false,

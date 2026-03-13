@@ -157,6 +157,7 @@ export class TokenReservationLedger {
 
     entry.status = 'cancelled';
     this.removeFromTokenIndex(entry);
+    this.reservations.delete(reservationId);
   }
 
   /**

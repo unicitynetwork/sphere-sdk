@@ -297,12 +297,12 @@ describe('TokenReservationLedger', () => {
       expect(ledger.getReservation('res-1')).toBeUndefined();
     });
 
-    it('commit() for already-cancelled reservation is no-op (does not revert)', () => {
+    it('commit() for already-cancelled reservation is no-op (reservation already deleted)', () => {
       ledger.reserve('res-1', entry('tok-1', 500000n, 1000000n), 'UCT');
       ledger.cancel('res-1');
-      ledger.commit('res-1'); // should be no-op
+      ledger.commit('res-1'); // should be no-op — reservation already deleted by cancel
 
-      expect(ledger.getReservation('res-1')?.status).toBe('cancelled');
+      expect(ledger.getReservation('res-1')).toBeUndefined();
       expect(ledger.getFreeAmount('tok-1', 1000000n)).toBe(1000000n);
     });
 
@@ -502,16 +502,16 @@ describe('TokenReservationLedger', () => {
       expect(ledger.hasActiveReservation('tok-1')).toBe(false);
     });
 
-    it('getSize() counts active and cancelled but not committed (deleted)', () => {
+    it('getSize() counts only active reservations (commit and cancel both delete)', () => {
       ledger.reserve('res-1', entry('tok-1', 100000n, 1000000n), 'UCT');
       ledger.reserve('res-2', entry('tok-1', 100000n, 1000000n), 'UCT');
       ledger.reserve('res-3', entry('tok-1', 100000n, 1000000n), 'UCT');
 
       ledger.commit('res-1');  // deleted from map
-      ledger.cancel('res-2');  // still in map with status=cancelled
+      ledger.cancel('res-2');  // also deleted from map
 
-      // res-1 deleted by commit, res-2 cancelled (in map), res-3 active (in map)
-      expect(ledger.getSize()).toBe(2);
+      // Only res-3 remains (active)
+      expect(ledger.getSize()).toBe(1);
     });
   });
 
@@ -566,13 +566,13 @@ describe('TokenReservationLedger', () => {
       ledger.cancel('res-1');
       expect(ledger.getReservation('res-1')).toBeUndefined();
 
-      // active -> cancelled (valid)
+      // active -> cancelled (valid) — reservation is deleted
       ledger.cancel('res-2');
-      expect(ledger.getReservation('res-2')?.status).toBe('cancelled');
+      expect(ledger.getReservation('res-2')).toBeUndefined();
 
-      // cancelled -> committed (blocked)
+      // cancelled -> committed is no-op (reservation already gone)
       ledger.commit('res-2');
-      expect(ledger.getReservation('res-2')?.status).toBe('cancelled');
+      expect(ledger.getReservation('res-2')).toBeUndefined();
     });
 
     it('I-RL-5: tokenIndex stays consistent after reserve/cancel/commit sequences', () => {

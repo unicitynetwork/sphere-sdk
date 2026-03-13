@@ -443,6 +443,7 @@ export class SpendQueue {
    * Re-evaluates queued entries for the given coinId in FIFO order.
    */
   notifyChange(coinId: string): void {
+    if (this.destroyed) return;
     const entries = this.queues.get(coinId);
     if (!entries || entries.length === 0) return;
 
@@ -459,10 +460,10 @@ export class SpendQueue {
         continue;
       }
 
-      // Build merged pool: original parsedPool + new tokens from cache
+      // Build merged pool: start from original parsedPool, override with fresh cache entries
       const mergedPool: ParsedTokenPool = new Map(entry.parsedPool);
       for (const [id, cached] of this.parsedTokenCache) {
-        if (cached.token.coinId === coinId && !mergedPool.has(id)) {
+        if (cached.token.coinId === coinId) {
           mergedPool.set(id, cached);
         }
       }
@@ -563,8 +564,9 @@ export class SpendQueue {
 
     for (const [tokenId, entry] of pool) {
       if (entry.token.coinId !== coinId) continue;
-      // Skip tokens that have been removed from the live wallet
-      if (!liveTokens.has(tokenId)) continue;
+      // Skip tokens removed or no longer confirmed in the live wallet
+      const liveToken = liveTokens.get(tokenId);
+      if (!liveToken || liveToken.status !== 'confirmed') continue;
       const freeAmount = this.ledger.getFreeAmount(entry.token.id, entry.amount);
       if (freeAmount > 0n) {
         view.push({ token: entry.token, sdkToken: entry.sdkToken, amount: freeAmount });
